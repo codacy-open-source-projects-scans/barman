@@ -44,6 +44,7 @@ from barman.command_wrappers import BarmanSubProcess, Command, Rsync
 from barman.copy_controller import RsyncCopyController
 from barman.exceptions import (
     ArchiverFailure,
+    BackupException,
     BadXlogSegmentName,
     CommandFailedException,
     ConninfoException,
@@ -1598,15 +1599,16 @@ class Server(RemoteStatusMixin):
             before timing out
         :param str|None backup_name: a friendly name by which this backup can
             be referenced in the future
-        :kwparam barman.infofile.LocalBackupInfo parent_backup_info:
-            information of the parent backup in case it is an incremental backup
-            using the postgres mode
+        :kwparam str parent_backup_id: id of the parent backup when taking a
+            Postgres incremental backup
         """
         # The 'backup' command is not available on a passive node.
         # We assume that if we get here the node is not passive
         assert not self.passive_node
 
         try:
+            # validate arguments, raise BackupException if any error is found
+            self.backup_manager.validate_backup_args(**kwargs)
             # Default strategy for check in backup is CheckStrategy
             # This strategy does not print any output - it only logs checks
             strategy = CheckStrategy()
@@ -1619,6 +1621,9 @@ class Server(RemoteStatusMixin):
                 return
             # check required backup directories exist
             self._make_directories()
+        except BackupException as e:
+            output.error("failed to start backup: %s", force_str(e))
+            return
         except OSError as e:
             output.error("failed to create %s directory: %s", e.filename, e.strerror)
             return
@@ -1686,10 +1691,22 @@ class Server(RemoteStatusMixin):
         Get the id of the latest/last backup in the catalog (if exists)
 
         :param status_filter: The status of the backup to return,
+            default to :attr:`BackupManager.DEFAULT_STATUS_FILTER`.
+        :return str|None: ID of the backup
+        """
+        return self.backup_manager.get_last_backup_id(status_filter)
+
+    def get_last_full_backup_id(
+        self, status_filter=BackupManager.DEFAULT_STATUS_FILTER
+    ):
+        """
+        Get the id of the latest/last FULL backup in the catalog (if exists)
+
+        :param status_filter: The status of the backup to return,
             default to DEFAULT_STATUS_FILTER.
         :return string|None: ID of the backup
         """
-        return self.backup_manager.get_last_backup_id(status_filter)
+        return self.backup_manager.get_last_full_backup_id(status_filter)
 
     def get_first_backup_id(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
         """
