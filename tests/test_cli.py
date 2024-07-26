@@ -55,7 +55,9 @@ from barman.server import Server
 from testing_helpers import (
     build_config_dictionary,
     build_config_from_dicts,
+    build_mocked_server,
     build_real_server,
+    build_test_backup_info,
 )
 
 
@@ -537,6 +539,7 @@ class TestCli(object):
         backup_info.status = BackupInfo.DONE
         backup_info.tablespaces = []
         backup_info.compression = None
+        backup_info.parent_backup_id = None
         return backup_info
 
     @pytest.fixture
@@ -749,30 +752,84 @@ class TestCli(object):
 
     @pytest.mark.parametrize(
         (
+            "backup_is_incremental",
             "backup_is_compressed",
             "recovery_staging_path_arg",
             "recovery_staging_path_config",
             "expected_recovery_staging_path",
             "should_error",
+            "error_substring",
         ),
         [
-            # If a backup is not compressed then recovery_staging_path is ignored
-            (False, None, None, None, False),
-            # If a backup is compressed and no recovery_staging_path is provided
-            # we expect an error
-            (True, None, None, None, True),
+            # If a backup is not incremental nor compressed then recovery_staging_path
+            # is ignored
+            (False, False, None, None, None, False, None),
+            # If a backup is compressed and no recovery_staging_path is provided we
+            # expect an error.
+            (
+                False,
+                True,
+                None,
+                None,
+                None,
+                True,
+                "backup is compressed with gzip compression but no recovery staging "
+                "path is provided.",
+            ),
             # If a backup is compressed and an argument is provided then it should
             # be set in the config
-            (True, "/from/arg", None, "/from/arg", False),
+            (False, True, "/from/arg", None, "/from/arg", False, None),
             # If a backup is compressed and a bad argument is provided then it should
             # error
-            (True, "from/arg", None, None, True),
+            (
+                False,
+                True,
+                "from/arg",
+                None,
+                None,
+                True,
+                "Cannot parse recovery staging path: Invalid value : 'from/arg' (must "
+                "be an absolute path)",
+            ),
             # If a backup is compressed and a config value is set then it should
             # be set in the config
-            (True, None, "/from/conf", "/from/conf", False),
+            (False, True, None, "/from/conf", "/from/conf", False, None),
             # If a backup is compressed and both arg and config are set then arg
             # takes precedence
-            (True, "/from/arg", "/from/conf", "/from/arg", False),
+            (False, True, "/from/arg", "/from/conf", "/from/arg", False, None),
+            # If a backup is incremental and no recovery_staging_path is provided we
+            # expect an error.
+            (
+                True,
+                False,
+                None,
+                None,
+                None,
+                True,
+                "backup will be combined with pg_combinebackup in the barman host but "
+                "no recovery staging path is provided.",
+            ),
+            # If a backup is incremental and an argument is provided then it should
+            # be set in the config
+            (True, False, "/from/arg", None, "/from/arg", False, None),
+            # If a backup is incremental and a bad argument is provided then it should
+            # error
+            (
+                True,
+                False,
+                "from/arg",
+                None,
+                None,
+                True,
+                "Cannot parse recovery staging path: Invalid value : 'from/arg' (must "
+                "be an absolute path)",
+            ),
+            # If a backup is incremental and a config value is set then it should
+            # be set in the config
+            (True, False, None, "/from/conf", "/from/conf", False, None),
+            # If a backup is incremental and both arg and config are set then arg
+            # takes precedence
+            (True, False, "/from/arg", "/from/conf", "/from/arg", False, None),
         ],
     )
     @patch("barman.cli.parse_backup_id")
@@ -783,11 +840,13 @@ class TestCli(object):
         parse_backup_id_mock,
         mock_backup_info,
         mock_recover_args,
+        backup_is_incremental,
         backup_is_compressed,
         recovery_staging_path_arg,
         recovery_staging_path_config,
         expected_recovery_staging_path,
         should_error,
+        error_substring,
         monkeypatch,
         capsys,
     ):
@@ -795,6 +854,8 @@ class TestCli(object):
         parse_backup_id_mock.return_value = mock_backup_info
         # AND the backup has the specified compression
         mock_backup_info.compression = backup_is_compressed and "gzip" or None
+        # AND the backup has the specified parent
+        mock_backup_info.parent_backup_id = backup_is_incremental and "some_id" or None
         # AND a configuration with the specified recovery_staging_path
         config = build_config_from_dicts(
             global_conf={"recovery_staging_path": recovery_staging_path_config},
@@ -815,12 +876,68 @@ class TestCli(object):
 
         # THEN if we expected an error the error was observed
         _, err = capsys.readouterr()
+        errors = [msg for msg in err.split("\n") if msg.startswith("ERROR: ")]
         if should_error:
-            assert len(err) > 0
+            assert len(errors) > 0
+            assert any([error_substring in msg for msg in errors])
         else:
+            assert len(errors) == 0
             # AND if we expected success, the server config recovery staging
             # path matches expectations
             assert server.recovery_staging_path == expected_recovery_staging_path
+
+    @pytest.mark.parametrize(
+        ("status", "should_error"),
+        [
+            (BackupInfo.DONE, False),
+            (BackupInfo.WAITING_FOR_WALS, False),
+            (BackupInfo.FAILED, True),
+            (BackupInfo.EMPTY, True),
+            (BackupInfo.SYNCING, True),
+            (BackupInfo.STARTED, True),
+        ],
+    )
+    @patch("barman.output.error")
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_recover_backup_status(
+        self,
+        get_server_mock,
+        parse_backup_id_mock,
+        error_mock,
+        status,
+        should_error,
+        mock_recover_args,
+    ):
+
+        server = build_mocked_server(name="test_server")
+
+        get_server_mock.return_value = server
+
+        backup_info = build_test_backup_info(
+            server=server,
+            backup_id="test_backup_id",
+            status=status,
+        )
+
+        parse_backup_id_mock.return_value = backup_info
+        mock_recover_args.backup_id = "test_backup_id"
+        mock_recover_args.snapshot_recovery_instance = None
+
+        with pytest.raises(
+            SystemExit,
+        ):
+            recover(mock_recover_args)
+
+        if should_error:
+            error_mock.assert_called_once_with(
+                "Cannot recover from backup '%s' of server "
+                "'%s': backup status is not DONE",
+                "test_backup_id",
+                "test_server",
+            )
+        else:
+            error_mock.assert_not_called()
 
     @pytest.mark.parametrize(
         (
