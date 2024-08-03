@@ -522,7 +522,7 @@ class BackupInfo(FieldListFile):
     snapshots_info = Field(
         "snapshots_info", load=load_snapshots_info, dump=output_snapshots_info
     )
-
+    data_checksums = Field("data_checksums")
     summarize_wal = Field("summarize_wal")
     parent_backup_id = Field("parent_backup_id")
     children_backup_ids = Field(
@@ -751,6 +751,22 @@ class LocalBackupInfo(BackupInfo):
         """
         return self.children_backup_ids is not None
 
+    @property
+    def backup_type(self):
+        """
+        Returns a string with the backup type label.
+
+        The backup type can be one of the following:
+        - ``rsync``: If the backup mode is "rsync``.
+        - ``incremental``: If the mode is ``postgres`` and the backup is incremental.
+        - ``full``: If the mode is ``postgres`` and the backup is not incremental.
+
+        :return str: The backup type label.
+        """
+        if self.mode != "postgres":
+            return "rsync"
+        return "incremental" if self.is_incremental else "full"
+
     def get_list_of_files(self, target):
         """
         Get the list of files for the current backup
@@ -945,6 +961,31 @@ class LocalBackupInfo(BackupInfo):
             yield backup_info
             backup_info = backup_info.get_parent_backup_info()
 
+    def is_checksum_consistent(self):
+        """
+            Check if all backups in the chain are consistent with their checksums
+            configurations.
+
+            The backup chain is considered inconsistent if the current backup was taken with
+            ``data_checksums`` enabled and any of its ascendants were taken with it disabled.
+            It is considered consistent otherwise.
+
+        .. note::
+            While this method was created to check inconsistencies in chains of one
+            or more (Postgres 17+ core) incremental backups, it can be safely used
+            with any Postgres version and with any Barman backup method. That is
+            true because it always returns ``True`` when called for a Postgres full
+            backup or for a rsync backup.
+
+            :return bool: ``True`` if it is consistent, ``False`` otherwise.
+        """
+        if self.data_checksums != "on" or not self.parent_backup_id:
+            return True
+        for backup in self.walk_to_root(return_self=False):
+            if backup.data_checksums == "off":
+                return False
+        return True
+
     def is_full_and_eligible_for_incremental(self):
         """
         Used to filter out backups that have a parent backup id and are not
@@ -961,7 +1002,7 @@ class LocalBackupInfo(BackupInfo):
         :return bool: True if it's a full backup or False if not.
         """
         if (
-            self.backup_manager.config.backup_method == "postgres"
+            self.mode == "postgres"
             and self.summarize_wal == "on"
             and not self.parent_backup_id
         ):

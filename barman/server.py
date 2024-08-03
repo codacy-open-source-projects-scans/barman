@@ -1705,6 +1705,16 @@ class Server(RemoteStatusMixin):
             if not previous_backup:
                 self.backup_manager.remove_wal_before_backup(backup_info)
 
+            # check if the backup chain (in case it is a Postgres incremental) is consistent
+            # with their checksums configurations
+            if not backup_info.is_checksum_consistent():
+                output.warning(
+                    "This is an incremental backup taken with `data_checksums = on` whereas "
+                    "some previous backups in the chain were taken with `data_checksums = off`. "
+                    "This can lead to potential recovery issues. Consider taking a new full backup "
+                    "to avoid having inconsistent backup chains."
+                )
+
             if backup_info.status == BackupInfo.WAITING_FOR_WALS:
                 output.warning(
                     "IMPORTANT: this backup is classified as "
@@ -1845,6 +1855,7 @@ class Server(RemoteStatusMixin):
         target_time=None,
         target_xid=None,
         target_lsn=None,
+        target_immediate=False,
     ):
         """
         Get the xlog files required for a recovery.
@@ -1856,8 +1867,9 @@ class Server(RemoteStatusMixin):
             calculated target timeline, so we make sure recovery will be able to finish
             successfully (assuming the archived WALs honor the specified targets).
 
-            On the other hand, *target_tli* and *target_lsn* are easier to handle, so we
-            only copy the WALs required to reach the requested targets.
+            On the other hand, *target_tli*, *target_lsn* and *target_immediate* are
+            easier to handle, so we only copy the WALs required to reach the requested
+            targets.
 
         :param BackupInfo backup: a backup object
         :param target_tli : target timeline, either a timeline ID or one of the keywords
@@ -1865,6 +1877,8 @@ class Server(RemoteStatusMixin):
         :param target_time: target time, in epoch
         :param target_xid: target transaction ID
         :param target_lsn: target LSN
+        :param target_immediate: target that ends recovery as soon as
+            consistency is reached. Defaults to ``False``.
         """
         begin = backup.begin_wal
         end = backup.end_wal
@@ -1908,11 +1922,13 @@ class Server(RemoteStatusMixin):
                 tli, _, _ = xlog.decode_segment_name(wal_info.name)
                 if tli > calculated_target_tli:
                     continue
-                yield wal_info
                 if wal_info.name > end:
-                    end = wal_info.name
-                    if target_lsn and wal_info.name >= target_wal:
+                    if target_immediate:
                         break
+                    if target_lsn and wal_info.name > target_wal:
+                        break
+                    end = wal_info.name
+                yield wal_info
             # return all the remaining history files
             for line in fxlogdb:
                 wal_info = WalFileInfo.from_xlogdb_line(line)
@@ -2924,12 +2940,12 @@ class Server(RemoteStatusMixin):
         except LockFileBusy:
             # If another process is running for this server,
             if reset:
-                output.info(
+                output.error(
                     "Unable to reset the status of receive-wal "
                     "for server %s. Process is still running" % self.config.name
                 )
             else:
-                output.info(
+                output.error(
                     "Another receive-wal process is already running "
                     "for server %s." % self.config.name
                 )

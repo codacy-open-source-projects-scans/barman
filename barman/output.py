@@ -676,11 +676,14 @@ class ConsoleOutputWriter(object):
             self.info(backup_info.backup_id)
             return
 
-        out_list = ["%s %s " % (backup_info.server_name, backup_info.backup_id)]
+        out_list = ["%s %s" % (backup_info.server_name, backup_info.backup_id)]
+
         if backup_info.backup_name is not None:
-            out_list.append("'%s' - " % backup_info.backup_name)
-        else:
-            out_list.append("- ")
+            out_list.append(" '%s'" % backup_info.backup_name)
+
+        # Set backup type label
+        out_list.append(" - %s - " % backup_info.backup_type[0].upper())
+
         if backup_info.status in BackupInfo.STATUS_COPY_DONE:
             end_time = backup_info.end_time.ctime()
             out_list.append(
@@ -715,6 +718,7 @@ class ConsoleOutputWriter(object):
         if backup_info["status"] in BackupInfo.STATUS_COPY_DONE:
             output_fun(row.format("PostgreSQL Version", backup_info["version"]))
             output_fun(row.format("PGDATA directory", backup_info["pgdata"]))
+            output_fun(row.format("Checksums", backup_info["data_checksums"]))
             output_fun("")
 
     @staticmethod
@@ -1470,12 +1474,13 @@ class JsonOutputWriter(ConsoleOutputWriter):
             self.json_output[server_name].append(backup_info.backup_id)
             return
 
-        output = dict(
-            backup_id=backup_info.backup_id,
-        )
+        output = dict(backup_id=backup_info.backup_id)
 
         if backup_info.backup_name is not None:
             output.update({"backup_name": backup_info.backup_name})
+
+        # Set backup type label
+        output.update({"backup_type": backup_info.backup_type})
 
         if backup_info.status in BackupInfo.STATUS_COPY_DONE:
             output.update(
@@ -1520,6 +1525,7 @@ class JsonOutputWriter(ConsoleOutputWriter):
                 dict(
                     postgresql_version=data["version"],
                     pgdata_directory=data["pgdata"],
+                    data_checksums=data["data_checksums"],
                     tablespaces=[],
                 )
             )
