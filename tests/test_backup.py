@@ -17,6 +17,7 @@
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
 import errno
+import itertools
 import os
 import re
 from datetime import datetime, timedelta
@@ -25,7 +26,7 @@ import dateutil.parser
 import dateutil.tz
 import mock
 import pytest
-from mock import Mock, patch
+from mock import Mock, patch, call
 from barman.backup import BackupManager
 from barman.lockfile import ServerBackupIdLock
 
@@ -365,6 +366,139 @@ class TestBackup(object):
 
         assert deleted is True
         assert child_backup.backup_id not in parent_backup.children_backup_ids
+
+        # Test 8: Update next rsync backup information
+        given_backup = build_test_backup_info(
+            backup_id="rsync_backup_id",
+            server=backup_manager.server,
+        )
+        build_backup_directories(given_backup)
+        next_backup = build_test_backup_info(
+            backup_id="next_rsync_backup_id",
+            server=backup_manager.server,
+        )
+        build_backup_directories(next_backup)
+        mock_available_backups.return_value = {
+            given_backup.backup_id: given_backup,
+            next_backup.backup_id: next_backup,
+        }
+        with patch("barman.backup.BackupManager.get_next_backup") as get_next_backup:
+            with patch(
+                "barman.backup.BackupManager._set_backup_sizes"
+            ) as set_backup_sizes:
+                get_next_backup.return_value = next_backup
+                deleted = backup_manager.delete_backup(given_backup)
+                assert deleted is True
+                set_backup_sizes.assert_called_once_with(next_backup)
+
+    @patch("os.stat")
+    @patch("barman.backup.fsync_file")
+    @patch("barman.backup.fsync_dir")
+    @patch("os.walk")
+    @pytest.mark.parametrize("fsync", [True, False])
+    def test_set_backup_sizes(
+        self,
+        mock_walk,
+        mock_fsync_dir,
+        mock_fsync_file,
+        mock_stat,
+        fsync,
+    ):
+        """
+        Test that the _set_backup_sizes method correctly sets the backup sizes
+        and optionally performs fsync.
+        """
+        # Set up the mocks
+        backup_manager = build_backup_manager()
+        mock_stat.reset_mock()
+        mock_backup_info = Mock()
+
+        # Mock os.walk to return a predefined directory structure
+        mock_walk.return_value = [
+            ("/root", ["dir1", "dir2"], ["file1.txt"]),
+            ("/root/dir1", [], ["file2.txt"]),
+            ("/root/dir2", ["subdir"], []),
+            ("/root/dir2/subdir", [], ["file3.txt"]),
+        ]
+
+        # Define the mock return values for os.stat
+        def mock_stat_return_value(backup):
+            return_values = {
+                "/root/file1.txt": {
+                    "size": 1024,
+                    "nlink": 3,
+                },
+                "/root/dir1/file2.txt": {
+                    "size": 2048,
+                    "nlink": 2,
+                },
+                "/root/dir2/subdir/file3.txt": {
+                    "size": 4096,
+                    "nlink": 1,
+                },
+            }
+            return Mock(
+                st_size=return_values[backup]["size"],
+                st_nlink=return_values[backup]["nlink"],
+            )
+
+        mock_stat.side_effect = mock_stat_return_value
+
+        # Define the mock return values for fsync_file
+        def mock_fsync_file_return_value(file_path):
+            return mock_stat_return_value(file_path)
+
+        mock_fsync_file.side_effect = mock_fsync_file_return_value
+
+        # Call the method under test
+        backup_manager._set_backup_sizes(mock_backup_info, fsync)
+
+        # Assertions for both with and without fsync cases
+        mock_walk.assert_called_once_with(
+            mock_backup_info.get_basebackup_directory.return_value,
+        )
+        assert mock_backup_info.set_attribute.call_count == 2
+        mock_backup_info.set_attribute.assert_has_calls(
+            [
+                call("size", 7168),
+                call("deduplicated_size", 4096),
+            ]
+        )
+        mock_backup_info.save.assert_called_once()
+
+        # Assertions when called with fsync
+        if fsync:
+            mock_stat.assert_not_called()
+            assert mock_fsync_dir.call_count == 4
+            mock_fsync_dir.assert_has_calls(
+                [
+                    call("/root"),
+                    call("/root/dir1"),
+                    call("/root/dir2"),
+                    call("/root/dir2/subdir"),
+                ]
+            )
+            assert mock_fsync_file.call_count == 3
+            mock_fsync_file.assert_has_calls(
+                [
+                    call("/root/file1.txt"),
+                    call("/root/dir1/file2.txt"),
+                    call("/root/dir2/subdir/file3.txt"),
+                ]
+            )
+
+        # Assertions without fsync (standard case)
+        else:
+            mock_fsync_dir.assert_not_called()
+            mock_fsync_file.assert_not_called()
+            assert mock_stat.call_count == 3
+            mock_stat.assert_has_calls(
+                [
+                    call("/root/file1.txt"),
+                    call("/root/dir1/file2.txt"),
+                    call("/root/dir2/subdir/file3.txt"),
+                ]
+            )
 
     def test_available_backups(self, tmpdir):
         """
@@ -954,6 +1088,59 @@ class TestBackup(object):
         # no exception is raised when summarize_wal is on
         backup_manager._validate_incremental_backup_configs()
 
+    @pytest.mark.parametrize(
+        ("parent_backup_compression", "backup_compression"),
+        list(itertools.product(("gzip", None), ("gzip", None))),
+    )
+    @patch("barman.backup.BackupManager.get_backup")
+    def test_validate_incremental_backup_configs_backup_compression(
+        self,
+        mock_get_backup,
+        parent_backup_compression,
+        backup_compression,
+    ):
+        """
+        Test the behaviour of backups taken with backup_compression set
+        for incremental backups and/or parent backups.
+        """
+        # set backup_compression option in global config
+        backup_manager = build_backup_manager(
+            global_conf={
+                "backup_method": "postgres",
+                "backup_compression": backup_compression,
+            }
+        )
+
+        # mock the postgres object to set server version
+        mock_postgres = Mock()
+        backup_manager.executor.server.postgres = mock_postgres
+        mock_postgres.configure_mock(server_version=170000)
+
+        # mock enabled summarize_wal option
+        backup_manager.executor.server.postgres.get_setting.side_effect = ["on"]
+        err_msg = ""
+
+        mock_get_backup.return_value = build_test_backup_info(
+            compression=parent_backup_compression, summarize_wal="on"
+        )
+        # ensure incremental backup with backup_compression set raises exception
+        if backup_compression:
+            err_msg = "Incremental backups cannot be taken with "
+            "'backup_compression' set in the configuration options."
+            with pytest.raises(BackupException, match=err_msg):
+                backup_manager._validate_incremental_backup_configs()
+        elif parent_backup_compression:
+            err_msg = (
+                "The specified backup cannot be a parent for an "
+                "incremental backup. Reason: "
+                "Compressed backups are not eligible as parents of incremental backups."
+            )
+            with pytest.raises(BackupException, match=err_msg):
+                backup_manager._validate_incremental_backup_configs()
+        else:
+            # no exception is raised when backup_compression is None
+            backup_manager._validate_incremental_backup_configs()
+
     @patch("barman.backup.BackupManager.get_available_backups")
     def test_get_last_full_backup_id(self, get_available_backups):
         """
@@ -990,6 +1177,47 @@ class TestBackup(object):
         last_full_backup = backup_manager.get_last_full_backup_id()
         get_available_backups.assert_called_once()
         assert last_full_backup == "20241011T180000"
+
+    @patch("barman.backup._logger")
+    @patch("barman.backup.output")
+    @patch("barman.backup.BackupManager._set_backup_sizes")
+    def test_backup_fsync_and_set_sizes(
+        self,
+        mock_set_backup_sizes,
+        mock_output,
+        mock_logger,
+    ):
+        """
+        Test the function for correct backup size and deduplication ratio
+        setting and logging.
+        """
+        backup_manager = build_backup_manager()
+        backup_manager.executor.current_action = "calculating backup size"
+        backup_info = Mock()
+        backup_info.size = 0
+
+        # Test case with no deduplication ratio output
+        backup_manager.backup_fsync_and_set_sizes(backup_info)
+        mock_logger.debug.assert_called_once_with("calculating backup size")
+        mock_set_backup_sizes.assert_called_with(backup_info, fsync=True)
+        mock_output.info.assert_called_with("Backup size: %s" % "0 B")
+
+        # Reset mocks
+        mock_logger.reset_mock()
+        mock_set_backup_sizes.reset_mock()
+        mock_output.reset_mock()
+
+        # Test case when reuse_backup == "link"
+        backup_manager.config.reuse_backup = "link"
+        backup_info.size = 1000
+        backup_info.deduplicated_size = 800
+        backup_manager.backup_fsync_and_set_sizes(backup_info)
+        mock_logger.debug.assert_called_once_with("calculating backup size")
+        mock_set_backup_sizes.assert_called_with(backup_info, fsync=True)
+        mock_output.info.assert_called_once_with(
+            "Backup size: %s. Actual size on disk: %s (-%s deduplication ratio)."
+            % ("1000 B", "800 B", "20.00%")
+        )
 
 
 class TestWalCleanup(object):

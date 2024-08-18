@@ -205,6 +205,9 @@ class TestRsyncBackupExecutor(object):
                 "backup_options": "exclusive_backup",
             }
         )
+        # mocks the keep-alive query
+        backup_manager.server.postgres.send_heartbeat_query.return_value = True, None
+
         backup_info = LocalBackupInfo(backup_manager.server, backup_id="fake_backup_id")
         backup_info.begin_xlog = "0/2000028"
         backup_info.begin_wal = "000000010000000000000002"
@@ -871,7 +874,7 @@ class TestStrategy(object):
             Tablespace(name="tbs2", oid=16405, location="/another/location"),
         ]
         assert backup_info.summarize_wal is None
-        assert backup_info.cluster_size is None
+        assert backup_info.cluster_size == 2048
 
         strategy._pg_get_metadata(backup_info)
 

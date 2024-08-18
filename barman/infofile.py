@@ -757,15 +757,47 @@ class LocalBackupInfo(BackupInfo):
         Returns a string with the backup type label.
 
         The backup type can be one of the following:
-        - ``rsync``: If the backup mode is "rsync``.
+        - ``snapshot``: If the backup mode starts with ``snapshot``.
+        - ``rsync``: If the backup mode starts with ``rsync``.
         - ``incremental``: If the mode is ``postgres`` and the backup is incremental.
         - ``full``: If the mode is ``postgres`` and the backup is not incremental.
 
         :return str: The backup type label.
         """
-        if self.mode != "postgres":
+        if self.mode.startswith("snapshot"):
+            return "snapshot"
+        elif self.mode.startswith("rsync"):
             return "rsync"
         return "incremental" if self.is_incremental else "full"
+
+    @property
+    def deduplication_ratio(self):
+        """
+        Returns a value between and including ``0`` and ``1`` related to the estimate
+        deduplication ratio of the backup.
+
+        .. note::
+            For ``rsync`` backups, the :attr:`size` of the backup, which is the sum of
+            all file sizes in basebackup directory, is used to calculate the
+            ratio. For ``postgres`` backups, the :attr:`cluster_size` is used, which contains
+            the estimated size of the Postgres cluster at backup time.
+
+            We perform this calculation to make an estimation of how much network and disk
+            I/O has been saved when taking an incremental backup through ``rsync`` or through
+            ``pg_basebackup``.
+
+            We abuse of the term "deduplication" here. It makes more sense to ``rsync`` than to
+            ``postgres`` method. However, the idea is the same in both cases: get an estimation
+            of resources saving.
+
+        :return float: The backup deduplication ratio.
+        """
+        size = self.cluster_size
+        if self.backup_type == "rsync":
+            size = self.size
+        if size and self.deduplicated_size:
+            return 1 - (self.deduplicated_size / size)
+        return 0
 
     def get_list_of_files(self, target):
         """
