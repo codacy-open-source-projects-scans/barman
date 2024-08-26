@@ -67,6 +67,11 @@ barman delete <server_name> <backup_id>
 
 The `delete` command accepts any [shortcut](#backup-id-shortcuts) to identify backups.
 
+> **IMPORTANT:**
+> If the specified backup has dependent block-level incremental backups,
+> those backups and all their dependents will also be deleted during this operation
+> as they would effectively become unusable for recovery with a missing parent in its chain.
+
 ## `keep`
 
 If you have a backup which you wish to keep beyond the retention policy of
@@ -75,6 +80,21 @@ the server then you can make it an archival backup with:
 ```bash
 barman keep <server_name> <backup_id> [--target TARGET, --status, --release]
 ```
+
+> **NOTE:**
+> To ensure the integrity of your backup system, block-level incremental backups
+> cannot use the keep annotation in Barman. This restriction is due to
+> the way block-level incremental backups depend on each other. Using the keep 
+> annotation on such backups could result in orphaned backups,
+> which means that certain backups might exist without their necessary
+> parent backups.
+>
+> In simpler terms, if you were allowed to apply the keep annotation to
+> a block-level incremental backup, there would be a risk that parts of the backup
+> chain would be retained without their required predecessors. This 
+> situation could create backups that would be no longer be useful or
+> complete, as they would be missing the essential parent backups needed
+> to restore them properly.
 
 Possible values for `TARGET` are:
 
@@ -251,6 +271,10 @@ the following mutually exclusive options:
 > the start and the end of a backup, you must recover from the
 > previous backup in the catalogue.
 
+> **IMPORTANT:**
+> If no timezone is specified when using `--target-time`, the timezone of the Barman
+> host will be used.
+
 You can use the `--exclusive` option to specify whether to stop immediately
 before or immediately after the recovery target.
 
@@ -315,6 +339,17 @@ behaviour defined by `recovery_options`. Use `--get-wal` with `barman recover`
 to enable the fetching of WALs from the Barman server, alternatively use
 `--no-get-wal` to disable it.
 
+> **IMPORTANT:**
+> When recovering with `--no-get-wal` in conjunction with any of these
+> targets [`--target-xid`, `--target-name`, `--target-time`], Barman 
+> will copy the whole WAL archive from the Barman host to the recovery host.
+> By doing that, and assuming that all the WALs required for reaching
+> the configured target were already archived into Barman, we guarantee
+> that at least these WALs will be made available to Postgres.
+> This happens because currently there is no reliable and/or performant
+> way of determining in Barman which WALs are needed by Postgres to
+> reach those kinds of recovery targets.
+
 ### Recovering compressed backups
 
 If a backup has been compressed using the `backup_compression` option
@@ -338,6 +373,37 @@ either set `recovery_staging_path` in the global/server config *or* use
 the `--recovery-staging-path` option with the `barman recover` command. If
 you do neither of these things and attempt to recover a compressed backup
 then Barman will fail rather than try to guess a suitable location.
+
+### Recovering block-level incremental backups
+
+If a backup is a block-level incremental, `barman recover` is able to combine the chain
+of backups on recovery through `pg_combinebackup`.
+A chain of backups is the tree branch that goes from the full backup
+to the one requested for the recovery. This is a multi-step process:
+
+1. The chain of backups is combined into a new synthetic backup. A
+   folder named with the ID of the incremental backup being recovered is
+   created inside a given staging directory on the local server using
+   `pg_combinebackup`. For any type of recover (local or remote), the
+   synthetic backup is created locally in the barman server.
+2. If it's a remote recover, the content is copied to the final destination
+   using Rsync. Otherwise, when it's a local recover, the content is just
+   moved to the final destination.
+3. The folder named with the ID of the incremental backup being recovered, which
+    was created inside the provided staging directory, is removed at the end of the
+    recovery process.
+
+When recovering from a block-level incremental backup, you *must* therefore
+either set `local_staging_path` in the global/server config *or* use
+the `--local-staging-path` option with the `barman recover` command. If
+you do neither of these things and attempt to recover such backup
+then Barman fails rather than trying to guess a suitable location.
+
+> **IMPORTANT:**
+> If any of the backups in the chain were taken with checksums
+> disabled, but the final backup was taken with checksums enabled, the
+> resulting directory may contain pages with invalid checksums.
+> [Follow up the `limitations` section in pg_basebackup documentation](https://www.postgresql.org/docs/17/app-pgcombinebackup.html).
 
 ## `show-backup`
 

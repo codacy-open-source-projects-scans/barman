@@ -2271,28 +2271,28 @@ class TestRecoveryExecutorFactory(object):
     @pytest.mark.parametrize(
         (
             "compression",
-            "parent_backup_id",
+            "is_incremental",
             "expected_executor",
             "snapshots_info",
             "should_error",
         ),
         [
             # No compression or snapshots_info should return RecoveryExecutor
-            (None, None, RecoveryExecutor, None, False),
+            (None, False, RecoveryExecutor, None, False),
             # Supported compression should return TarballRecoveryExecutor
-            ("gzip", None, TarballRecoveryExecutor, None, False),
+            ("gzip", False, TarballRecoveryExecutor, None, False),
             # Unrecognised compression should cause an error
-            ("snappy", None, None, None, True),
+            ("snappy", False, None, None, True),
             # A backup_info with snapshots_info should return SnapshotRecoveryExecutor
-            (None, None, SnapshotRecoveryExecutor, mock.Mock(), False),
+            (None, False, SnapshotRecoveryExecutor, mock.Mock(), False),
             # A backup with a parent_backup_id should return IncrementalRecoveryExecutor
-            (None, "some_parent_id", IncrementalRecoveryExecutor, None, False),
+            (None, True, IncrementalRecoveryExecutor, None, False),
         ],
     )
     def test_recovery_executor_factory(
         self,
         compression,
-        parent_backup_id,
+        is_incremental,
         expected_executor,
         snapshots_info,
         should_error,
@@ -2302,7 +2302,7 @@ class TestRecoveryExecutorFactory(object):
         mock_backup_info = mock.Mock(
             compression=compression,
             snapshots_info=snapshots_info,
-            parent_backup_id=parent_backup_id,
+            is_incremental=is_incremental,
         )
 
         # WHEN recovery_executor_factory is called with the specified compression
@@ -2384,7 +2384,7 @@ class TestIncrementalRecoveryExecutor(object):
         """
         mock_backup_info = Mock()
         mock__combine_backups.return_value = synthetic_backup_info
-        executor.config.recovery_staging_path = "fake/staging/path"
+        executor.config.local_staging_path = "fake/staging/path"
 
         with mock.patch("barman.recovery_executor.RecoveryExecutor.recover") as mock_sr:
             _ = executor.recover(
@@ -2407,10 +2407,10 @@ class TestIncrementalRecoveryExecutor(object):
     )
     @mock.patch("barman.infofile.LocalBackupInfo.get_data_directory")
     @mock.patch("barman.infofile.FieldListFile.load")
-    @mock.patch("barman.config.parse_recovery_staging_path")
+    @mock.patch("barman.config.parse_staging_path")
     def test__combine_backups(
         self,
-        mock_parse_recovery_stg_path,
+        parse_local_staging_path,
         mock_load_fields,
         mock_get_data_dir,
         mock__prepare_dest,
@@ -2429,7 +2429,7 @@ class TestIncrementalRecoveryExecutor(object):
         called with the correct parameters.
         It also tests if the result is a SyntheticBackupInfo object.
 
-        :param mock_parse_recovery_stg_path: parse_recovery_staging_path mock
+        :param mock_parse_local_stg_path: parse_local_staging_path mock
         :param mock_load_fields: load mock for backup_infos
         :param mock_get_data_dir: get_data_directory method mock
         :param mock__prepare_dest: _prepare_destination method mock
@@ -2439,7 +2439,7 @@ class TestIncrementalRecoveryExecutor(object):
         :param executor: executor mock fixture
         :param server: server mock fixture
         """
-        mock_parse_recovery_stg_path.return_value = "/home/fake/path/data"
+        parse_local_staging_path.return_value = "/home/fake/path/data"
 
         mock_backup_info = testing_helpers.build_test_backup_info(
             backup_id="backup",
@@ -2582,8 +2582,8 @@ class TestIncrementalRecoveryExecutor(object):
 
         executor._backup_copy(backup_info, dest="destination/recover/path")
 
-        mock_get_data_dir.call_count == 3
-        mock_prepare_dest.call_count == 2
+        assert mock_get_data_dir.call_count == 3
+        assert mock_prepare_dest.call_count == 2
 
         tablespace_mapping = {
             "tbs1": "/home/fake/path/tablespace1",
@@ -2950,8 +2950,8 @@ class TestIncrementalRecoveryExecutor(object):
                 source=source_dir, destination=dest_dir, exclude_path_names=set()
             )
 
-        mock_path_join.call_count == 1
-        mock_sh_move.call_count == 1
+        assert mock_path_join.call_count == 1
+        assert mock_sh_move.call_count == 1
         mock_error.assert_called_once_with(
             f"Destination directory '{dest_dir}' must be empty."
         )

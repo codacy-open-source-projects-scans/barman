@@ -39,6 +39,9 @@ barman backup <server_name>
 > You can use `barman backup <server_1_name> <server_2_name>` to sequentially
 > backup both `<server_1_name>` and `<server_2_name>` servers.
 
+For information on how to take incremental backups in Barman, please check the
+[incremental backup section]{#incremental-backup}.
+
 Barman 2.10 introduces the `-w`/`--wait` option for the `backup` command.
 When set, Barman temporarily saves the state of the backup to
 `WAITING_FOR_WALS`, then waits for all the required WAL files to be
@@ -280,7 +283,8 @@ barman list-backups <server_name>
 > **TIP:** You can request a full list of the backups of all servers
 > using `all` as the server name.
 
-To have a machine-readable output you can use the `--minimal` option.
+To get a machine-readable output you can use the `--minimal` option, 
+and to get the output in JSON format you can use the `--format=json` option.
 
 ## `rebuild-xlogdb`
 

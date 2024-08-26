@@ -19,6 +19,11 @@ backup *SERVER_NAME*
         Overrides value of the parameter `immediate_checkpoint`, if present
         in the configuration file.
 
+    --incremental [BACKUP_ID]
+    :   performs a block-level incremental backup. A `BACKUP_ID` or [backup ID shortcut](#shortcuts)
+        of a previous backup must be provided, which references a previous backup
+        in the catalog to be used as the parent backup from which the incremental is taken.
+
     --reuse-backup [INCREMENTAL_TYPE]
     :   Overrides `reuse_backup` option behaviour. Possible values for
         `INCREMENTAL_TYPE` are:
@@ -74,6 +79,11 @@ backup *SERVER_NAME*
     --wait-timeout
     :   the time, in seconds, spent waiting for the required WAL
         files to be archived before timing out
+
+    --keepalive-interval
+    :   an interval, in seconds, at which a hearbeat query will be sent to the
+        server to keep the libpq connection alive during an Rsync backup. Default
+        is 60. A value of 0 disables it.
 
     --manifest
     :   forces the creation of a backup manifest file at the end of a backup. 
