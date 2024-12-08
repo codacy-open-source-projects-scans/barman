@@ -714,9 +714,9 @@ class BackupInfo(FieldListFile):
         if data.get("tablespaces") is not None:
             data["tablespaces"] = [list(item) for item in data["tablespaces"]]
         if data.get("begin_time") is not None:
-            data["begin_time"] = data["begin_time"].ctime()
+            data["begin_time"] = data["begin_time"].isoformat()
         if data.get("end_time") is not None:
-            data["end_time"] = data["end_time"].ctime()
+            data["end_time"] = data["end_time"].isoformat()
         return data
 
     @classmethod
@@ -1062,6 +1062,23 @@ class LocalBackupInfo(BackupInfo):
             and not self.is_incremental
         ):
             return True
+        return False
+
+    @property
+    def is_orphan(self):
+        """
+        Determine if the backup is an orphan.
+
+        An orphan backup is defined as a backup directory that contains only
+        a non-empty backup.info file. This may indicate an incomplete delete operation.
+
+        :return bool: ``True`` if the backup is an orphan, ``False`` otherwise.
+        """
+        backup_dir = self.get_basebackup_directory()
+        backup_info_path = os.path.join(backup_dir, "backup.info")
+        if os.path.exists(backup_dir) and os.path.exists(backup_info_path):
+            if len(os.listdir(backup_dir)) == 1 and self.status != BackupInfo.EMPTY:
+                return True
         return False
 
 

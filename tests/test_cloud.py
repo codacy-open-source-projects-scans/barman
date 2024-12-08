@@ -28,26 +28,22 @@ from functools import partial
 from io import BytesIO
 from tarfile import TarFile, TarInfo
 from tarfile import open as open_tar
+from unittest import TestCase
+
+import mock
+import pytest
+import snappy
 from azure.core.exceptions import ResourceNotFoundError, ServiceRequestError
 from azure.identity import AzureCliCredential, ManagedIdentityCredential
 from azure.storage.blob import PartialBatchErrorException
-
-import mock
-from mock.mock import MagicMock
-import pytest
-import snappy
-
-from barman.exceptions import BackupPreconditionException
-from barman.infofile import BackupInfo
-
-if sys.version_info.major > 2:
-    from unittest.mock import patch as unittest_patch
-from unittest import TestCase
 from boto3.exceptions import Boto3Error
 from botocore.exceptions import ClientError, EndpointConnectionError
+from google.api_core.exceptions import Conflict, GoogleAPIError
+from mock.mock import MagicMock
 
 from barman.annotations import KeepManager
 from barman.cloud import (
+    DEFAULT_DELIMITER,
     CloudBackupCatalog,
     CloudBackupSnapshot,
     CloudBackupUploader,
@@ -57,7 +53,6 @@ from barman.cloud import (
     CloudUploadController,
     CloudUploadingError,
     FileUploadStatistics,
-    DEFAULT_DELIMITER,
 )
 from barman.cloud_providers import (
     CloudProviderOptionUnsupported,
@@ -67,8 +62,12 @@ from barman.cloud_providers import (
 from barman.cloud_providers.aws_s3 import S3CloudInterface
 from barman.cloud_providers.azure_blob_storage import AzureCloudInterface
 from barman.cloud_providers.google_cloud_storage import GoogleCloudInterface
+from barman.exceptions import BackupPreconditionException
+from barman.infofile import BackupInfo
 
-from google.api_core.exceptions import GoogleAPIError, Conflict
+if sys.version_info.major > 2:
+    from unittest.mock import patch as unittest_patch
+
 
 try:
     from queue import Queue
@@ -603,7 +602,11 @@ class TestS3CloudInterface(object):
         cloud_interface.upload_fileobj(mock_fileobj, mock_key)
 
         s3_client.upload_fileobj.assert_called_once_with(
-            Fileobj=mock_fileobj, Bucket="bucket", Key=mock_key, ExtraArgs={}
+            Fileobj=mock_fileobj,
+            Bucket="bucket",
+            Key=mock_key,
+            ExtraArgs={},
+            Config=cloud_interface.config,
         )
 
     @pytest.mark.parametrize(
@@ -645,6 +648,7 @@ class TestS3CloudInterface(object):
             Bucket="bucket",
             Key=mock_key,
             ExtraArgs=expected_extra_args,
+            Config=cloud_interface.config,
         )
 
     @pytest.mark.parametrize(
@@ -694,6 +698,7 @@ class TestS3CloudInterface(object):
             ExtraArgs={
                 "Tagging": expected_tagging,
             },
+            Config=cloud_interface.config,
         )
 
     @mock.patch("barman.cloud_providers.aws_s3.boto3")

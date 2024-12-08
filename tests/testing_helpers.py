@@ -24,8 +24,8 @@ import mock
 from dateutil import tz
 
 from barman.backup import BackupManager
-from barman.config import BackupOptions, Config
 from barman.compression import PgBaseBackupCompressionConfig
+from barman.config import BackupOptions, Config
 from barman.infofile import BackupInfo, LocalBackupInfo, Tablespace, WalFileInfo
 from barman.server import Server
 from barman.utils import mkpath
@@ -283,6 +283,10 @@ def build_config_dictionary(config_keys=None):
         "archiver_batch_size": 0,
         "autogenerate_manifest": False,
         "aws_await_snapshots_timeout": 3600,
+        "aws_snapshot_lock_mode": None,
+        "aws_snapshot_lock_duration": None,
+        "aws_snapshot_lock_cool_off_period": None,
+        "aws_snapshot_lock_expiration_date": None,
         "aws_profile": None,
         "aws_region": None,
         "azure_credential": None,

@@ -18,10 +18,12 @@
 
 import bz2
 import gzip
+import lzma
 import shutil
 from abc import ABCMeta, abstractmethod
 from io import BytesIO
 
+from barman.compression import _try_import_lz4, _try_import_zstd
 from barman.utils import with_metaclass
 
 
@@ -115,7 +117,7 @@ def compress(wal_file, compression):
     compressed data.
     :param IOBase wal_file: A file-like object containing the WAL file data.
     :param str compression: The compression algorithm to apply. Can be one of:
-      bzip2, gzip, snappy.
+      bzip2, gzip, snappy, zstd, lz4, xz.
     :return: The compressed data
     :rtype: BytesIO
     """
@@ -125,6 +127,17 @@ def compress(wal_file, compression):
         snappy.stream_compress(wal_file, in_mem_snappy)
         in_mem_snappy.seek(0)
         return in_mem_snappy
+    elif compression == "zstd":
+        in_mem_zstd = BytesIO()
+        zstd = _try_import_zstd()
+        zstd.ZstdCompressor().copy_stream(wal_file, in_mem_zstd)
+        in_mem_zstd.seek(0)
+        return in_mem_zstd
+    elif compression == "lz4":
+        lz4 = _try_import_lz4()
+        in_mem_lz4 = BytesIO(lz4.frame.compress(wal_file.read()))
+        in_mem_lz4.seek(0)
+        return in_mem_lz4
     elif compression == "gzip":
         # Create a BytesIO for in memory compression
         in_mem_gzip = BytesIO()
@@ -138,6 +151,10 @@ def compress(wal_file, compression):
         in_mem_bz2 = BytesIO(bz2.compress(wal_file.read()))
         in_mem_bz2.seek(0)
         return in_mem_bz2
+    elif compression == "xz":
+        in_mem_xz = BytesIO(lzma.compress(wal_file.read()))
+        in_mem_xz.seek(0)
+        return in_mem_xz
     else:
         raise ValueError("Unknown compression type: %s" % compression)
 
@@ -170,17 +187,25 @@ def decompress_to_file(blob, dest_file, compression):
     :param IOBase dest_file: A file-like object into which the uncompressed data
       should be written.
     :param str compression: The compression algorithm to apply. Can be one of:
-      bzip2, gzip, snappy.
+      bzip2, gzip, snappy, zstd, lz4, xz.
     :rtype: None
     """
     if compression == "snappy":
         snappy = _try_import_snappy()
         snappy.stream_decompress(blob, dest_file)
         return
+    elif compression == "zstd":
+        zstd = _try_import_zstd()
+        source_file = zstd.ZstdDecompressor().stream_reader(blob)
+    elif compression == "lz4":
+        lz4 = _try_import_lz4()
+        source_file = lz4.frame.open(blob, mode="rb")
     elif compression == "gzip":
         source_file = gzip.GzipFile(fileobj=blob, mode="rb")
     elif compression == "bzip2":
         source_file = bz2.BZ2File(blob, "rb")
+    elif compression == "xz":
+        source_file = lzma.open(blob, "rb")
     else:
         raise ValueError("Unknown compression type: %s" % compression)
 

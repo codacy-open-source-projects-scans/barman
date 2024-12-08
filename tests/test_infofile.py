@@ -26,6 +26,13 @@ import mock
 import pytest
 from dateutil.tz import tzlocal, tzoffset
 from mock import PropertyMock, patch
+from testing_helpers import (
+    build_backup_manager,
+    build_mocked_server,
+    build_real_server,
+    build_test_backup_info,
+)
+
 from barman.cloud_providers.aws_s3 import AwsSnapshotMetadata, AwsSnapshotsInfo
 from barman.cloud_providers.azure_blob_storage import (
     AzureSnapshotMetadata,
@@ -35,7 +42,6 @@ from barman.cloud_providers.google_cloud_storage import (
     GcpSnapshotMetadata,
     GcpSnapshotsInfo,
 )
-
 from barman.infofile import (
     BackupInfo,
     Field,
@@ -43,15 +49,9 @@ from barman.infofile import (
     LocalBackupInfo,
     SyntheticBackupInfo,
     WalFileInfo,
-    load_datetime_tz,
     dump_backup_ids,
     load_backup_ids,
-)
-from testing_helpers import (
-    build_backup_manager,
-    build_mocked_server,
-    build_real_server,
-    build_test_backup_info,
+    load_datetime_tz,
 )
 
 BASE_BACKUP_INFO = """backup_label=None
@@ -538,6 +538,44 @@ class TestBackupInfo(object):
 
         assert backup_info.backup_type == expected_backup_type
 
+    def test_is_orphan(self, tmpdir):
+        """
+        Ensure :meth:`LocalBackupInfo.is_orphan` returns the correct value.
+        """
+        server = build_mocked_server(
+            main_conf={"basebackups_directory": tmpdir.strpath},
+        )
+
+        # Case 1: Orphan backup (only backup.info file, status not empty)
+        backup_dir = tmpdir.mkdir("orphan_backup")
+        backup_info_path = backup_dir.join("backup.info")
+        backup_info_path.write("status = DONE\n")
+        b_info = LocalBackupInfo(server, backup_id="orphan_backup")
+        b_info.status = BackupInfo.DONE
+        assert b_info.is_orphan is True
+
+        # Case 2: Not orphan (backup.info file and other files)
+        backup_dir = tmpdir.mkdir("not_orphan_backup")
+        backup_info_path = backup_dir.join("backup.info")
+        backup_info_path.write("status = DONE\n")
+        backup_dir.join("other_file").write("some content")
+        b_info = LocalBackupInfo(server, backup_id="not_orphan_backup")
+        b_info.status = BackupInfo.DONE
+        assert b_info.is_orphan is False
+
+        # Case 3: Not orphan (status is empty)
+        backup_dir = tmpdir.mkdir("empty_status_backup")
+        backup_info_path = backup_dir.join("backup.info")
+        backup_info_path.write("status = EMPTY\n")
+        b_info = LocalBackupInfo(server, backup_id="empty_status_backup")
+        b_info.status = BackupInfo.EMPTY
+        assert b_info.is_orphan is False
+
+        # Case 4: Not orphan (no backup.info file)
+        backup_dir = tmpdir.mkdir("no_backup_info")
+        b_info = LocalBackupInfo(server, backup_id="no_backup_info")
+        assert b_info.is_orphan is False
+
     def test_backup_info_save(self, tmpdir):
         """
         Test the save method of a BackupInfo object
@@ -886,6 +924,7 @@ class TestBackupInfo(object):
                     device_name="/dev/sdf",
                     snapshot_name="user-assigned name",
                     snapshot_id="snap-0123",
+                    snapshot_lock_mode="compliance",
                 )
             ],
         )
@@ -902,6 +941,7 @@ class TestBackupInfo(object):
         assert snapshot0.device_name == "/dev/sdf"
         assert snapshot0.snapshot_name == "user-assigned name"
         assert snapshot0.snapshot_id == "snap-0123"
+        assert snapshot0.snapshot_lock_mode == "compliance"
 
         # AND the snapshots_info is included in the JSON output
         snapshots_json = b_info.to_json()["snapshots_info"]
@@ -913,6 +953,7 @@ class TestBackupInfo(object):
         assert snapshot0_json["provider"]["device_name"] == "/dev/sdf"
         assert snapshot0_json["provider"]["snapshot_name"] == "user-assigned name"
         assert snapshot0_json["provider"]["snapshot_id"] == "snap-0123"
+        assert snapshot0_json["provider"]["snapshot_lock_mode"] == "compliance"
 
     def test_with_no_snapshots_info(self, tmpdir):
         """

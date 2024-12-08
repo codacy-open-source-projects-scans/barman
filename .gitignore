@@ -10,6 +10,7 @@
 *~
 \#*\#
 .*.swp
+*.bak
 
 # eclipse project files
 /.project
@@ -35,3 +36,10 @@ venv/*
 
 # pyenv
 .python-version
+
+# Sphinx docs
+docs/_build/*
+docs/contributor_guide/modules
+
+# Allow the man directory
+!docs/_build/man/

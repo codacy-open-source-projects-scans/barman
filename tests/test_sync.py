@@ -23,6 +23,11 @@ import dateutil
 import mock
 import pytest
 from dateutil import tz
+from testing_helpers import (
+    build_config_from_dicts,
+    build_real_server,
+    build_test_backup_info,
+)
 
 import barman.server
 from barman.exceptions import (
@@ -33,11 +38,6 @@ from barman.exceptions import (
 )
 from barman.infofile import BackupInfo, LocalBackupInfo
 from barman.lockfile import LockFileBusy
-from testing_helpers import (
-    build_config_from_dicts,
-    build_real_server,
-    build_test_backup_info,
-)
 
 # expected result of the sync --status command
 EXPECTED_MINIMAL = {
@@ -50,14 +50,14 @@ EXPECTED_MINIMAL = {
             "deduplicated_size": 1024,
             "version": 90302,
             "ident_file": "/pgdata/location/pg_ident.conf",
-            "end_time": "Wed Jul 23 12:00:43 2014",
+            "end_time": "2014-07-23T12:00:43",
             "status": "DONE",
             "backup_id": "1234567890",
             "config_file": "/pgdata/location/postgresql.conf",
             "timeline": 1,
             "end_xlog": "0/20000B8",
             "pgdata": "/pgdata/location",
-            "begin_time": "Wed Jul 23 11:00:43 2014",
+            "begin_time": "2014-07-23T11:00:43",
             "hba_file": "/pgdata/location/pg_hba.conf",
             "end_offset": 184,
             "tablespaces": [

@@ -16,42 +16,13 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
-from argparse import ArgumentTypeError
-
 import json
 import os
-import pytest
 import sys
-from mock import MagicMock, Mock, patch
+from argparse import ArgumentTypeError
 
-import barman.config
-from barman import output
-from barman.cli import (
-    ArgumentParser,
-    argument,
-    backup,
-    check_target_action,
-    check_wal_archive,
-    command,
-    generate_manifest,
-    get_model,
-    get_models_list,
-    get_server,
-    get_server_list,
-    manage_model_command,
-    manage_server_command,
-    OrderedHelpFormatter,
-    parse_backup_id,
-    receive_wal,
-    recover,
-    replication_status,
-    keep,
-    show_servers,
-    config_switch,
-)
-from barman.exceptions import WalArchiveContentError
-from barman.infofile import BackupInfo
-from barman.server import Server
+import pytest
+from mock import MagicMock, Mock, patch
 from testing_helpers import (
     build_config_dictionary,
     build_config_from_dicts,
@@ -59,6 +30,35 @@ from testing_helpers import (
     build_real_server,
     build_test_backup_info,
 )
+
+import barman.config
+from barman import output
+from barman.cli import (
+    ArgumentParser,
+    OrderedHelpFormatter,
+    argument,
+    backup,
+    check_target_action,
+    check_wal_archive,
+    command,
+    config_switch,
+    generate_manifest,
+    get_model,
+    get_models_list,
+    get_server,
+    get_server_list,
+    keep,
+    manage_model_command,
+    manage_server_command,
+    parse_backup_id,
+    receive_wal,
+    replication_status,
+    restore,
+    show_servers,
+)
+from barman.exceptions import WalArchiveContentError
+from barman.infofile import BackupInfo
+from barman.server import Server
 
 
 # noinspection PyMethodMayBeStatic
@@ -174,9 +174,9 @@ class TestCli(object):
             # If wal_streaming_conninfo is set and wal_conninfo is unset then
             # wal_streaming_conninfo is used for conninfo
             (True, "ws_conninfo", None, "ws_conninfo", "ws_conninfo"),
-            # If wal_streaming_conninfo is not set then conninfo and streaming_conninfo
-            # are not overridden even if wal_conninfo is set
-            (True, None, "w_conninfo", "s_conninfo", "conninfo"),
+            # If wal_streaming_conninfo is not set then conninfo is overridden and
+            # streaming_conninfo is not overridden if wal_conninfo is set
+            (True, None, "w_conninfo", "s_conninfo", "w_conninfo"),
         ),
     )
     @patch("barman.cli.manage_server_command")
@@ -412,9 +412,9 @@ class TestCli(object):
             # If wal_streaming_conninfo is set and wal_conninfo is unset then
             # wal_streaming_conninfo is used for conninfo
             (True, "ws_conninfo", None, "ws_conninfo", "ws_conninfo"),
-            # If wal_streaming_conninfo is not set then conninfo and streaming_conninfo
-            # are not overridden even if wal_conninfo is set
-            (True, None, "w_conninfo", "s_conninfo", "conninfo"),
+            # If wal_streaming_conninfo is not set then conninfo is overriden and
+            # streaming_conninfo is not overridden if wal_conninfo is set
+            (True, None, "w_conninfo", "s_conninfo", "w_conninfo"),
         ),
     )
     def test_get_server_list_wal_streaming(
@@ -543,7 +543,7 @@ class TestCli(object):
         return backup_info
 
     @pytest.fixture
-    def mock_recover_args(self):
+    def mock_restore_args(self):
         args = Mock()
         args.backup_id = "20170823T104400"
         args.server_name = "main"
@@ -561,12 +561,12 @@ class TestCli(object):
 
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_multiple_targets(
+    def test_restore_multiple_targets(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         monkeypatch,
         capsys,
     ):
@@ -583,7 +583,7 @@ class TestCli(object):
         )
 
         # Testing mutual exclusiveness of target options
-        args = mock_recover_args
+        args = mock_restore_args
         args.backup_id = "20170823T104400"
         args.server_name = "main"
         args.destination_directory = "recovery_dir"
@@ -591,7 +591,7 @@ class TestCli(object):
         args.target_time = "2021-01-001 00:00:00.000"
 
         with pytest.raises(SystemExit):
-            recover(args)
+            restore(args)
 
         _, err = capsys.readouterr()
         assert (
@@ -601,12 +601,12 @@ class TestCli(object):
 
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_one_target(
+    def test_restore_one_target(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         monkeypatch,
         capsys,
     ):
@@ -623,26 +623,26 @@ class TestCli(object):
         )
 
         # This parameters are fine
-        args = mock_recover_args
+        args = mock_restore_args
         args.backup_id = "20170823T104400"
         args.server_name = "main"
         args.destination_directory = "recovery_dir"
         args.target_action = None
 
         with pytest.raises(SystemExit):
-            recover(args)
+            restore(args)
 
         _, err = capsys.readouterr()
         assert "" == err
 
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_default_target(
+    def test_restore_default_target(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         monkeypatch,
         capsys,
     ):
@@ -659,14 +659,14 @@ class TestCli(object):
         )
 
         # This parameters are fine
-        args = mock_recover_args
+        args = mock_restore_args
         args.backup_id = "20170823T104400"
         args.server_name = "main"
         args.destination_directory = "recovery_dir"
         args.target_action = None
 
         with pytest.raises(SystemExit):
-            recover(args)
+            restore(args)
 
         _, err = capsys.readouterr()
         assert "" == err
@@ -703,12 +703,12 @@ class TestCli(object):
     )
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_get_wal(
+    def test_restore_get_wal(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         recovery_options,
         get_wal_arg,
         no_get_wal_arg,
@@ -733,15 +733,15 @@ class TestCli(object):
 
         # WHEN the specified --get-wal / --no-get-wal combinations are used
         if get_wal_arg:
-            mock_recover_args.get_wal = True
+            mock_restore_args.get_wal = True
         elif no_get_wal_arg:
-            mock_recover_args.get_wal = False
+            mock_restore_args.get_wal = False
         else:
-            del mock_recover_args.get_wal
+            del mock_restore_args.get_wal
 
         # WITH a barman recover command
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
 
         # THEN then the presence of the get_wal recovery option matches expectations
         if expect_get_wal:
@@ -800,12 +800,12 @@ class TestCli(object):
     )
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_recovery_staging_path(
+    def test_restore_recovery_staging_path(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         backup_is_compressed,
         recovery_staging_path_arg,
         recovery_staging_path_config,
@@ -833,11 +833,11 @@ class TestCli(object):
             (config,),
         )
         # WHEN recover is called with the specified --recovery-staging-path
-        mock_recover_args.recovery_staging_path = recovery_staging_path_arg
+        mock_restore_args.recovery_staging_path = recovery_staging_path_arg
 
         # WITH a barman recover command
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
 
         # THEN if we expected an error the error was observed
         _, err = capsys.readouterr()
@@ -898,12 +898,12 @@ class TestCli(object):
     )
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_local_staging_path(
+    def test_restore_local_staging_path(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         backup_is_incremental,
         local_staging_path_arg,
         local_staging_path_config,
@@ -929,11 +929,11 @@ class TestCli(object):
             (config,),
         )
         # WHEN recover is called with the specified --local-staging-path
-        mock_recover_args.local_staging_path = local_staging_path_arg
+        mock_restore_args.local_staging_path = local_staging_path_arg
 
         # WITH a barman recover command
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
 
         # THEN if we expected an error the error was observed
         _, err = capsys.readouterr()
@@ -961,14 +961,14 @@ class TestCli(object):
     @patch("barman.output.error")
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_backup_status(
+    def test_restore_backup_status(
         self,
         get_server_mock,
         parse_backup_id_mock,
         error_mock,
         status,
         should_error,
-        mock_recover_args,
+        mock_restore_args,
     ):
 
         server = build_mocked_server(name="test_server")
@@ -982,17 +982,17 @@ class TestCli(object):
         )
 
         parse_backup_id_mock.return_value = backup_info
-        mock_recover_args.backup_id = "test_backup_id"
-        mock_recover_args.snapshot_recovery_instance = None
+        mock_restore_args.backup_id = "test_backup_id"
+        mock_restore_args.snapshot_recovery_instance = None
 
         with pytest.raises(
             SystemExit,
         ):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
 
         if should_error:
             error_mock.assert_called_once_with(
-                "Cannot recover from backup '%s' of server "
+                "Cannot restore from backup '%s' of server "
                 "'%s': backup status is not DONE",
                 "test_backup_id",
                 "test_server",
@@ -1059,12 +1059,12 @@ class TestCli(object):
     )
     @patch("barman.cli.get_server")
     @patch("barman.cli.parse_backup_id")
-    def test_recover_snapshots(
+    def test_restore_snapshots(
         self,
         parse_backup_id_mock,
         get_server_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         snapshots_info,
         snapshot_recovery_args,
         extra_recovery_args,
@@ -1078,14 +1078,14 @@ class TestCli(object):
         mock_backup_info.tablespaces[-1].name = "tbs1"
         parse_backup_id_mock.return_value = mock_backup_info
         # AND the specified additional recovery args
-        mock_recover_args.snapshot_recovery_instance = None
+        mock_restore_args.snapshot_recovery_instance = None
         extra_recovery_args.update(snapshot_recovery_args)
         for k, v in extra_recovery_args.items():
-            setattr(mock_recover_args, k, v)
+            setattr(mock_restore_args, k, v)
 
         # WHEN barman recover is called
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
 
         # THEN if we expected an error the error was observed
         server = get_server_mock.return_value
@@ -1105,8 +1105,8 @@ class TestCli(object):
 
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_recovery_instance_kwarg_not_passed(
-        self, get_server_mock, parse_backup_id_mock, mock_backup_info, mock_recover_args
+    def test_restore_recovery_instance_kwarg_not_passed(
+        self, get_server_mock, parse_backup_id_mock, mock_backup_info, mock_restore_args
     ):
         """
         Verifies that recovery_instance is not passed to server.recover for
@@ -1116,14 +1116,14 @@ class TestCli(object):
         mock_backup_info.snapshots_info = None
         parse_backup_id_mock.return_value = mock_backup_info
         # AND the args do not specify a recovery instance
-        mock_recover_args.snapshot_recovery_instance = None
+        mock_restore_args.snapshot_recovery_instance = None
         # AND the args do not specify any other snapshot provider options
-        mock_recover_args.azure_resource_group = None
-        mock_recover_args.gcp_zone = None
+        mock_restore_args.azure_resource_group = None
+        mock_restore_args.gcp_zone = None
 
         # WHEN barman recover is called
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
 
         # THEN recover was called once
         get_server_mock.return_value.recover.assert_called_once()
@@ -1143,12 +1143,12 @@ class TestCli(object):
     )
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_recover_snapshot_provider_args(
+    def test_restore_snapshot_provider_args(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
-        mock_recover_args,
+        mock_restore_args,
         arg,
         arg_alias,
     ):
@@ -1165,29 +1165,29 @@ class TestCli(object):
         parse_backup_id_mock.return_value = mock_backup_info
 
         # WHEN recover is called without overriding the config
-        setattr(mock_recover_args, arg, None)
+        setattr(mock_restore_args, arg, None)
         if arg_alias is not None:
-            setattr(mock_recover_args, arg_alias, None)
+            setattr(mock_restore_args, arg_alias, None)
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
         # THEN the config value is unchanged
         assert getattr(config, arg) == initial_value
 
         # WHEN recover is called with the override argument
         updated_value = "updated"
-        setattr(mock_recover_args, arg, updated_value)
+        setattr(mock_restore_args, arg, updated_value)
         with pytest.raises(SystemExit):
-            recover(mock_recover_args)
+            restore(mock_restore_args)
         # THEN the config value is updated
         assert getattr(config, arg) == updated_value
 
         # WHEN recover is called with the alias
         final_value = "final"
         if arg_alias is not None:
-            setattr(mock_recover_args, arg_alias, final_value)
-            setattr(mock_recover_args, arg, None)
+            setattr(mock_restore_args, arg_alias, final_value)
+            setattr(mock_restore_args, arg, None)
             with pytest.raises(SystemExit):
-                recover(mock_recover_args)
+                restore(mock_restore_args)
             # THEN the config value is updated
             assert getattr(config, arg) == final_value
 

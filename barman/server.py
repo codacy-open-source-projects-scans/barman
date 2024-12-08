@@ -52,6 +52,7 @@ from barman.exceptions import (
     LockFileBusy,
     LockFileException,
     LockFilePermissionDenied,
+    PostgresCheckpointPrivilegesRequired,
     PostgresDuplicateReplicationSlot,
     PostgresException,
     PostgresInvalidReplicationSlot,
@@ -60,7 +61,6 @@ from barman.exceptions import (
     PostgresReplicationSlotInUse,
     PostgresReplicationSlotsFull,
     PostgresSuperuserRequired,
-    PostgresCheckpointPrivilegesRequired,
     PostgresUnsupportedFeature,
     SyncError,
     SyncNothingToDo,
@@ -80,17 +80,17 @@ from barman.lockfile import (
     ServerXLOGDBLock,
 )
 from barman.postgres import (
+    PostgreSQL,
     PostgreSQLConnection,
     StandbyPostgreSQLConnection,
     StreamingConnection,
-    PostgreSQL,
 )
 from barman.process import ProcessManager
 from barman.remote_status import RemoteStatusMixin
-from barman.retention_policies import RetentionPolicyFactory, RetentionPolicy
+from barman.retention_policies import RetentionPolicy, RetentionPolicyFactory
 from barman.utils import (
     BarmanEncoder,
-    file_md5,
+    file_hash,
     force_str,
     fsync_dir,
     fsync_file,
@@ -136,6 +136,7 @@ class CheckStrategy(object):
         "incoming WALs directory",
         "streaming WALs directory",
         "wal maximum age",
+        "PostgreSQL server is standby",
     ]
 
     def __init__(self, ignore_checks=NON_CRITICAL_CHECKS):
@@ -299,7 +300,18 @@ class Server(RemoteStatusMixin):
                     config.slot_name,
                     config.primary_checkpoint_timeout,
                 )
-            else:
+                # If primary_conninfo is set but conninfo does not point to a standby
+                # it could be that a failover happend and the standby has been promoted.
+                # In this case, don't set a standby connection and just warn the user.
+                # A standard connection will be set further so that Barman keeps working.
+                if self.postgres.is_in_recovery is False:
+                    self.postgres.close()
+                    self.postgres = None
+                    output.warning(
+                        "'primary_conninfo' is set but 'conninfo' does not point to a "
+                        "standby server. Ignoring 'primary_conninfo'."
+                    )
+            if self.postgres is None:
                 self.postgres = PostgreSQLConnection(
                     config.conninfo, config.immediate_checkpoint, config.slot_name
                 )
@@ -886,7 +898,7 @@ class Server(RemoteStatusMixin):
         # If we have wal-specific conninfo then we must use those to get
         # the remote status information for the check
         streaming_conninfo, conninfo = self.config.get_wal_conninfo()
-        if streaming_conninfo != self.config.streaming_conninfo:
+        if conninfo != self.config.conninfo:
             with closing(StreamingConnection(streaming_conninfo)) as streaming, closing(
                 PostgreSQLConnection(conninfo, slot_name=self.config.slot_name)
             ) as postgres:
@@ -1007,9 +1019,12 @@ class Server(RemoteStatusMixin):
         :param CheckStrategy check_strategy: The strategy for the management
             of the results of the various checks.
         """
+        is_standby_conn = isinstance(self.postgres, StandbyPostgreSQLConnection)
+
         # Check that standby is standby
         check_strategy.init_check("PostgreSQL server is standby")
-        is_in_recovery = self.postgres.is_in_recovery
+        # The server only is in recovery if we have a standby connection and pg_is_in_recovery() is True
+        is_in_recovery = is_standby_conn and self.postgres.is_in_recovery
         if is_in_recovery:
             check_strategy.result(self.config.name, True)
         else:
@@ -1021,6 +1036,11 @@ class Server(RemoteStatusMixin):
                     "primary_conninfo is set"
                 ),
             )
+
+        # if we don't have a standby connection object then we can't perform
+        # any of the further checks as they require a primary reference
+        if not is_standby_conn:
+            return
 
         # Check that primary is not standby
         check_strategy.init_check("Primary server is not a standby")
@@ -2148,6 +2168,7 @@ class Server(RemoteStatusMixin):
         self,
         wal_name,
         compression=None,
+        keep_compression=False,
         output_directory=None,
         peek=None,
         partial=False,
@@ -2157,6 +2178,7 @@ class Server(RemoteStatusMixin):
 
         :param str wal_name: id of the WAL file to find into the WAL archive
         :param str|None compression: compression format for the output
+        :param bool keep_compression: if True, do not uncompress compressed WAL files
         :param str|None output_directory: directory where to deposit the
             WAL file
         :param int|None peek: if defined list the next N WAL file
@@ -2291,7 +2313,9 @@ class Server(RemoteStatusMixin):
 
             try:
                 # Try returning the wal_file to the client
-                self.get_wal_sendfile(wal_file, compression, destination)
+                self.get_wal_sendfile(
+                    wal_file, compression, keep_compression, destination
+                )
                 # We are done, return to the caller
                 return
             except CommandFailedException:
@@ -2323,12 +2347,13 @@ class Server(RemoteStatusMixin):
             source_suffix,
         )
 
-    def get_wal_sendfile(self, wal_file, compression, destination):
+    def get_wal_sendfile(self, wal_file, compression, keep_compression, destination):
         """
         Send a WAL file to the destination file, using the required compression
 
         :param str wal_file: WAL file path
         :param str compression: required compression
+        :param bool keep_compression: if True, do not uncompress compressed WAL files
         :param destination: file stream to use to write the data
         """
         # Identify the wal file
@@ -2350,37 +2375,38 @@ class Server(RemoteStatusMixin):
         uncompressed_file = None
         compressed_file = None
 
-        # If the required compression is different from the source we
-        # decompress/compress it into the required format (getattr is
-        # used here to gracefully handle None objects)
-        if getattr(wal_compressor, "compression", None) != getattr(
-            out_compressor, "compression", None
-        ):
-            # If source is compressed, decompress it into a temporary file
-            if wal_compressor is not None:
-                uncompressed_file = NamedTemporaryFile(
-                    dir=self.config.wals_directory,
-                    prefix=".%s." % os.path.basename(wal_file),
-                    suffix=".uncompressed",
-                )
-                # decompress wal file
-                try:
-                    wal_compressor.decompress(source_file, uncompressed_file.name)
-                except CommandFailedException as exc:
-                    output.error("Error decompressing WAL: %s", str(exc))
-                    return
-                source_file = uncompressed_file.name
+        if not keep_compression:
+            # If the required compression is different from the source we
+            # decompress/compress it into the required format (getattr is
+            # used here to gracefully handle None objects)
+            if getattr(wal_compressor, "compression", None) != getattr(
+                out_compressor, "compression", None
+            ):
+                # If source is compressed, decompress it into a temporary file
+                if wal_compressor is not None:
+                    uncompressed_file = NamedTemporaryFile(
+                        dir=self.config.wals_directory,
+                        prefix=".%s." % os.path.basename(wal_file),
+                        suffix=".uncompressed",
+                    )
+                    # decompress wal file
+                    try:
+                        wal_compressor.decompress(source_file, uncompressed_file.name)
+                    except CommandFailedException as exc:
+                        output.error("Error decompressing WAL: %s", str(exc))
+                        return
+                    source_file = uncompressed_file.name
 
-            # If output compression is required compress the source
-            # into a temporary file
-            if out_compressor is not None:
-                compressed_file = NamedTemporaryFile(
-                    dir=self.config.wals_directory,
-                    prefix=".%s." % os.path.basename(wal_file),
-                    suffix=".compressed",
-                )
-                out_compressor.compress(source_file, compressed_file.name)
-                source_file = compressed_file.name
+                # If output compression is required compress the source
+                # into a temporary file
+                if out_compressor is not None:
+                    compressed_file = NamedTemporaryFile(
+                        dir=self.config.wals_directory,
+                        prefix=".%s." % os.path.basename(wal_file),
+                        suffix=".compressed",
+                    )
+                    out_compressor.compress(source_file, compressed_file.name)
+                    source_file = compressed_file.name
 
         # Copy the prepared source file to destination
         with open(source_file, "rb") as input_file:
@@ -2429,7 +2455,9 @@ class Server(RemoteStatusMixin):
         # The closing wrapper is needed only for Python 2.6
         extracted_files = {}
         validated_files = {}
-        md5sums = {}
+        hashsums = {}
+        extracted_files_with_checksums = {}
+        hash_algorithm = "sha256"
         try:
             with closing(tarfile.open(mode="r|", fileobj=fileobj)) as tar:
                 for item in tar:
@@ -2458,7 +2486,7 @@ class Server(RemoteStatusMixin):
                         )
                         return
                     # Checksum file
-                    if name == "MD5SUMS":
+                    if name in ("MD5SUMS", "SHA256SUMS"):
                         # Parse content and store it in md5sums dictionary
                         for line in tar.extractfile(item).readlines():
                             line = line.decode().rstrip()
@@ -2477,7 +2505,9 @@ class Server(RemoteStatusMixin):
                             # Strip leading './' from path in the checksum file
                             if path.startswith("./"):
                                 path = path[2:]
-                            md5sums[path] = checksum
+                            hashsums[path] = checksum
+                        if name == "MD5SUMS":
+                            hash_algorithm = "md5"
                     else:
                         # Extract using a temp name (with PID)
                         tmp_path = os.path.join(
@@ -2488,15 +2518,25 @@ class Server(RemoteStatusMixin):
                         # Set the original timestamp
                         tar.utime(item, tmp_path)
                         # Add the tuple to the dictionary of extracted files
-                        extracted_files[name] = incoming_file(
-                            name, tmp_path, path, file_md5(tmp_path)
+                        extracted_files[name] = dict(
+                            name=name,
+                            tmp_path=tmp_path,
+                            path=path,
                         )
                         validated_files[name] = False
 
+            for name, _dict in extracted_files.items():
+                extracted_files_with_checksums[name] = incoming_file(
+                    _dict["name"],
+                    _dict["tmp_path"],
+                    _dict["path"],
+                    file_hash(_dict["tmp_path"], hash_algorithm=hash_algorithm),
+                )
+
             # For each received checksum verify the corresponding file
-            for name in md5sums:
+            for name in hashsums:
                 # Check that file is present in the tar archive
-                if name not in extracted_files:
+                if name not in extracted_files_with_checksums:
                     output.error(
                         "Checksum without corresponding file '%s' "
                         "in put-wal for server '%s'%s",
@@ -2506,13 +2546,13 @@ class Server(RemoteStatusMixin):
                     )
                     return
                 # Verify the checksum of the file
-                if extracted_files[name].checksum != md5sums[name]:
+                if extracted_files_with_checksums[name].checksum != hashsums[name]:
                     output.error(
                         "Bad file checksum '%s' (should be %s) "
                         "for file '%s' "
                         "in put-wal for server '%s'%s",
-                        extracted_files[name].checksum,
-                        md5sums[name],
+                        extracted_files_with_checksums[name].checksum,
+                        hashsums[name],
                         name,
                         self.config.name,
                         source_suffix,
@@ -2522,14 +2562,14 @@ class Server(RemoteStatusMixin):
                     "Received file '%s' with checksum '%s' "
                     "by put-wal for server '%s'%s",
                     name,
-                    md5sums[name],
+                    hashsums[name],
                     self.config.name,
                     source_suffix,
                 )
                 validated_files[name] = True
 
             # Put the files in the final place, atomically and fsync all
-            for item in extracted_files.values():
+            for item in extracted_files_with_checksums.values():
                 # Final verification of checksum presence for each file
                 if not validated_files[item.name]:
                     output.error(
@@ -2558,7 +2598,7 @@ class Server(RemoteStatusMixin):
             fsync_dir(dest_dir)
         finally:
             # Cleanup of any remaining temp files (where applicable)
-            for item in extracted_files.values():
+            for item in extracted_files_with_checksums.values():
                 if os.path.exists(item.tmp_path):
                     os.unlink(item.tmp_path)
 

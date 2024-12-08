@@ -21,7 +21,6 @@ This module is responsible for all the things related to
 Barman configuration, such as parsing configuration file.
 """
 
-from copy import deepcopy
 import collections
 import datetime
 import inspect
@@ -30,6 +29,7 @@ import logging.handlers
 import os
 import re
 import sys
+from copy import deepcopy
 from glob import iglob
 from typing import List
 
@@ -489,6 +489,10 @@ class ServerConfig(BaseConfig):
         "archiver_batch_size",
         "autogenerate_manifest",
         "aws_await_snapshots_timeout",
+        "aws_snapshot_lock_mode",
+        "aws_snapshot_lock_duration",
+        "aws_snapshot_lock_cool_off_period",
+        "aws_snapshot_lock_expiration_date",
         "aws_profile",
         "aws_region",
         "azure_credential",
@@ -587,6 +591,10 @@ class ServerConfig(BaseConfig):
         "archiver_batch_size",
         "autogenerate_manifest",
         "aws_await_snapshots_timeout",
+        "aws_snapshot_lock_mode",
+        "aws_snapshot_lock_duration",
+        "aws_snapshot_lock_cool_off_period",
+        "aws_snapshot_lock_expiration_date",
         "aws_profile",
         "aws_region",
         "azure_credential",
@@ -710,6 +718,8 @@ class ServerConfig(BaseConfig):
         "archiver_batch_size": int,
         "autogenerate_manifest": parse_boolean,
         "aws_await_snapshots_timeout": int,
+        "aws_snapshot_lock_duration": int,
+        "aws_snapshot_lock_cool_off_period": int,
         "backup_compression": parse_backup_compression,
         "backup_compression_format": parse_backup_compression_format,
         "backup_compression_level": int,
@@ -947,20 +957,18 @@ class ServerConfig(BaseConfig):
 
         :rtype: (str,str)
         :return: Tuple consisting of the ``wal_streaming_conninfo`` and
-            ``wal_conninfo`` defined in the configuration if ``wal_streaming_conninfo``
-            is set, a tuple of ``streaming_conninfo`` and ``conninfo`` otherwise.
+            ``wal_conninfo``.
         """
-        wal_streaming_conninfo, wal_conninfo = None, None
-        if self.wal_streaming_conninfo is not None:
-            wal_streaming_conninfo = self.wal_streaming_conninfo
-            if self.wal_conninfo is not None:
-                wal_conninfo = self.wal_conninfo
-            else:
-                wal_conninfo = self.wal_streaming_conninfo
+        # If `wal_streaming_conninfo` is not set, fall back to `streaming_conninfo`
+        wal_streaming_conninfo = self.wal_streaming_conninfo or self.streaming_conninfo
+
+        # If `wal_conninfo` is not set, fall back to `wal_streaming_conninfo`. If
+        # `wal_streaming_conninfo` is not set, fall back to `conninfo`.
+        if self.wal_conninfo is not None:
+            wal_conninfo = self.wal_conninfo
+        elif self.wal_streaming_conninfo is not None:
+            wal_conninfo = self.wal_streaming_conninfo
         else:
-            # If wal_streaming_conninfo is not set then return the original
-            # streaming_conninfo and conninfo parameters
-            wal_streaming_conninfo = self.streaming_conninfo
             wal_conninfo = self.conninfo
         return wal_streaming_conninfo, wal_conninfo
 

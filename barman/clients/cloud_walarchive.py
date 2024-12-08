@@ -22,15 +22,15 @@ import os.path
 from contextlib import closing
 
 from barman.clients.cloud_cli import (
-    add_tag_argument,
-    create_argument_parser,
     CLIErrorExit,
     GeneralErrorExit,
     NetworkErrorExit,
     UrlArgumentType,
+    add_tag_argument,
+    create_argument_parser,
 )
-from barman.cloud import configure_logging
 from barman.clients.cloud_compression import compress
+from barman.cloud import configure_logging
 from barman.cloud_providers import get_cloud_interface
 from barman.exceptions import BarmanException
 from barman.utils import check_positive, check_size, force_str
@@ -148,11 +148,34 @@ def parse_arguments(args=None):
         dest="compression",
     )
     compression.add_argument(
+        "--xz",
+        help="xz-compress the WAL while uploading to the cloud "
+        "(should not be used with python < 3.3)",
+        action="store_const",
+        const="xz",
+        dest="compression",
+    )
+    compression.add_argument(
         "--snappy",
         help="snappy-compress the WAL while uploading to the cloud "
         "(requires optional python-snappy library)",
         action="store_const",
         const="snappy",
+        dest="compression",
+    )
+    compression.add_argument(
+        "--zstd",
+        help="zstd-compress the WAL while uploading to the cloud "
+        "(requires optional zstandard library)",
+        action="store_const",
+        const="zstd",
+    )
+    compression.add_argument(
+        "--lz4",
+        help="lz4-compress the WAL while uploading to the cloud "
+        "(requires optional lz4 library)",
+        action="store_const",
+        const="lz4",
         dest="compression",
     )
     add_tag_argument(
@@ -316,9 +339,21 @@ class CloudWalUploader(object):
             # add bz2 extension
             return "%s.bz2" % wal_name
 
+        elif self.compression == "xz":
+            # add xz extension
+            return "%s.xz" % wal_name
+
         elif self.compression == "snappy":
             # add snappy extension
             return "%s.snappy" % wal_name
+
+        elif self.compression == "zstd":
+            # add zst extension
+            return "%s.zst" % wal_name
+
+        elif self.compression == "lz4":
+            # add lz4 extension
+            return "%s.lz4" % wal_name
         else:
             raise ValueError("Unknown compression type: %s" % self.compression)
 

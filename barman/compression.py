@@ -24,6 +24,7 @@ import binascii
 import bz2
 import gzip
 import logging
+import lzma
 import shutil
 from abc import ABCMeta, abstractmethod, abstractproperty
 from contextlib import closing
@@ -31,13 +32,13 @@ from distutils.version import LooseVersion as Version
 
 import barman.infofile
 from barman.command_wrappers import Command
-from barman.fs import unix_command_factory
 from barman.exceptions import (
     CommandFailedException,
     CompressionException,
     CompressionIncompatibility,
     FileNotFoundException,
 )
+from barman.fs import unix_command_factory
 from barman.utils import force_str, with_metaclass
 
 _logger = logging.getLogger(__name__)
@@ -63,7 +64,7 @@ class CompressionManager(object):
             # If custom_compression_magic is set then we should not assume
             # unidentified files are custom compressed and should rely on the
             # magic for identification instead.
-            elif type(config.custom_compression_magic) == str:
+            elif isinstance(config.custom_compression_magic, str):
                 # Since we know the custom compression magic we can now add it
                 # to the class property.
                 compression_registry["custom"].MAGIC = binascii.unhexlify(
@@ -407,6 +408,84 @@ class PyBZip2Compressor(InternalCompressor):
         return bz2.BZ2File(name, mode="rb")
 
 
+class XZCompressor(InternalCompressor):
+    """
+    Predefined compressor with XZ Python library
+    """
+
+    MAGIC = b"\xfd7zXZ\x00"
+
+    def _compressor(self, dst):
+        return lzma.open(dst, mode="wb")
+
+    def _decompressor(self, src):
+        return lzma.open(src, mode="rb")
+
+
+def _try_import_zstd():
+    try:
+        import zstandard
+    except ImportError:
+        raise SystemExit("Missing required python module: zstandard")
+    return zstandard
+
+
+class ZSTDCompressor(InternalCompressor):
+    """
+    Predefined compressor with zstd
+    """
+
+    MAGIC = b"(\xb5/\xfd"
+
+    def __init__(self, config, compression, path=None):
+        """
+        Constructor.
+        :param config: barman.config.ServerConfig
+        :param compression: str compression name
+        :param path: str|None
+        """
+        super(ZSTDCompressor, self).__init__(config, compression, path)
+        self._zstd = _try_import_zstd()
+
+    def _compressor(self, dst):
+        return self._zstd.ZstdCompressor().stream_writer(open(dst, mode="wb"))
+
+    def _decompressor(self, src):
+        return self._zstd.ZstdDecompressor().stream_reader(open(src, mode="rb"))
+
+
+def _try_import_lz4():
+    try:
+        import lz4.frame
+    except ImportError:
+        raise SystemExit("Missing required python module: lz4")
+    return lz4
+
+
+class LZ4Compressor(InternalCompressor):
+    """
+    Predefined compressor with lz4
+    """
+
+    MAGIC = b"\x04\x22\x4D\x18"
+
+    def __init__(self, config, compression, path=None):
+        """
+        Constructor.
+        :param config: barman.config.ServerConfig
+        :param compression: str compression name
+        :param path: str|None
+        """
+        super(LZ4Compressor, self).__init__(config, compression, path)
+        self._lz4 = _try_import_lz4()
+
+    def _compressor(self, dst):
+        return self._lz4.frame.open(dst, mode="wb")
+
+    def _decompressor(self, src):
+        return self._lz4.frame.open(src, mode="rb")
+
+
 class CustomCompressor(CommandCompressor):
     """
     Custom compressor
@@ -419,14 +498,12 @@ class CustomCompressor(CommandCompressor):
         :param compression: str compression name
         :param path: str|None
         """
-        if (
-            config.custom_compression_filter is None
-            or type(config.custom_compression_filter) != str
+        if config.custom_compression_filter is None or not isinstance(
+            config.custom_compression_filter, str
         ):
             raise CompressionIncompatibility("custom_compression_filter")
-        if (
-            config.custom_decompression_filter is None
-            or type(config.custom_decompression_filter) != str
+        if config.custom_decompression_filter is None or not isinstance(
+            config.custom_decompression_filter, str
         ):
             raise CompressionIncompatibility("custom_decompression_filter")
 
@@ -445,6 +522,9 @@ compression_registry = {
     "bzip2": BZip2Compressor,
     "pygzip": PyGZipCompressor,
     "pybzip2": PyBZip2Compressor,
+    "xz": XZCompressor,
+    "zstd": ZSTDCompressor,
+    "lz4": LZ4Compressor,
     "custom": CustomCompressor,
 }
 

@@ -16,16 +16,18 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
+import datetime
+import itertools
+import json
 import logging
+
 import mock
 import pytest
-
 from azure.core.exceptions import ResourceNotFoundError
 from botocore.exceptions import ClientError
 from google.api_core.exceptions import NotFound
 
 from barman.cloud import CloudProviderError
-
 from barman.cloud_providers import (
     CloudProviderUnsupported,
     get_snapshot_interface,
@@ -143,13 +145,22 @@ class TestGetSnapshotInterface(object):
             aws_region="us-east-2",
             aws_profile="default",
             aws_await_snapshots_timeout=7200,
+            aws_snapshot_lock_mode="compliance",
+            aws_snapshot_lock_duration=1,
+            aws_snapshot_lock_cool_off_period=2,
+            aws_snapshot_lock_expiration_date=datetime.datetime(2024, 1, 1),
         )
+
         # WHEN get_snapshot_interface_from_server_config is called
         snapshot_interface = get_snapshot_interface_from_server_config(mock_config)
         # THEN the config values are passed to the snapshot interface
         assert isinstance(snapshot_interface, AwsCloudSnapshotInterface)
         assert snapshot_interface.region == "us-east-2"
         assert snapshot_interface.await_snapshots_timeout == 7200
+        assert snapshot_interface.lock_mode == "compliance"
+        assert snapshot_interface.lock_duration == 1
+        assert snapshot_interface.lock_cool_off_period == 2
+        assert snapshot_interface.lock_expiration_date == datetime.datetime(2024, 1, 1)
         mock_boto3.Session.assert_called_once_with(profile_name="default")
 
     @pytest.mark.parametrize(
@@ -374,6 +385,11 @@ class TestGetSnapshotInterface(object):
             aws_region="us-east-2",
             aws_profile="default",
             aws_await_snapshots_timeout=7200,
+            aws_snapshot_lock_mode="compliance",
+            aws_snapshot_lock_duration=1,
+            aws_snapshot_lock_cool_off_period=2,
+            aws_snapshot_lock_expiration_date=datetime.datetime(2024, 1, 1),
+            tags=None,
         )
         # WHEN get_snapshot_interface is called
         snapshot_interface = get_snapshot_interface(mock_config)
@@ -381,6 +397,10 @@ class TestGetSnapshotInterface(object):
         assert isinstance(snapshot_interface, AwsCloudSnapshotInterface)
         assert snapshot_interface.region == "us-east-2"
         assert snapshot_interface.await_snapshots_timeout == 7200
+        assert snapshot_interface.lock_mode == "compliance"
+        assert snapshot_interface.lock_duration == 1
+        assert snapshot_interface.lock_cool_off_period == 2
+        assert snapshot_interface.lock_expiration_date == datetime.datetime(2024, 1, 1)
         mock_boto3.Session.assert_called_once_with(profile_name="default")
 
 
@@ -2624,6 +2644,33 @@ class TestAwsCloudSnapshotInterface(object):
             ]
         }
 
+    def _get_mock_lock_snapshot(self, disks):
+        """Helper which returns a mock lock_snapshot response."""
+        lock_created_on = datetime.datetime(
+            2024, 1, 1, 0, 0, 0, 0, datetime.timezone.utc
+        )
+
+        responses = iter(
+            [
+                {
+                    "SnapshotId": self._get_snapshot_id(disk),
+                    "LockState": "compliance",
+                    "LockDuration": 1,
+                    "CoolOffPeriod": 1,
+                    "CoolOffPeriodExpiresOn": (
+                        lock_created_on + datetime.timedelta(hours=1)
+                    ),
+                    "LockCreatedOn": lock_created_on,
+                }
+                for disk in disks
+            ]
+        )
+
+        def mock_fun(*args, **kwargs):
+            return next(responses)
+
+        return mock_fun
+
     def _get_snapshot_id(self, disk):
         """Helper which forges the expected snapshot id for the given disk id."""
         return disk["id"].replace("vol", "snap")
@@ -2692,12 +2739,16 @@ class TestAwsCloudSnapshotInterface(object):
             # AND the default region is set on the snapshot interface
             assert snapshot_interface.region == mock_session.region_name
 
-    def test_create_snapshot(self, caplog):
+    @pytest.mark.parametrize(
+        "tags", (None, [("environment", "production"), ("project", "my-project")])
+    )
+    def test_create_snapshot(self, tags, caplog):
         """
         Verify that _create_snapshot calls boto3 and returns the expected values.
+        Check if tags are applied when set.
         """
         # GIVEN a new AwsCloudInterface
-        snapshot_interface = AwsCloudSnapshotInterface()
+        snapshot_interface = AwsCloudSnapshotInterface(tags=tags)
         # AND a backup_info for a given server name and backup ID
         backup_info = mock.Mock(backup_id=self.backup_id, server_name=self.server_name)
         # AND a mock create_snapshot function which returns a successful response
@@ -2718,13 +2769,19 @@ class TestAwsCloudSnapshotInterface(object):
 
         # THEN create_snapshot is called on the EC2 client with the expected args
         mock_ec2_client.create_snapshot.assert_called_once()
-        mock_ec2_client.create_snapshot.assert_called_once_with(
-            TagSpecifications=[
-                {
-                    "ResourceType": "snapshot",
-                    "Tags": [{"Key": "Name", "Value": snapshot_name}],
-                }
+        tag_specs = {
+            "ResourceType": "snapshot",
+            "Tags": [
+                {"Key": "Name", "Value": snapshot_name},
             ],
+        }
+
+        if tags:
+            for key, value in tags:
+                tag_specs["Tags"].append({"Key": key, "Value": value})
+
+        mock_ec2_client.create_snapshot.assert_called_once_with(
+            TagSpecifications=[tag_specs],
             VolumeId=volume_id,
         )
         # AND snapshot_name has the expected value
@@ -2769,11 +2826,51 @@ class TestAwsCloudSnapshotInterface(object):
         expected_snapshot_name = "my-pgdata-volume-{}".format(self.backup_id.lower())
         assert "Snapshot '{}' failed".format(expected_snapshot_name) in str(exc.value)
 
-    @pytest.mark.parametrize("number_of_disks", (1, 2, 3))
-    def test_take_snapshot_backup(self, number_of_disks, mock_ec2_client):
+    def test__lock_snapshot(self, caplog):
+        """
+        Verify that _lock_snapshot calls boto3.
+        """
+        args = {
+            "snapshot_id": "snap-123",
+            "lock_mode": "governance",
+            "lock_duration": None,
+            "lock_cool_off_period": None,
+            "lock_expiration_date": "2025-11-08T21:53:00.606Z",
+        }
+
+        snapshot_interface = AwsCloudSnapshotInterface()
+        mock_ec2_client = self._mock_boto3.Session.return_value.client.return_value
+        mock_resp = mock_ec2_client.lock_snapshot.return_value
+        mock_resp["SnapshotId"] = args["snapshot_id"]
+        mock_resp["LockState"] = args["lock_mode"]
+        mock_resp["LockCreatedOn"] = "1991-01-01T00:00:00.000Z"
+        mock_resp["LockExpiresOn"] = args["lock_expiration_date"]
+        caplog.set_level(logging.INFO)
+
+        _ = snapshot_interface._lock_snapshot(**args)
+
+        mock_ec2_client.lock_snapshot.assert_called_once_with(
+            SnapshotId="snap-123",
+            LockMode="governance",
+            ExpirationDate="2025-11-08T21:53:00.606Z",
+        )
+
+        assert (
+            "Snapshot locked: \n%s" % json.dumps(dict(mock_resp), indent=4)
+            in caplog.text
+        )
+
+    @pytest.mark.parametrize(
+        ("number_of_disks", "snapshot_lock"),
+        list(itertools.product((1, 2, 3), (True, False))),
+    )
+    def test_take_snapshot_backup(
+        self, number_of_disks, snapshot_lock, mock_ec2_client
+    ):
         """
         Verify that take_snapshot_backup waits for completion of all snapshots and
-        updates the backup_info when complete.
+        updates the backup_info when complete. Also verifies if the _lock_snapshot is
+        called when the interface has a lock_mode.
         """
         # GIVEN a set of disks, represented as VolumeMetadata
         disks = self.aws_disks[:number_of_disks]
@@ -2786,22 +2883,30 @@ class TestAwsCloudSnapshotInterface(object):
         mock_ec2_client.describe_instances.return_value = (
             self._get_mock_describe_instances_resp(disks)
         )
-        # AND the mock EC2 client returns successful create_snapashot responses
+        # AND the mock EC2 client returns successful create_snapshot responses
         mock_ec2_client.create_snapshot.side_effect = self._get_mock_create_snapshot(
             disks
         )
         # AND a new AwsCloudSnapshotInterface
         snapshot_interface = AwsCloudSnapshotInterface(region=self.aws_region)
+        snapshot_interface.lock_mode = snapshot_lock
 
         # WHEN take_snapshot_backup is called
         snapshot_interface.take_snapshot_backup(
             backup_info, self.aws_instance_id, volumes
         )
 
+        # When there is a lock_mode, we check if it was called for all disks
+        if snapshot_interface.lock_mode:
+            mock_ec2_client.lock_snapshot.call_count == number_of_disks
+            mock_ec2_client.lock_snapshot.side_effect = self._get_mock_lock_snapshot(
+                disks
+            )
+
         # THEN we waited for completion of all snapshots
         expected_snapshot_ids = [self._get_snapshot_id(disk) for disk in disks]
         mock_ec2_client.get_waiter.return_value.wait.assert_called_once_with(
-            Filters=[{"Name": "snapshot-id", "Values": expected_snapshot_ids}],
+            SnapshotIds=expected_snapshot_ids,
             WaiterConfig={"Delay": 15, "MaxAttempts": 240},
         )
 
@@ -2908,7 +3013,7 @@ class TestAwsCloudSnapshotInterface(object):
         mock_ec2_client.describe_instances.return_value = (
             self._get_mock_describe_instances_resp(disks)
         )
-        # AND the mock EC2 client returns successful create_snapashot responses
+        # AND the mock EC2 client returns successful create_snapshot responses
         mock_ec2_client.create_snapshot.side_effect = self._get_mock_create_snapshot(
             disks
         )
@@ -2926,11 +3031,11 @@ class TestAwsCloudSnapshotInterface(object):
         # THEN we waited for completion of all snapshots with the expected WaiterConfig
         expected_snapshot_ids = [self._get_snapshot_id(disk) for disk in disks]
         mock_ec2_client.get_waiter.return_value.wait.assert_called_once_with(
-            Filters=[{"Name": "snapshot-id", "Values": expected_snapshot_ids}],
+            SnapshotIds=expected_snapshot_ids,
             WaiterConfig=expected_wait_config,
         )
 
-    aws_live_states = ["pending", "running", "shutting-down", "stopping", "stopped"]
+    AWS_LIVE_STATES = ["pending", "running", "shutting-down", "stopping", "stopped"]
 
     def test_get_instance_metadata_by_id(self, mock_ec2_client):
         """
@@ -2952,7 +3057,7 @@ class TestAwsCloudSnapshotInterface(object):
         # THEN describe_instances was called once with the instance ID and filter
         mock_ec2_client.describe_instances.assert_called_once_with(
             InstanceIds=[self.aws_instance_id],
-            Filters=[{"Name": "instance-state-name", "Values": self.aws_live_states}],
+            Filters=[{"Name": "instance-state-name", "Values": self.AWS_LIVE_STATES}],
         )
 
         # AND the mock instance metadata was returned
@@ -2981,14 +3086,14 @@ class TestAwsCloudSnapshotInterface(object):
         assert mock_ec2_client.describe_instances.call_args_list[0][1] == {
             "InstanceIds": [instance_name],
             "Filters": [
-                {"Name": "instance-state-name", "Values": self.aws_live_states}
+                {"Name": "instance-state-name", "Values": self.AWS_LIVE_STATES}
             ],
         }
         # AND again with a tag filter
         assert mock_ec2_client.describe_instances.call_args_list[1][1] == {
             "Filters": [
                 {"Name": "tag:Name", "Values": [instance_name]},
-                {"Name": "instance-state-name", "Values": self.aws_live_states},
+                {"Name": "instance-state-name", "Values": self.AWS_LIVE_STATES},
             ]
         }
 
@@ -3015,7 +3120,7 @@ class TestAwsCloudSnapshotInterface(object):
         mock_ec2_client.describe_instances.assert_called_once_with(
             Filters=[
                 {"Name": "tag:Name", "Values": [instance_name]},
-                {"Name": "instance-state-name", "Values": self.aws_live_states},
+                {"Name": "instance-state-name", "Values": self.AWS_LIVE_STATES},
             ]
         )
 
@@ -3440,7 +3545,10 @@ class TestAwsCloudSnapshotInterface(object):
         (
             [],
             [mock.Mock(identifier="snap-0123")],
-            [mock.Mock(identifier="snap-0123"), mock.Mock(identifier="snap0124")],
+            [
+                mock.Mock(identifier="snap-0123"),
+                mock.Mock(identifier="snap0124"),
+            ],
         ),
     )
     def test_delete_snapshot_backup(self, snapshots_list, mock_ec2_client, caplog):
@@ -3465,6 +3573,27 @@ class TestAwsCloudSnapshotInterface(object):
             mock.call(SnapshotId=snapshot.identifier) for snapshot in snapshots_list
         ]
         mock_ec2_client.delete_snapshot.assert_has_calls(expected_calls)
+
+    def test_delete_snapshot_with_lock(self, mock_ec2_client):
+        """Verify that a snapshot is not deleted and an error is raised."""
+        mock_ec2_client.delete_snapshot.side_effect = (
+            ClientError({"Error": {"Code": "SnapshotLocked"}}, "message"),
+        )
+        # AND a mock snapshots interface
+        snapshot_interface = AwsCloudSnapshotInterface(region=self.aws_region)
+
+        snapshot_id = "snap-0123"
+        with pytest.raises(SystemExit) as exc:
+            snapshot_interface._delete_snapshot(snapshot_id)
+
+        # AND the exception has the expected message
+        expected_message = (
+            f"Locked snapshot: {snapshot_id}.\n"
+            "Before deleting a snapshot, please ensure that it is not locked "
+            "or that the lock has expired."
+        )
+
+        assert expected_message in str(exc.value)
 
 
 class TestAwsVolumeMetadata(object):

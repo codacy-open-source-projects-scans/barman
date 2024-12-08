@@ -25,35 +25,17 @@ import json
 import logging
 import os
 import sys
-from argparse import (
-    SUPPRESS,
-    ArgumentTypeError,
-    ArgumentParser,
-    HelpFormatter,
-)
-
-from barman.lockfile import ConfigUpdateLock
-
-if sys.version_info.major < 3:
-    from argparse import Action, _SubParsersAction, _ActionsContainer
-try:
-    import argcomplete
-except ImportError:
-    argcomplete = None
+from argparse import SUPPRESS, ArgumentParser, ArgumentTypeError, HelpFormatter
 from collections import OrderedDict
 from contextlib import closing
-
 
 import barman.config
 import barman.diagnose
 import barman.utils
 from barman import output
 from barman.annotations import KeepManager
-from barman.config import (
-    ConfigChangesProcessor,
-    RecoveryOptions,
-    parse_staging_path,
-)
+from barman.backup_manifest import BackupManifest
+from barman.config import ConfigChangesProcessor, RecoveryOptions, parse_staging_path
 from barman.exceptions import (
     BadXlogSegmentName,
     LockFileBusy,
@@ -62,8 +44,12 @@ from barman.exceptions import (
     WalArchiveContentError,
 )
 from barman.infofile import BackupInfo, WalFileInfo
+from barman.lockfile import ConfigUpdateLock
 from barman.server import Server
+from barman.storage.local_file_manager import LocalFileManager
 from barman.utils import (
+    RESERVED_BACKUP_IDS,
+    SHA256,
     BarmanEncoder,
     check_backup_name,
     check_non_negative,
@@ -72,15 +58,19 @@ from barman.utils import (
     configure_logging,
     drop_privileges,
     force_str,
-    get_log_levels,
     get_backup_id_using_shortcut,
+    get_log_levels,
     parse_log_level,
-    RESERVED_BACKUP_IDS,
-    SHA256,
 )
 from barman.xlog import check_archive_usable
-from barman.backup_manifest import BackupManifest
-from barman.storage.local_file_manager import LocalFileManager
+
+if sys.version_info.major < 3:
+    from argparse import Action, _ActionsContainer, _SubParsersAction
+try:
+    import argcomplete
+except ImportError:
+    argcomplete = None
+
 
 _logger = logging.getLogger(__name__)
 
@@ -494,7 +484,7 @@ def backup_completer(prefix, parsed_args, **kwargs):
         argument(
             "--name",
             help="a name which can be used to reference this backup in barman "
-            "commands such as recover and delete",
+            "commands such as restore and delete",
             dest="backup_name",
             default=None,
             type=check_backup_name,
@@ -759,7 +749,7 @@ def rebuild_xlogdb(args):
         argument(
             "backup_id",
             completer=backup_completer,
-            help="specifies the backup ID to recover",
+            help="specifies the backup ID to restore",
         ),
         argument(
             "destination_directory",
@@ -853,7 +843,7 @@ def rebuild_xlogdb(args):
             dest="standby_mode",
             action="store_true",
             default=SUPPRESS,
-            help="Enable standby mode when starting the recovered PostgreSQL instance",
+            help="Enable standby mode when starting the restored PostgreSQL instance",
         ),
         argument(
             "--recovery-staging-path",
@@ -862,7 +852,7 @@ def rebuild_xlogdb(args):
                 "A path to a location on the recovery host where compressed backup "
                 "files will be staged during the recovery. This location must have "
                 "enough available space to temporarily hold the full compressed "
-                "backup. This option is *required* when recovering from a compressed "
+                "backup. This option is *required* when restoring from a compressed "
                 "backup."
             ),
         ),
@@ -872,7 +862,7 @@ def rebuild_xlogdb(args):
                 "A path to a location on the local host where incremental backups "
                 "will be combined during the recovery. This location must have "
                 "enough available space to temporarily hold the new synthetic "
-                "backup. This option is *required* when recovering from an "
+                "backup. This option is *required* when restoring from an "
                 "incremental backup."
             ),
         ),
@@ -909,11 +899,12 @@ def rebuild_xlogdb(args):
             help="The name of the AWS region containing the EC2 VM and storage "
             "volumes for recovery of a snapshot backup",
         ),
-    ]
+    ],
+    cmd_aliases=["recover"],
 )
-def recover(args):
+def restore(args):
     """
-    Recover a server at a given time, name, LSN or xid
+    Restore a server at a given time, name, LSN or xid
     """
     server = get_server(args)
 
@@ -921,7 +912,7 @@ def recover(args):
     backup_id = parse_backup_id(server, args)
     if backup_id.status not in BackupInfo.STATUS_COPY_DONE:
         output.error(
-            "Cannot recover from backup '%s' of server '%s': "
+            "Cannot restore from backup '%s' of server '%s': "
             "backup status is not DONE",
             args.backup_id,
             server.config.name,
@@ -944,7 +935,7 @@ def recover(args):
         # data can be staged.
         if server.config.recovery_staging_path is None:
             output.error(
-                "Cannot recover from backup '%s' of server '%s': "
+                "Cannot restore from backup '%s' of server '%s': "
                 "backup is compressed with %s compression but no recovery "
                 "staging path is provided. Either set recovery_staging_path "
                 "in the Barman config or use the --recovery-staging-path "
@@ -971,7 +962,7 @@ def recover(args):
         # data can be staged.
         if server.config.local_staging_path is None:
             output.error(
-                "Cannot recover from backup '%s' of server '%s': "
+                "Cannot restore from backup '%s' of server '%s': "
                 "backup will be combined with pg_combinebackup in the "
                 "barman host but no local staging path is provided. "
                 "Either set local_staging_path in the Barman config "
@@ -1546,6 +1537,12 @@ def delete(args):
             default=SUPPRESS,
         ),
         argument(
+            "--keep-compression",
+            help="do not decompress the output if compressed",
+            action="store_true",
+            dest="keep_compression",
+        ),
+        argument(
             "--peek",
             "-p",
             help="peek from the WAL archive up to 'SIZE' WAL files, starting "
@@ -1585,13 +1582,21 @@ def get_wal(args):
     # the namespace doesn't contain it due to SUPPRESS default.
     # In that case we pick 'None' using getattr third argument.
     compression = getattr(args, "compression", None)
+    keep_compression = getattr(args, "keep_compression", False)
     output_directory = getattr(args, "output_directory", None)
     peek = getattr(args, "peek", None)
+
+    if compression and keep_compression:
+        output.error(
+            "argument `%s` not allowed with argument `keep-compression`" % compression
+        )
+        output.close_and_exit()
 
     with closing(server):
         server.get_wal(
             args.wal_name,
             compression=compression,
+            keep_compression=keep_compression,
             output_directory=output_directory,
             peek=peek,
             partial=args.partial,
@@ -1823,9 +1828,14 @@ def generate_manifest(args):
         argument(
             "backup_id", completer=backup_completer, help="specifies the backup ID"
         ),
-        argument("--release", help="remove the keep annotation", action="store_true"),
         argument(
-            "--status", help="return the keep status of the backup", action="store_true"
+            "-r", "--release", help="remove the keep annotation", action="store_true"
+        ),
+        argument(
+            "-s",
+            "--status",
+            help="return the keep status of the backup",
+            action="store_true",
         ),
         argument(
             "--target",
@@ -1922,13 +1932,13 @@ def check_wal_archive(args):
             "server_name",
             completer=server_completer,
             help="specifies the name of the server which configuration should "
-            "be override by the model",
+            "be overriden by the model",
         ),
         argument(
             "model_name",
             help="specifies the name of the model which configuration should "
-            "override the server configuration. Not used when called with "
-            "the '--reset' flag",
+            "override the server configuration. This is an optional argument "
+            "and will not be used when called with the '--reset' flag.",
             nargs="?",
         ),
         argument(

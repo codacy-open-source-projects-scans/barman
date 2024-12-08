@@ -27,12 +27,12 @@ from mock import MagicMock, Mock, call, mock_open, patch
 from barman.config import (
     BackupOptions,
     BaseConfig,
-    ConfigMapping,
     Config,
     ConfigChange,
     ConfigChangeSet,
     ConfigChangesProcessor,
     ConfigChangesQueue,
+    ConfigMapping,
     CsvOption,
     ModelConfig,
     RecoveryOptions,
@@ -40,9 +40,9 @@ from barman.config import (
     parse_backup_compression_format,
     parse_backup_compression_location,
     parse_si_suffix,
-    parse_staging_path,
     parse_slot_name,
     parse_snapshot_disks,
+    parse_staging_path,
     parse_time_interval,
 )
 
@@ -1336,6 +1336,10 @@ class TestModelConfig:
             "archiver_batch_size": None,
             "autogenerate_manifest": None,
             "aws_await_snapshots_timeout": None,
+            "aws_snapshot_lock_mode": None,
+            "aws_snapshot_lock_duration": None,
+            "aws_snapshot_lock_cool_off_period": None,
+            "aws_snapshot_lock_expiration_date": None,
             "aws_profile": None,
             "aws_region": None,
             "azure_credential": None,
@@ -1425,6 +1429,16 @@ class TestModelConfig:
             "archiver_batch_size": {"source": "SOME_SOURCE", "value": None},
             "autogenerate_manifest": {"source": "SOME_SOURCE", "value": None},
             "aws_await_snapshots_timeout": {"source": "SOME_SOURCE", "value": None},
+            "aws_snapshot_lock_mode": {"source": "SOME_SOURCE", "value": None},
+            "aws_snapshot_lock_duration": {"source": "SOME_SOURCE", "value": None},
+            "aws_snapshot_lock_cool_off_period": {
+                "source": "SOME_SOURCE",
+                "value": None,
+            },
+            "aws_snapshot_lock_expiration_date": {
+                "source": "SOME_SOURCE",
+                "value": None,
+            },
             "aws_profile": {"source": "SOME_SOURCE", "value": None},
             "aws_region": {"source": "SOME_SOURCE", "value": None},
             "azure_credential": {"source": "SOME_SOURCE", "value": None},
@@ -1515,9 +1529,9 @@ class TestModelConfig:
             # If neither wal_streaming_conninfo nor wal_conninfo are set then we expect
             # the regular conninfo to be returned
             (None, None, ("s_conninfo", "conninfo")),
-            # If wal_streaming_conninfo is not set we expect the regular conninfo to be
+            # If wal_streaming_conninfo is not set we expect the wal_conninfo to be
             # returned
-            (None, "w_conninfo", ("s_conninfo", "conninfo")),
+            (None, "w_conninfo", ("s_conninfo", "w_conninfo")),
             # If wal_streaming_conninfo is set and wal_conninfo is not then we expect
             # wal_streaming_conninfo to be returned for both
             ("ws_conninfo", None, ("ws_conninfo", "ws_conninfo")),

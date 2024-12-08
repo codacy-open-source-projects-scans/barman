@@ -34,14 +34,15 @@ from functools import partial
 from io import BytesIO, RawIOBase
 from tempfile import NamedTemporaryFile
 
+from barman import xlog
 from barman.annotations import KeepManagerMixinCloud
 from barman.backup_executor import ConcurrentBackupStrategy, SnapshotBackupExecutor
 from barman.clients import cloud_compression
 from barman.clients.cloud_cli import get_missing_attrs
 from barman.exceptions import (
+    BackupException,
     BackupPreconditionException,
     BarmanException,
-    BackupException,
     ConfigurationException,
 )
 from barman.fs import UnixLocalCommand, path_allowed
@@ -58,7 +59,6 @@ from barman.utils import (
     total_seconds,
     with_metaclass,
 )
-from barman import xlog
 
 try:
     # Python 3.x
@@ -72,7 +72,14 @@ BUFSIZE = 16 * 1024
 LOGGING_FORMAT = "%(asctime)s [%(process)s] %(levelname)s: %(message)s"
 
 # Allowed compression algorithms
-ALLOWED_COMPRESSIONS = {".gz": "gzip", ".bz2": "bzip2", ".snappy": "snappy"}
+ALLOWED_COMPRESSIONS = {
+    ".gz": "gzip",
+    ".bz2": "bzip2",
+    ".xz": "xz",
+    ".snappy": "snappy",
+    ".zst": "zstd",
+    ".lz4": "lz4",
+}
 
 DEFAULT_DELIMITER = "/"
 

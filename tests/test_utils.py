@@ -19,21 +19,20 @@
 import decimal
 import json
 import logging
+import os
+import re
 import signal
 import sys
-import re
-import os
 from argparse import ArgumentTypeError
 from datetime import datetime, timedelta
-from dateutil import tz
+from distutils.version import LooseVersion
 
 import mock
 import pytest
-from distutils.version import LooseVersion
-from barman.lockfile import LockFile
+from dateutil import tz
 
 import barman.utils
-
+from barman.lockfile import LockFile
 
 LOGFILE_NAME = "logfile.log"
 
@@ -1020,6 +1019,88 @@ class TestCheckBackupNames(object):
         )
         # THEN None is returned
         assert backup_info is None
+
+
+class TestAWSSnapshotLock(object):
+    """
+    Tests AWS Snapshot Lock checks
+    """
+
+    def test_check_aws_expiration_date_format(self):
+        """
+        Tests if check_aws_expiration_date properly creates a datetime object
+        with the specific format.
+        """
+        assert isinstance(
+            barman.utils.check_aws_expiration_date_format("2024-01-01T00:00:00.000Z"),
+            datetime,
+        )
+
+    @pytest.mark.parametrize(
+        "timestamp", ["2024-01-01", "2024-01-01T00:00:00", "2024-01-01T00:00:00.000"]
+    )
+    def test_check_aws_expiration_date_format_error(self, timestamp):
+        """
+        Tests if check_aws_expiration_date raises an ArgumentTypeError if the value
+        is in the wrong format.
+        """
+        with pytest.raises(ArgumentTypeError):
+            barman.utils.check_aws_expiration_date_format(timestamp)
+
+    @pytest.mark.parametrize("duration", ["1", "12000", "36500"])
+    def test_check_aws_snapshot_lock_duration_range(self, duration):
+        """
+        Tests if check_aws_snapshot_lock_duration_range is properly set as an integer
+        in the range limit.
+        """
+        assert barman.utils.check_aws_snapshot_lock_duration_range(duration) == int(
+            duration
+        )
+
+    @pytest.mark.parametrize("duration", ["-1", "0", "36501"])
+    def test_check_aws_snapshot_lock_duration_range_error(self, duration):
+        """
+        Tests if check_aws_snapshot_lock_duration_range raises an ArgumentTypeError if
+        the value is outside the range.
+        """
+        with pytest.raises(ValueError):
+            barman.utils.check_aws_snapshot_lock_duration_range(duration)
+
+    @pytest.mark.parametrize("duration", ["1", "30", "72"])
+    def test_check_aws_snapshot_lock_cool_off_period_range(self, duration):
+        """
+        Tests if check_aws_snapshot_lock_cool_off_period_range is properly set as an
+        integer in the range limit.
+        """
+        assert barman.utils.check_aws_snapshot_lock_cool_off_period_range(
+            duration
+        ) == int(duration)
+
+    @pytest.mark.parametrize("duration", ["-1", "0", "73"])
+    def test_check_aws_snapshot_lock_cool_off_period_range_error(self, duration):
+        """
+        Tests if check_aws_snapshot_lock_cool_off_period_range raises an
+        ArgumentTypeError if the value is outside the range.
+        """
+        with pytest.raises(ValueError):
+            barman.utils.check_aws_snapshot_lock_cool_off_period_range(duration)
+
+    @pytest.mark.parametrize("mode", ["governance", "compliance"])
+    def test_check_aws_snapshot_lock_mode(self, mode):
+        """
+        Tests if check_aws_snapshot_lock_cool_off_period_range raises an
+        ArgumentTypeError if the value is outside the range.
+        """
+        assert barman.utils.check_aws_snapshot_lock_mode(mode) == str(mode)
+
+    @pytest.mark.parametrize("mode", ["nogovernance", "nocompliance"])
+    def test_check_aws_snapshot_lock_mode_error(self, mode):
+        """
+        Tests if check_aws_snapshot_lock_cool_off_period_range raises an
+        ArgumentTypeError if the value is outside the range.
+        """
+        with pytest.raises(ValueError):
+            barman.utils.check_aws_snapshot_lock_mode(mode) == str(mode)
 
 
 class TestEditConfig:

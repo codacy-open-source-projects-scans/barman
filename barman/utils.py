@@ -23,7 +23,6 @@ This module contains utility functions used in Barman.
 import datetime
 import decimal
 import errno
-from glob import glob
 import grp
 import hashlib
 import json
@@ -34,14 +33,15 @@ import pwd
 import re
 import signal
 import sys
-from argparse import ArgumentTypeError
 from abc import ABCMeta, abstractmethod
+from argparse import ArgumentTypeError
 from contextlib import contextmanager
+from distutils.version import Version
+from glob import glob
+
 from dateutil import tz
 
-from distutils.version import Version
 from barman import lockfile
-
 from barman.exceptions import TimeoutError
 
 _logger = logging.getLogger(__name__)
@@ -570,25 +570,27 @@ def is_power_of_two(number):
     return number != 0 and (number & (number - 1)) == 0
 
 
-def file_md5(file_path, buffer_size=1024 * 16):
+def file_hash(file_path, buffer_size=1024 * 16, hash_algorithm="sha256"):
     """
-    Calculate the md5 checksum for the provided file path
+    Calculate the checksum for the provided file path with a specific
+    hashing algorithm
 
     :param str file_path: path of the file to read
     :param int buffer_size: read buffer size, default 16k
+    :param str hash_algorithm: sha256 | md5
     :return str: Hexadecimal md5 string
     """
-    md5 = hashlib.md5()
+    hash_func = hashlib.new(hash_algorithm)
     with open(file_path, "rb") as file_object:
         while 1:
             buf = file_object.read(buffer_size)
             if not buf:
                 break
-            md5.update(buf)
-    return md5.hexdigest()
+            hash_func.update(buf)
+    return hash_func.hexdigest()
 
 
-# Might be better to use stream instead of full file content. As done in file_md5.
+# Might be better to use stream instead of full file content. As done in file_hash.
 # Might create performance issue for large files.
 class ChecksumAlgorithm(with_metaclass(ABCMeta)):
     @abstractmethod
@@ -724,6 +726,89 @@ def check_positive(value):
     if int_value < 1:
         raise ArgumentTypeError("'%s' is not a valid positive integer" % value)
     return int_value
+
+
+def check_aws_expiration_date_format(value):
+    """
+    Check user input for aws expiration date timestamp with a specific format.
+
+    :param value: str containing the value to check.
+    :raise ValueError: Fails with an invalid date.
+    """
+    fmt = "%Y-%m-%dT%H:%M:%S.%fZ"
+    try:
+        # Attempt to parse the input date string into a datetime object
+        return datetime.datetime.strptime(value, fmt)
+    except ValueError:
+        raise ArgumentTypeError(
+            "Invalid date: '%s'. Expected format is '%s'." % (value, fmt)
+        )
+
+
+def check_aws_snapshot_lock_duration_range(value):
+    """
+    Check for AWS Snapshot Lock duration range option
+
+    :param value: str containing the value to check
+    """
+    if value is None:
+        return None
+    try:
+        int_value = int(value)
+    except Exception:
+        raise ArgumentTypeError("'%s' is not a valid input" % value)
+
+    if not 1 <= int_value <= 36500:
+        raise ValueError(
+            "aws_snapshot_lock_duration must be between 1 and 36,500 days."
+        )
+
+    return int_value
+
+
+def check_aws_snapshot_lock_cool_off_period_range(value):
+    """
+    Check for AWS Snapshot Lock cool-off period range option
+
+    :param value: str containing the value to check
+    """
+    if value is None:
+        return None
+    try:
+        int_value = int(value)
+    except Exception:
+        raise ArgumentTypeError("'%s' is not a valid input" % value)
+
+    if not 1 <= int_value <= 72:
+        raise ValueError(
+            "aws_snapshot_lock_cool_off_period must be between 1 and 72 hours."
+        )
+
+    return int_value
+
+
+def check_aws_snapshot_lock_mode(value):
+    """
+    Replication slot names may only contain lower case letters, numbers,
+    and the underscore character. This function parse a replication slot name
+
+    :param str value: slot_name value
+    :return:
+    """
+
+    AWS_SNAPSHOT_LOCK_MODE = ["governance", "compliance"]
+    if value is None:
+        return None
+
+    value = value.lower()
+    if value not in AWS_SNAPSHOT_LOCK_MODE:
+        raise ValueError(
+            "Invalid AWS snapshot lock mode. "
+            "Please specify either 'governance' or 'compliance'. "
+            "Ensure that the mode you choose aligns with your snapshot locking "
+            "requirements."
+        )
+    return value
 
 
 def check_tli(value):
