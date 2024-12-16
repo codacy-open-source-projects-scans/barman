@@ -2,6 +2,25 @@
 
 © Copyright EnterpriseDB UK Limited 2024 - All rights reserved.
 
+## 3.12.1 (2024-12-09)
+
+### Bugfixes
+
+- Add isoformat fields for backup start and end times in json output
+
+  This patch modifies the json output of the infofile object
+  adding two new fields: `begin_time_iso` and `end_time_iso`.
+  The new fields allow the use of a more standard and timezone aware
+  time format, preserving compatibility with previous versions.
+  It is worth noting that in the future the iso format for dates will be the
+  standard used by barman for storing dates and will be used everywhere
+  non human readable output is requested.
+
+  As part of the work, this patch reverts BAR-316, which was introduced on Barman
+  3.12.0.
+
+  References: BAR-494.
+
 ## 3.12.0 (2024-11-21)
 
 ### Minor changes
@@ -157,6 +176,14 @@
 
   References: BAR-417.
 
+- Use ISO format instead of ctime when producing JSON output of Barman cloud commands
+
+  The ctime format has no information about the time zone associated with the timestamp.
+  Besides that, that format is better suited for human consumption. For machine
+  consumption the ISO format is better suited.
+
+  References: BAR-316.
+
 ### Bugfixes
 
 - Fix barman check which returns wrong results for Replication Slot
@@ -212,6 +239,16 @@
   be emitted whenever running any Barman command so the user can be aware.
 
   References: BAR-348.
+
+- Check for USAGE instead of MEMBER when calling pg_has_role in Barman
+
+  To work correctly Barman database user needs to be included in some roles. Barman was
+  verifying the conditions was satisfied by calling `pg_has_role` in Postgres. However,
+  it was check for the `MEMBER` privilege instead of `USAGE`. This oversight was fixed.
+
+  This change is a contribution from @RealGreenDragon.
+
+  References: BAR-489.
 
 ## 3.11.1 (2024-08-22)
 
