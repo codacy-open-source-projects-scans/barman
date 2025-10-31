@@ -1,0 +1,16 @@
+Barman TODO - Backlog of features for Barman
+
+* Cluster-awareness
+* TAR copy method
+* TAR storage strategy for backups
+* Centralised WAL hub capability (streaming server)
+* Export/Import of backups
+* External backup sources (e.g. S3)
+* Improve recovery support
+* Sandbox recovery
+* Logical backup integration (pg_dump on sandbox instances)
+* WAL retention policies
+* Grandfather-Father-Son backup
+* Deep Backup validation
+* SSH only connections
+* ...
