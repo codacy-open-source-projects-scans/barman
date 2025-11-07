@@ -10,7 +10,9 @@ Synopsis
     
     receive-wal
         [ --create-slot ]
+        [ --if-not-exists ]
         [ --drop-slot ]
+        [ { -h | --help } ]
         [ --reset ]
         [ --stop ]
         SERVER_NAME
@@ -32,9 +34,16 @@ Parameters
     Create the physical replication slot configured with the ``slot_name`` configuration
     parameter.
 
+``--if-not-exists``
+    Do not error out when ``--create-slot`` is specified and a slot with the specified name
+    already exists.
+
 ``--drop-slot``
     Drop the physical replication slot configured with the ``slot_name`` configuration
     parameter.
+
+``-h`` / ``--help``
+    Show a help message and exit. Provides information about command usage.
 
 ``--reset``
     Reset the status of ``receive-wal``, restarting the streaming from the current WAL file
@@ -42,3 +51,10 @@ Parameters
 
 ``--stop``
     Stop the process for the server.
+
+.. warning::
+
+   The ``--stop`` option for the ``barman receive-wal`` command will be obsoleted
+   in a future release. Users should favor using the
+   :ref:`terminate-process <commands-barman-terminate-process>` command instead, which
+   is the new way of handling this feature.

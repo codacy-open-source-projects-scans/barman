@@ -133,6 +133,8 @@ operations. A value of ``0`` indicates no limit (default).
 
 Scope: Global / Server / Model.
 
+.. _configuration-options-general-barman-home:
+
 **barman_home**
 
 Designates the main data directory for Barman. Defaults to ``/var/lib/barman``.
@@ -144,29 +146,11 @@ Scope: Global.
 Specifies the directory for lock files. The default is ``barman_home``.
 
 .. note::
-  The ``barman_lock_directory`` should be on a non-network local filesystem.
+  The ``barman_lock_directory`` should be on a non-network local filesystem. If using
+  NFS, or any other network filesystem to store the backups and WAL files, make sure
+  that the lock directory lives in a local filesystem.
 
 Scope: Global.
-
-**basebackup_retry_sleep**
-
-Sets the number of seconds to wait after a failed base backup copy before retrying.
-Default is ``30`` seconds. Must be a non-negative integer.
-
-.. note::
-  This applies to both backup and recovery operations.
-
-Scope: Global / Server / Model.
-
-**basebackup_retry_times**
-
-Defines the number of retry attempts for a base backup copy after an error occurs.
-Default is ``0`` (no retries). Must be a non-negative integer.
-
-.. note::
-  This applies to both backup and recovery operations.
-
-Scope: Global / Server / Model.
 
 **check_timeout**
 
@@ -208,8 +192,8 @@ Scope: Global.
 Specifies the connection string used by Barman to connect to the Postgres server.
 This is a libpq connection string. Commonly used keys include: ``host``, ``hostaddr``,
 ``port``, ``dbname``, ``user`` and ``password``. See the 
-`PostgreSQL documentation <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING>`_
-for details.
+`libpq-connstring <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING>`_
+PostgreSQL documentation for details.
 
 Scope: Server / Model.
 
@@ -240,6 +224,32 @@ failed to be archived and take appropriate actions (dispose of, store somewhere 
 replace the duplicate file archived before, etc.)
 
 Scope: Server.
+
+**encryption**
+
+Specifies the encryption method used for encrypting backups and WAL files. Supported
+values are:
+
+* ``none`` (default): No encryption is applied.
+* ``gpg``: Uses :term:`GPG` for encryption. Requires :term:`GPG` to be installed
+  and properly configured on the system.
+
+Scope: Global / Server / Model.
+
+**encryption_key_id**
+
+Specifies the encryption key ID used for encrypting backups and WAL files. This option
+is required when ``encryption = gpg`` and must correspond to a valid :term:`GPG` key ID
+available on the system.
+
+Scope: Global / Server / Model.
+
+**encryption_passphrase_command**
+
+Specifies a command used to retrieve the encryption passphrase for decrypting
+backups and WAL files. The command must write the passphrase to standard output.
+
+Scope: Global / Server / Model.
 
 **forward_config_path**
 
@@ -348,9 +358,9 @@ Scope: Global / Server / Model.
 **path_prefix**
 
 Lists one or more absolute paths, separated by colons, where Barman looks for executable
-files. These paths are checked before the ``PATH`` environment variable. This option can
-be set for each server and needs to point to the ``bin`` directory for the appropriate
-``PG_MAJOR_VERSION``.
+files such as PostgreSQL binaries (from the appropriate ``bin`` directory for the
+``PG_MAJOR_VERSION``), ``rsync``, encryption, and compression tools. These paths are
+prepended to the ``PATH`` environment variable and are checked before any others.
 
 Scope: Global / Server / Model.
 
@@ -446,8 +456,8 @@ This is a boolean option that allows for the automatic creation of backup manife
 files. The manifest file, which is a JSON document, lists all files included in the
 backup. It is generated upon completion of the backup and saved in the backup
 directory. The format of the manifest file adheres to the specifications outlined in the
-`PostgreSQL documentation <https://www.postgresql.org/docs/current/backup-manifest-format.html>`_
-and is compatible with the ``pg_verifybackup`` tool. Default is ``false``.
+`backup manifest format <https://www.postgresql.org/docs/current/backup-manifest-format.html>`_
+PostgreSQL documentation and is compatible with the ``pg_verifybackup`` tool. Default is ``false``.
 
 .. note::
   This option is ignored if the ``backup_method`` is not ``rsync``.
@@ -511,12 +521,16 @@ the standard compression behavior.
 
 Scope: Global / Server / Model.
 
+.. _configuration-options-backups-backup-directory:
+
 **backup_directory**
 
 Specifies the directory where backup data for a server will be stored. Defaults to
 ``<barman_home>/<server_name>``.
 
 Scope: Server.
+
+.. _configuration-options-backups-backup-method:
 
 **backup_method**
 
@@ -551,12 +565,34 @@ list that can include:
 
 Scope: Global / Server / Model.
 
+.. _configuration-options-backups-basebackups-directory:
+
 **basebackups_directory**
 
 Specifies the directory where base backups are stored. Defaults to
 ``<backup_directory>/base``.
 
 Scope: Server.
+
+**basebackup_retry_sleep**
+
+Sets the number of seconds to wait after a failed base backup copy before retrying.
+Default is ``30`` seconds. Must be a non-negative integer.
+
+.. note::
+  This applies to both backup and recovery operations.
+
+Scope: Global / Server / Model.
+
+**basebackup_retry_times**
+
+Defines the number of retry attempts for a base backup copy after an error occurs.
+Default is ``0`` (no retries). Must be a non-negative integer.
+
+.. note::
+  This applies to both backup and recovery operations.
+
+Scope: Global / Server / Model.
 
 **reuse_backup**
 
@@ -571,6 +607,15 @@ last available backup. The options are:
 
 .. note::
   This option will be ignored when ``backup_method=postgres``.
+
+Scope: Global / Server / Model.
+
+.. _configuration-options-backups-worm-mode:
+
+**worm_mode**
+
+If set to ``on``, enables support for WORM (Write Once Read Many) storage, allowing
+Barman to handle backups on immutable storage correctly. Default is ``off``.
 
 Scope: Global / Server / Model.
 
@@ -662,9 +707,9 @@ Scope: Global / Server / Model.
 
 **azure_credential**
 
-Specifies the type of Azure credential to use for authentication, either ``azure-cli``
-or ``managed-identity``. If not provided, the default Azure authentication method will
-be used.
+Specifies the type of Azure credential to use for authentication, either ``azure-cli``,
+``managed-identity`` or ``default``. If not provided, the default Azure authentication
+method will be used.
 
 .. note::
   Only supported when ``backup_method = snapshot`` and ``snapshot_provider = azure``.
@@ -917,8 +962,13 @@ These configuration options are related to how Barman will manage the Write-Ahea
 **compression**
 
 Specifies the standard compression algorithm for WAL files. Options include: ``lz4``,
-``xz``, ``zstd``, ``gzip``, ``pybzip2``, ``pigz``, ``bzip2``, ``pybzip2`` and ``custom``. 
-  
+``xz``, ``zstd``, ``gzip``, ``pygzip``, ``pigz``, ``bzip2``, ``pybzip2``, ``snappy``
+and ``custom``. 
+
+.. deprecated:: 3.16
+    The ``pygzip`` and ``pybzip2`` compression options are deprecated and will be
+    removed in a future release. Use their equivalents ``gzip`` and ``bzip2`` instead.
+
 .. note::
   All of these options require the module to be installed in the location where the
   compression will occur.
@@ -964,6 +1014,13 @@ apply custom compression to all WAL files, even those pre-compressed.
   In hexadecimal representation, this can be expressed as:
     Hex String: ``fd377a585a00``
 
+  As Barman expects the value of ``custom_compression_magic`` to be prefixed with
+  ``0x``, you would need to set that config option like this:
+
+  .. code-block:: ini
+
+    custom_compression_magic = 0xfd377a585a00
+
   Reference: `xz-file-format <https://tukaani.org/xz/xz-file-format-1.0.4.txt>`_
 
 Scope: Global / Server / Model.
@@ -979,6 +1036,61 @@ compression algorithm used.
   ``custom_compression_filter = "xz -c -d"``
 
   This is the same as running ``xz -c -d > "$2" < "$1";``.
+
+Scope: Global / Server / Model.
+
+.. _configuration-options-compression-level:
+
+**compression_level**
+
+Specifies the compression level to be used by the selected compression algorithm. Valid
+values are integers within the supported range of the chosen algorithm or one
+of the predefined labels: ``low``, ``medium``, and ``high``, which serve as shortcuts.
+
+* ``low``: uses low level of compression, favoring compression speed over compression ratio.
+* ``medium``: uses a medium level of compression, balancing between compression speed and compression ratio.
+* ``high``: uses a high level of compression, favoring compression ratio over compression speed.
+
+Predefined labels map to algorithm-specific levels, as detailed below:
+
+.. list-table:: Compression levels
+   :widths: 30 25 15 15 15
+   :header-rows: 1
+
+   * - Algorithm
+     - Level range
+     - low
+     - medium
+     - high
+   * - ``lz4``
+     - 0 to 16
+     - 0
+     - 6
+     - 10
+   * - ``xz``
+     - 1 to 9
+     - 1
+     - 3
+     - 5
+   * - ``zstd``
+     - -22 to 22
+     - 1
+     - 4
+     - 9
+   * - ``gzip``, ``pygzip`` and ``pigz``
+     - 1 to 9
+     - 1
+     - 6
+     - 9
+   * - ``bzip2`` and ``pybzip2``
+     - 1 to 9
+     - 1
+     - 5
+     - 9
+
+If the specified compression level is greater than the algorithm's maximum level, that
+maximum level is used. Similarly, if it is lower than the minimum level, that minimum
+level is used. The default value is ``medium``.
 
 Scope: Global / Server / Model.
 
@@ -1049,11 +1161,23 @@ privileges.
 
 Scope: Server / Model.
 
+.. _configuration-options-wals-wals-directory:
+
 **wals_directory**
 
 Directory containing WAL files. Defaults to ``<backup_directory>/wals``.
 
 Scope: Server.
+
+.. _configuration-options-wals-xlogdb-directory:
+
+**xlogdb_directory**
+
+A custom directory for the ``SERVER-xlog.db`` file, ``SERVER`` being the server name.
+This file stores metadata of archived WAL files and is used internally by Barman. If
+unset, it defaults to the value of ``wals_directory``.
+
+Scope: Global / Server.
 
 .. _configuration-options-restore:
 
@@ -1071,14 +1195,20 @@ Required for recovery from a block-level incremental backup.
 .. note::
   Applies only when ``backup_method = postgres``.
 
+.. deprecated:: 3.15
+    ``local_staging_path`` is deprecated and will be removed in a future release.
+    Use ``staging_path`` and ``staging_location`` instead.
+
 Scope: Global / Server / Model.
 
 **recovery_options**
 
-Options for recovery operations. Currently, only ``get-wal`` is supported. This option
-enables the creation of a basic ``restore_command`` in the recovery configuration,
-which uses the barman ``get-wal`` command to retrieve WAL files directly from Barman's
-WAL archive. This setting accepts a comma-separated list of values and defaults to
+Options for recovery operations. Currently, only ``get-wal`` and ``delta-restore`` are
+supported. ``get-wal`` enables the creation of a basic ``restore_command`` in the
+recovery configuration, which uses the barman ``get-wal`` command to retrieve WAL files
+directly from Barman's WAL archive. ``delta-restore`` allows barman to restore a backup
+into a pre-existing destination directory along with existing custom tablespaces by
+overwriting it. This setting accepts a comma-separated list of values and defaults to
 empty.
 
 Scope: Global / Server / Model.
@@ -1091,9 +1221,53 @@ location must have sufficient space to temporarily store the compressed backup.
 .. note::
   Applies only for commpressed backups.
 
+.. deprecated:: 3.15
+    ``recovery_staging_path`` is deprecated and will be removed in a future release.
+    Use ``staging_path`` and ``staging_location`` instead.
+
+Scope: Global / Server / Model.
+
+**staging_path**
+
+A path where intermediate files are staged during restore. When restoring a compressed
+backup, it serves as a temporary location for decompression before copying to the final
+destination. When restoring an incremental backup, it is where backups are combined
+before copying to the final destination. This location must have enough space to store
+the decompressed/combined backup. The default is ``/tmp``.
+
+Scope: Global / Server / Model.
+
+**staging_location**
+
+Specifies whether ``staging_path`` is a local or remote path. Valid values are
+``local`` and ``remote``. The default is ``local``.
+
 Scope: Global / Server / Model.
 
 .. _configuration-options-retention-policies:
+
+**combine_mode**
+
+Specifies a copy mode for ``pg_combinebackup`` when combining incremental backups
+during a restore.
+
+Options include:
+
+* ``copy`` (default): Use standard file copying when combining incremental backups.
+* ``link``: Use hard links when combining incremental backups. Reconstruction of the
+  synthetic backup might be faster (no file copying) and use less disk space.
+* ``clone``: Use efficient file cloning (also known as “reflinks” on some systems)
+  instead of copying files to the new data directory, which can result in
+  near-instantaneous copying of the data files.
+* ``copy-file-range``: Use the ``copy_file_range`` system call for efficient copying.
+  On some file systems this gives results similar to ``clone``, sharing physical disk
+  blocks, while on others it may still copy blocks, but do so via an optimized path.
+
+Refer to the `pg_combinebackup documentation <https://www.postgresql.org/docs/current/app-pgcombinebackup.html>`_
+for more details and restrictions of each mode.
+
+
+Scope: Global / Server / Model.
 
 Retention Policies
 """"""""""""""""""
@@ -1106,7 +1280,7 @@ backups.
 Defines the time frame within which the latest backup must fall. If the latest backup
 is older than this period, the barman check command will report an error. If left
 empty (default), the latest backup is always considered valid. The accepted format is
-``"n {DAYS|WEEKS|MONTHS}"``, where ``n`` is an integer greater than zero.
+``"n {DAYS|WEEKS|MONTHS|HOURS}"``, where ``n`` is an integer greater than zero.
 
 Scope: Global / Server / Model.
 
@@ -1297,7 +1471,8 @@ Benefits
     create_slot = auto
     minimum_redundancy = 5
     retention_policy = RECOVERY WINDOW OF 7 DAYS
-    local_staging_path = /var/lib/barman/staging
+    staging_path = /var/lib/barman/staging
+    staging_location = local
     cluster = streaming
 
   **server2**
@@ -1312,8 +1487,10 @@ Benefits
       replication slot if not present.
     * Set the ``minimum_redundancy`` and the ``retention_policy`` for backups created
       from this server.
-    * Recovery for block-level incremental backups will use the ``local_staging_path``
-      as the intermediate location to combine the chain of backups.
+    * Recovery for block-level incremental backups will use the ``staging_path``
+      as the intermediate location to combine the chain of backups. This path is
+      considered to be a local path (same server as Barman), as ``staging_location``
+      is set to ``local``.
     * Group this server into the ``streaming`` cluster to be used by models.
 
   Model Configuration 1
@@ -1331,7 +1508,8 @@ Benefits
     wal_streaming_conninfo = host=pg3 user=streaming_barman port=5432 dbname=databasename
     compression = gzip
     backup_compression = gzip
-    recovery_staging_path = /var/lib/barman/recovery_staging
+    staging_path = /var/lib/barman/recovery_staging
+    staging_location = local
     retention_policy = RECOVERY WINDOW OF 14 DAYS
 
   **server2:switch_over_wal_streaming_conn_to_pg3**
@@ -1346,8 +1524,9 @@ Benefits
       with proper permissions.
     * WAL files will be compressed with ``gzip``.
     * All backups will be compressed with ``gzip``.
-    * Recovery for compressed backups will use the ``recovery_staging_path`` as the
-      intermediate location to uncompress the backup.
+    * Recovery for compressed backups will use the ``staging_path`` as the
+      intermediate location to decompress the backup. This path is considered to be
+      a local path (same server as Barman), as ``staging_location`` is set to ``local``.
     * Set a ``retention_policy`` for backups that are grouped in the ``streaming``
       cluster.
 
@@ -1370,12 +1549,14 @@ Benefits
     create_slot = auto
     minimum_redundancy = 5
     retention_policy = RECOVERY WINDOW OF 14 DAYS
-    local_staging_path = /var/lib/barman/staging
+    staging_path = /var/lib/barman/staging
+    staging_location = local
     wal_conninfo = host=pg3 user=barman port=5433 dbname=databasename 
     wal_streaming_conninfo = host=pg3 user=streaming_barman port=5433 dbname=databasename
     compression = gzip
     backup_compression = gzip
-    recovery_staging_path = /var/lib/barman/recovery_staging
+    staging_path = /var/lib/barman/recovery_staging
+    staging_location = local
 
   Model Configuration 2
   """""""""""""""""""""
@@ -1417,7 +1598,8 @@ Benefits
     create_slot = auto
     minimum_redundancy = 5
     retention_policy = RECOVERY WINDOW OF 7 DAYS
-    local_staging_path = /var/lib/barman/staging
+    staging_path = /var/lib/barman/staging
+    staging_location = local
 
   .. important::
     You will not see any in place changes in the configuration file. The overrides are

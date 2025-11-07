@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -106,6 +106,7 @@ class HookScriptRunner(object):
         self.environment.update(
             {
                 "BARMAN_BACKUP_DIR": backup_info.get_basebackup_directory(),
+                "BARMAN_BACKUP_INFO_PATH": backup_info.get_filename(),
                 "BARMAN_BACKUP_ID": backup_info.backup_id,
                 "BARMAN_PREVIOUS_ID": previous_backup_id,
                 "BARMAN_NEXT_ID": next_backup_id,

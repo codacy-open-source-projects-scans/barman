@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -23,8 +23,10 @@ This module represents a backup.
 import datetime
 import logging
 import os
+import re
 import shutil
 import tempfile
+from collections import defaultdict
 from contextlib import closing
 from glob import glob
 
@@ -43,7 +45,8 @@ from barman.backup_manifest import BackupManifest
 from barman.cloud_providers import get_snapshot_interface_from_backup_info
 from barman.command_wrappers import PgVerifyBackup
 from barman.compression import CompressionManager
-from barman.config import BackupOptions
+from barman.config import BackupOptions, RecoveryOptions
+from barman.encryption import EncryptionManager
 from barman.exceptions import (
     AbortedRetryHookScript,
     BackupException,
@@ -65,7 +68,11 @@ from barman.utils import (
     force_str,
     fsync_dir,
     fsync_file,
+    get_backup_id_from_target_lsn,
+    get_backup_id_from_target_time,
+    get_backup_id_from_target_tli,
     get_backup_info_from_name,
+    get_last_backup_id,
     human_readable_timedelta,
     pretty_size,
 )
@@ -78,6 +85,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
 
     DEFAULT_STATUS_FILTER = BackupInfo.STATUS_COPY_DONE
     DELETE_ANNOTATION = "delete_this"
+    DEFAULT_BACKUP_TYPE_FILTER = BackupInfo.BACKUP_TYPE_ALL
 
     def __init__(self, server):
         """
@@ -89,8 +97,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         self.config = server.config
         self._backup_cache = None
         self.compression_manager = CompressionManager(self.config, server.path)
+        self.encryption_manager = EncryptionManager(self.config, server.path)
         self.annotation_manager = AnnotationManagerFile(
-            self.server.config.basebackups_directory
+            self.server.meta_directory, self.server.config.basebackups_directory
         )
         self.executor = None
         try:
@@ -116,17 +125,28 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             return self.executor.mode
         return None
 
-    def get_available_backups(self, status_filter=DEFAULT_STATUS_FILTER):
+    def get_available_backups(
+        self,
+        status_filter=DEFAULT_STATUS_FILTER,
+        backup_type_filter=DEFAULT_BACKUP_TYPE_FILTER,
+    ):
         """
         Get a list of available backups
 
         :param status_filter: default DEFAULT_STATUS_FILTER. The status of
             the backup list returned
+        :param backup_type_filter: default DEFAULT_BACKUP_TYPE_FILTER. The type
+            of the backup list returned
         """
-        # If the filter is not a tuple, create a tuple using the filter
+        # If the status filter is not a tuple, create a tuple using the filter
         if not isinstance(status_filter, tuple):
             status_filter = tuple(
                 status_filter,
+            )
+        # If the backup_type filter is not a tuple, create a tuple using the filter
+        if not isinstance(backup_type_filter, tuple):
+            backup_type_filter = tuple(
+                backup_type_filter,
             )
         # Load the cache if necessary
         if self._backup_cache is None:
@@ -134,7 +154,10 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         # Filter the cache using the status filter tuple
         backups = {}
         for key, value in self._backup_cache.items():
-            if value.status in status_filter:
+            if (
+                value.status in status_filter
+                and value.backup_type in backup_type_filter
+            ):
                 backups[key] = value
         return backups
 
@@ -144,8 +167,21 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         from disk.
         """
         self._backup_cache = {}
-        # Load all the backups from disk reading the backup.info files
+        # Previous to version 3.13.2, Barman used to store the backup.info file
+        # alongside with the base backup. While that, in general, is not a problem,
+        # when dealing with WORM environments that could cause issues as the
+        # base backups are expected to be stored in an immutable storage. This
+        # code is only maintained as a fallback mechanism during a transient state
+        # in the backup catalog, where we will find backup.info files in both
+        # locations because of backups taken with < 3.13.2
         for filename in glob("%s/*/backup.info" % self.config.basebackups_directory):
+            backup = LocalBackupInfo(self.server, filename)
+            self._backup_cache[backup.backup_id] = backup
+        # In version 3.13.2, Barman changed the location of backup.info files.
+        # That was done so we have common location for the metadata, which
+        # should always be in a mutable storage, independently if worm_mode
+        # is enabled or not. So, this new approach takes precedence.
+        for filename in glob("%s/*-backup.info" % self.server.meta_directory):
             backup = LocalBackupInfo(self.server, filename)
             self._backup_cache[backup.backup_id] = backup
 
@@ -259,6 +295,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
              do nothing. We need to allow PITR from that keep:full backup to the
              current time.
           4. If there is a previous backup and it has a keep target of "standalone":
+
             a. If that previous backup is the oldest backup then delete WALs up to
                the begin_wal of the next backup except for WALs which are
                >= begin_wal and <= end_wal of the keep:standalone backup - we can
@@ -368,12 +405,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             default to :attr:`DEFAULT_STATUS_FILTER`.
         :return str|None: ID of the backup
         """
-        available_backups = self.get_available_backups(status_filter)
-        if len(available_backups) == 0:
-            return None
-
-        ids = sorted(available_backups.keys())
-        return ids[-1]
+        available_backups = self.get_available_backups(status_filter).values()
+        backup_id = get_last_backup_id(available_backups)
+        return backup_id
 
     def get_last_full_backup_id(self, status_filter=DEFAULT_STATUS_FILTER):
         """
@@ -385,7 +419,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         """
         available_full_backups = list(
             filter(
-                lambda backup: backup.is_full_and_eligible_for_incremental(),
+                lambda backup: backup.is_full,
                 self.get_available_backups(status_filter).values(),
             )
         )
@@ -426,6 +460,61 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         backup_info = get_backup_info_from_name(available_backups, backup_name)
         if backup_info is not None:
             return backup_info.backup_id
+
+    def get_closest_backup_id_from_target_time(
+        self, target_time, target_tli, status_filter=DEFAULT_STATUS_FILTER
+    ):
+        """
+        Get the id of a backup according to the time passed as the recovery target
+        *target_time*, and in the given *target_tli*, if specified.
+
+        :param str target_time: The target value with timestamp format
+            ``%Y-%m-%d %H:%M:%S`` with or without timezone.
+        :param int|None target_tli: The target timeline, if a specific one is required.
+        :param tuple[str, ...] status_filter: The status of the backup to return.
+        :return str|None: ID of the backup.
+        """
+
+        available_backups = self.get_available_backups(status_filter).values()
+        backup_id = get_backup_id_from_target_time(
+            available_backups, target_time, target_tli
+        )
+        return backup_id
+
+    def get_closest_backup_id_from_target_lsn(
+        self, target_lsn, target_tli, status_filter=DEFAULT_STATUS_FILTER
+    ):
+        """
+        Get the id of a backup according to the lsn passed as the recovery target
+        *target_lsn*, and in the given *target_tli*, if specified.
+
+        :param str target_lsn: The target value with lsn format, e.g.,
+            ``3/64000000``.
+        :param int|None target_tli: The target timeline, if a specific one is required.
+        :param tuple[str, ...] status_filter: The status of the backup to return.
+        :return str|None: ID of the backup.
+        """
+        available_backups = self.get_available_backups(status_filter).values()
+        backup_id = get_backup_id_from_target_lsn(
+            available_backups, target_lsn, target_tli
+        )
+        return backup_id
+
+    def get_last_backup_id_from_target_tli(
+        self, target_tli, status_filter=DEFAULT_STATUS_FILTER
+    ):
+        """
+        Get the id of a backup according to the timeline passed as the recovery target
+        *target_tli*.
+
+        :param int target_tli: The target timeline.
+        :param tuple[str, ...] status_filter: The status of the backup to return.
+        :return str|None: ID of the backup.
+        """
+
+        available_backups = self.get_available_backups(status_filter).values()
+        backup_id = get_backup_id_from_target_tli(available_backups, target_tli)
+        return backup_id
 
     def put_delete_annotation(self, backup_id):
         """
@@ -573,8 +662,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         # Remove the delete annotation
         self.release_delete_annotation(backup.backup_id)
 
-        # As last action, remove the backup directory,
-        # ending the delete operation
+        # Remove the base backup directory,
         try:
             self.delete_basebackup(backup)
         except OSError as e:
@@ -585,6 +673,19 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                 self.config.name,
                 e,
                 backup.get_basebackup_directory(),
+            )
+            return False
+
+        # As a last action remove, remove the backup.info, ending the delete operation
+        try:
+            self.delete_backupinfo_file(backup)
+        except OSError as e:
+            output.error(
+                "Failure deleting file %s for server %s.\n%s\n"
+                "Please manually remove the file",
+                backup.get_filename(),
+                self.config.name,
+                e,
             )
             return False
 
@@ -723,28 +824,55 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                 "to perform an incremental backup using the Postgres backup method"
             )
 
-        if self.config.backup_compression is not None:
-            raise BackupException(
-                "Incremental backups cannot be taken with "
-                "'backup_compression' set in the configuration options."
-            )
-
         parent_backup_id = kwargs.get("parent_backup_id")
         parent_backup_info = self.get_backup(parent_backup_id)
-
         if parent_backup_info:
             if parent_backup_info.summarize_wal != "on":
                 raise BackupException(
-                    "The specified backup is not eligible as a parent for an "
+                    "Backup ID %s is not eligible as a parent for an "
                     "incremental backup because WAL summaries were not enabled "
-                    "when that backup was taken."
+                    "when that backup was taken." % parent_backup_info.backup_id
                 )
-            if parent_backup_info.compression is not None:
-                raise BackupException(
-                    "The specified backup cannot be a parent for an "
-                    "incremental backup. Reason: "
-                    "Compressed backups are not eligible as parents of incremental backups."
-                )
+
+    def _encrypt_backup(self, backup_info):
+        """
+        Perform encryption of the base backup and tablespaces
+
+        :param barman.infofile.LocalBackupInfo backup_info: backup information
+        :raises BackupException: If the encryption validation fails
+        """
+        try:
+            self.encryption_manager.validate_config()
+            encryption = self.encryption_manager.get_encryption()
+        except ValueError as ex:
+            raise BackupException(force_str(ex))
+
+        output.info("Encrypting backup using %s encryption" % encryption.NAME)
+
+        # At this point, all the encryption configuration has already been
+        # validated. We only need to check the format of the backup, so
+        # we know how to encrypt the underlying files.
+        if self.config.backup_compression_format == "tar":
+            self._encrypt_tar_backup(backup_info, encryption)
+
+        backup_info.set_attribute("encryption", encryption.NAME)
+
+    def _encrypt_tar_backup(self, backup_info, encryption):
+        """
+        Perform encryption of base backup and tablespaces in tar format.
+
+        All ``.tar`` and ``.tar.*`` files under the backup data directory are encrypted.
+
+        :param barman.infofile.LocalBackupInfo backup_info: Backup information
+        :param barman.encryption.Encryption encryption: The encryption handler class
+        """
+        for tar_file in backup_info.get_directory_entries("data"):
+            filename = os.path.basename(tar_file)
+            if re.search(r"\.tar(\.[^.]+)?$", filename):
+                output.debug("Encrypting file %s" % tar_file)
+                encryption.encrypt(tar_file, os.path.dirname(tar_file))
+                output.debug("File encrypted. Deleting unencrypted file %s" % tar_file)
+                os.unlink(tar_file)
 
     def backup(self, wait=False, wait_timeout=None, name=None, **kwargs):
         """
@@ -802,6 +930,10 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
 
             # Free the Postgres connection
             self.server.postgres.close()
+
+            # Encrypt the backup if requested
+            if self.config.encryption is not None:
+                self._encrypt_backup(backup_info)
 
             # Compute backup size and fsync it on disk
             self.backup_fsync_and_set_sizes(backup_info)
@@ -932,7 +1064,13 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         return backup_info
 
     def recover(
-        self, backup_info, dest, tablespaces=None, remote_command=None, **kwargs
+        self,
+        backup_info,
+        dest,
+        wal_dest=None,
+        tablespaces=None,
+        remote_command=None,
+        **kwargs
     ):
         """
         Performs a recovery of a backup
@@ -940,6 +1078,8 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         :param barman.infofile.LocalBackupInfo backup_info: the backup
             to recover
         :param str dest: the destination directory
+        :param str|None wal_dest: the destination directory for WALs when doing PITR.
+            See :meth:`~barman.recovery_executor.RecoveryExecutor._set_pitr_targets` for more details.
         :param dict[str,str]|None tablespaces: a tablespace name -> location
             map (for relocation)
         :param str|None remote_command: default None. The remote command
@@ -965,7 +1105,43 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         # Delegate the recovery operation to a RecoveryExecutor object
 
         command = unix_command_factory(remote_command, self.server.path)
-        executor = recovery_executor_factory(self, command, backup_info)
+
+        delta_restore = RecoveryOptions.DELTA_RESTORE in self.config.recovery_options
+
+        # Avoid overwriting PGDATA files when restoring a backup without delta restore.
+        if not delta_restore:
+            # Ensure the PGDATA destination directory is empty.
+            dest_dir = command.list_dir_content(dest)
+            if dest_dir:
+                output.error(
+                    "The restore operation cannot proceed because the destination folder "
+                    "'%s' is not empty. To prevent accidental data loss, the destination "
+                    "must be empty. Please choose a different location or manually empty "
+                    "the folder.",
+                    dest,
+                )
+                output.close_and_exit()
+
+        if backup_info.tablespaces:
+            for tablespace in backup_info.tablespaces:
+                location = tablespace.location
+                if tablespaces and tablespace.name in tablespaces:
+                    location = tablespaces[tablespace.name]
+                # Avoid overwriting TABLESPACE files when restoring a backup without
+                # delta restore.
+                if not delta_restore:
+                    tbs_dir = command.list_dir_content(location)
+                    if tbs_dir:
+                        output.error(
+                            "The restore operation cannot proceed. The destination path "
+                            "'%s' for the tablespace '%s' is not empty. To prevent "
+                            "accidental data loss, the tablespace destination must be "
+                            "empty. Please choose a different location or manually empty "
+                            "the folder." % (location, tablespace.name)
+                        )
+                        output.close_and_exit()
+
+        executor = recovery_executor_factory(self, backup_info)
         # Run the pre_recovery_script if present.
         script = HookScriptRunner(self, "recovery_script", "pre")
         script.env_from_recover(
@@ -987,6 +1163,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             recovery_info = executor.recover(
                 backup_info,
                 dest,
+                wal_dest=wal_dest,
                 tablespaces=tablespaces,
                 remote_command=remote_command,
                 **kwargs
@@ -1052,14 +1229,19 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                 # was already removed
                 elif backup.is_orphan:
                     output.warning(
-                        "WARNING: Backup directory %s contains only a non-empty "
-                        "backup.info file which may indicate an incomplete delete operation. "
-                        "Please manually delete the directory.",
+                        "Backup '%s' is an orphan backup, this is possibly "
+                        "the result of an incomplete delete operation. Please manually "
+                        "delete the following files or directories if present:\n"
+                        "* %s \n"
+                        "* %s \n",
+                        backup.backup_id,
                         backup.get_basebackup_directory(),
+                        backup.get_filename(),
                     )
 
             for bid in sorted(retention_status.keys()):
                 if retention_status[bid] == BackupInfo.OBSOLETE:
+                    backup = available_backups[bid]
                     try:
                         # Lock acquisition: if you can acquire a ServerBackupLock
                         # it means that no other processes like another delete operation
@@ -1068,12 +1250,19 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                         with ServerBackupIdLock(
                             self.config.barman_lock_directory, self.config.name, bid
                         ):
+                            if backup.is_orphan:
+                                output.debug(
+                                    "Skipping deletion of orphan backup: '%s' at '%s'.",
+                                    backup.backup_id,
+                                    backup.get_basebackup_directory(),
+                                )
+                                continue
                             output.info(
                                 "Enforcing retention policy: removing backup %s for "
                                 "server %s" % (bid, self.config.name)
                             )
                             self.delete_backup(
-                                available_backups[bid],
+                                backup,
                                 skip_wal_cleanup_if_standalone=False,
                             )
                     except LockFileBusy:
@@ -1094,7 +1283,19 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         backup_dir = backup.get_basebackup_directory()
         _logger.debug("Deleting base backup directory: %s" % backup_dir)
 
-        shutil.rmtree(backup_dir)
+        if os.path.exists(backup_dir):
+            shutil.rmtree(backup_dir)
+
+    def delete_backupinfo_file(self, backup):
+        """
+        Delete the ``backup.info`` file of a given backup.
+
+        :param barman.infofile.LocalBackupInfo backup: the backup to delete
+        """
+        backup_info_path = backup.get_filename()
+        if os.path.exists(backup_info_path):
+            _logger.debug("Deleting backup.info file: %s" % backup_info_path)
+            os.unlink(backup_info_path)
 
     def delete_backup_data(self, backup):
         """
@@ -1138,22 +1339,56 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             _logger.debug("Deleting PGDATA directory: %s" % pg_data)
             shutil.rmtree(pg_data)
 
+    def _run_pre_delete_wal_scripts(self, wal_info):
+        """
+        Run the pre-delete hook-scripts, if any, on the given WAL.
+
+        :param barman.infofile.WalFileInfo wal_info: WAL to run the script on.
+        """
+        # Run the pre_wal_delete_script if present.
+        script = HookScriptRunner(self, "wal_delete_script", "pre")
+        script.env_from_wal_info(wal_info)
+        script.run()
+        # Run the pre_wal_delete_retry_script if present.
+        retry_script = RetryHookScriptRunner(self, "wal_delete_retry_script", "pre")
+        retry_script.env_from_wal_info(wal_info)
+        retry_script.run()
+
+    def _run_post_delete_wal_scripts(self, wal_info, error=None):
+        """
+        Run the post-delete hook-scripts, if any, on the given WAL.
+
+        :param barman.infofile.WalFileInfo wal_info: WAL to run the script on.
+        :param None|str error: error message in case a failure happened.
+        """
+        # Run the post_wal_delete_retry_script if present.
+        try:
+            retry_script = RetryHookScriptRunner(
+                self, "wal_delete_retry_script", "post"
+            )
+            retry_script.env_from_wal_info(wal_info, None, error)
+            retry_script.run()
+        except AbortedRetryHookScript as e:
+            # Ignore the ABORT_STOP as it is a post-hook operation
+            _logger.warning(
+                "Ignoring stop request after receiving "
+                "abort (exit code %d) from post-wal-delete "
+                "retry hook script: %s",
+                e.hook.exit_status,
+                e.hook.script,
+            )
+        # Run the post_wal_delete_script if present.
+        script = HookScriptRunner(self, "wal_delete_script", "post")
+        script.env_from_wal_info(wal_info, None, error)
+        script.run()
+
     def delete_wal(self, wal_info):
         """
         Delete a WAL segment, with the given WalFileInfo
 
         :param barman.infofile.WalFileInfo wal_info: the WAL to delete
         """
-
-        # Run the pre_wal_delete_script if present.
-        script = HookScriptRunner(self, "wal_delete_script", "pre")
-        script.env_from_wal_info(wal_info)
-        script.run()
-
-        # Run the pre_wal_delete_retry_script if present.
-        retry_script = RetryHookScriptRunner(self, "wal_delete_retry_script", "pre")
-        retry_script.env_from_wal_info(wal_info)
-        retry_script.run()
+        self._run_pre_delete_wal_scripts(wal_info)
 
         error = None
         try:
@@ -1173,27 +1408,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             )
             output.warning(error)
 
-        # Run the post_wal_delete_retry_script if present.
-        try:
-            retry_script = RetryHookScriptRunner(
-                self, "wal_delete_retry_script", "post"
-            )
-            retry_script.env_from_wal_info(wal_info, None, error)
-            retry_script.run()
-        except AbortedRetryHookScript as e:
-            # Ignore the ABORT_STOP as it is a post-hook operation
-            _logger.warning(
-                "Ignoring stop request after receiving "
-                "abort (exit code %d) from post-wal-delete "
-                "retry hook script: %s",
-                e.hook.exit_status,
-                e.hook.script,
-            )
-
-        # Run the post_wal_delete_script if present.
-        script = HookScriptRunner(self, "wal_delete_script", "post")
-        script.env_from_wal_info(wal_info, None, error)
-        script.run()
+        self._run_post_delete_wal_scripts(wal_info, error)
 
     def check(self, check_strategy):
         """
@@ -1230,8 +1445,13 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             ),
         )
         check_strategy.init_check("minimum redundancy requirements")
-        # Minimum redundancy checks
-        no_backups = len(self.get_available_backups(status_filter=(BackupInfo.DONE,)))
+        # Minimum redundancy checks will take into account only not-incremental backups
+        no_backups = len(
+            self.get_available_backups(
+                status_filter=(BackupInfo.DONE,),
+                backup_type_filter=(BackupInfo.NOT_INCREMENTAL),
+            )
+        )
         # Check minimum_redundancy_requirements parameter
         if no_backups < int(self.config.minimum_redundancy):
             status = False
@@ -1240,7 +1460,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         check_strategy.result(
             self.config.name,
             status,
-            hint="have %s backups, expected at least %s"
+            hint="have %s non-incremental backups, expected at least %s"
             % (no_backups, self.config.minimum_redundancy),
         )
 
@@ -1277,15 +1497,23 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             "Last available backup",
             self.get_last_backup_id(),
         )
-        # Minimum redundancy check. if number of backups minor than minimum
-        # redundancy, fail.
-        if no_backups < self.config.minimum_redundancy:
+
+        no_backups_not_incremental = len(
+            self.get_available_backups(
+                status_filter=(BackupInfo.DONE,),
+                backup_type_filter=(BackupInfo.NOT_INCREMENTAL),
+            )
+        )
+        # Minimum redundancy check. if number of non-incremental backups minor than
+        # minimum redundancy, fail.
+        if no_backups_not_incremental < self.config.minimum_redundancy:
             output.result(
                 "status",
                 self.config.name,
                 "minimum_redundancy",
                 "Minimum redundancy requirements",
-                "FAILED (%s/%s)" % (no_backups, self.config.minimum_redundancy),
+                "FAILED (%s/%s)"
+                % (no_backups_not_incremental, self.config.minimum_redundancy),
             )
         else:
             output.result(
@@ -1293,7 +1521,8 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                 self.config.name,
                 "minimum_redundancy",
                 "Minimum redundancy requirements",
-                "satisfied (%s/%s)" % (no_backups, self.config.minimum_redundancy),
+                "satisfied (%s/%s)"
+                % (no_backups_not_incremental, self.config.minimum_redundancy),
             )
 
         # Output additional status defined by the BackupExecutor
@@ -1314,82 +1543,6 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         else:
             return {}
 
-    def rebuild_xlogdb(self):
-        """
-        Rebuild the whole xlog database guessing it from the archive content.
-        """
-        from os.path import isdir, join
-
-        output.info("Rebuilding xlogdb for server %s", self.config.name)
-        root = self.config.wals_directory
-        comp_manager = self.compression_manager
-        wal_count = label_count = history_count = 0
-        # lock the xlogdb as we are about replacing it completely
-        with self.server.xlogdb("w") as fxlogdb:
-            xlogdb_dir = os.path.dirname(fxlogdb.name)
-            with tempfile.TemporaryFile(mode="w+", dir=xlogdb_dir) as fxlogdb_new:
-                for name in sorted(os.listdir(root)):
-                    # ignore the xlogdb and its lockfile
-                    if name.startswith(self.server.XLOG_DB):
-                        continue
-                    fullname = join(root, name)
-                    if isdir(fullname):
-                        # all relevant files are in subdirectories
-                        hash_dir = fullname
-                        for wal_name in sorted(os.listdir(hash_dir)):
-                            fullname = join(hash_dir, wal_name)
-                            if isdir(fullname):
-                                _logger.warning(
-                                    "unexpected directory "
-                                    "rebuilding the wal database: %s",
-                                    fullname,
-                                )
-                            else:
-                                if xlog.is_wal_file(fullname):
-                                    wal_count += 1
-                                elif xlog.is_backup_file(fullname):
-                                    label_count += 1
-                                elif fullname.endswith(".tmp"):
-                                    _logger.warning(
-                                        "temporary file found "
-                                        "rebuilding the wal database: %s",
-                                        fullname,
-                                    )
-                                    continue
-                                else:
-                                    _logger.warning(
-                                        "unexpected file "
-                                        "rebuilding the wal database: %s",
-                                        fullname,
-                                    )
-                                    continue
-                                wal_info = comp_manager.get_wal_file_info(fullname)
-                                fxlogdb_new.write(wal_info.to_xlogdb_line())
-                    else:
-                        # only history files are here
-                        if xlog.is_history_file(fullname):
-                            history_count += 1
-                            wal_info = comp_manager.get_wal_file_info(fullname)
-                            fxlogdb_new.write(wal_info.to_xlogdb_line())
-                        else:
-                            _logger.warning(
-                                "unexpected file rebuilding the wal database: %s",
-                                fullname,
-                            )
-                fxlogdb_new.flush()
-                fxlogdb_new.seek(0)
-                fxlogdb.seek(0)
-                shutil.copyfileobj(fxlogdb_new, fxlogdb)
-                fxlogdb.truncate()
-        output.info(
-            "Done rebuilding xlogdb for server %s "
-            "(history: %s, backup_labels: %s, wal_file: %s)",
-            self.config.name,
-            history_count,
-            label_count,
-            wal_count,
-        )
-
     def get_latest_archived_wals_info(self):
         """
         Return a dictionary of timelines associated with the
@@ -1401,7 +1554,6 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         from os.path import isdir, join
 
         root = self.config.wals_directory
-        comp_manager = self.compression_manager
 
         # If the WAL archive directory doesn't exists the archive is empty
         if not isdir(root):
@@ -1432,7 +1584,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                     fullname = join(hash_dir, wal_name)
                     # Return the first file that has the correct name
                     if not isdir(fullname) and xlog.is_wal_file(fullname):
-                        timelines[timeline] = comp_manager.get_wal_file_info(fullname)
+                        timelines[timeline] = self.get_wal_file_info(
+                            filename=fullname,
+                        )
                         break
 
         # Return the timeline map
@@ -1457,7 +1611,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             tuples which define inclusive ranges of WALs which must not be deleted.
         :return list: a list of removed WAL files
         """
-        removed = []
+        # A dictionary where key is the WAL directory name and value is a list of
+        # wal_info object representing the WALs to be deleted in that directory
+        wals_to_remove = defaultdict(list)
         with self.server.xlogdb("r+") as fxlogdb:
             xlogdb_dir = os.path.dirname(fxlogdb.name)
             with tempfile.TemporaryFile(mode="w+", dir=xlogdb_dir) as fxlogdb_new:
@@ -1498,18 +1654,59 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                         keep |= wal_info.name >= backup_info.begin_wal
 
                     # If the file has to be kept write it in the new xlogdb
-                    # otherwise delete it  and record it in the removed list
+                    # otherwise add it to the removal list
                     if keep:
                         fxlogdb_new.write(wal_info.to_xlogdb_line())
                     else:
-                        self.delete_wal(wal_info)
-                        removed.append(wal_info.name)
+                        wal_dir = os.path.dirname(wal_info.fullpath(self.server))
+                        wals_to_remove[wal_dir].append(wal_info)
+
+                wals_removed = self.delete_wals(wals_to_remove)
+
                 fxlogdb_new.flush()
                 fxlogdb_new.seek(0)
                 fxlogdb.seek(0)
                 shutil.copyfileobj(fxlogdb_new, fxlogdb)
                 fxlogdb.truncate()
-        return removed
+
+        return wals_removed
+
+    def delete_wals(self, wals_to_delete):
+        """
+        Delete the given WAL files. The entire WAL directory is deleted when possible.
+
+        :param dict[str, list[WalFileInfo]] wals_to_delete: A dictionary where key is the WAL directory name and
+            value is a list of wal_info objects representing the WALs to be deleted in
+            that directory.
+        :return list[str]: a list of deleted WAL names.
+        """
+        wals_deleted = []
+        for wal_dir, wal_list in wals_to_delete.items():
+            delete_directory = False
+            # Each directory can contain up to 256 WAL files. If the deletion list
+            # contains 256 entries, the entire directory can be safely deleted
+            # Otherwise, check if all WALs in the directory are in the deletion list
+            if len(wal_list) >= 256:
+                delete_directory = True
+            else:
+                wal_names_to_delete = {wal_info.name for wal_info in wal_list}
+                wal_names_in_dir = os.listdir(wal_dir)
+                if set(wal_names_in_dir).issubset(wal_names_to_delete):
+                    delete_directory = True
+            # If the directory can be deleted, run the hook-scripts on each WAL file
+            # before and after the rmtree. Otherwise, delete each WAL individually
+            if delete_directory:
+                for wal_info in wal_list:
+                    self._run_pre_delete_wal_scripts(wal_info)
+                shutil.rmtree(wal_dir)
+                for wal_info in wal_list:
+                    self._run_post_delete_wal_scripts(wal_info)
+                    wals_deleted.append(wal_info.name)
+            else:
+                for wal_info in wal_list:
+                    self.delete_wal(wal_info)
+                    wals_deleted.append(wal_info.name)
+        return wals_deleted
 
     def validate_last_backup_maximum_age(self, last_backup_maximum_age):
         """
@@ -1727,3 +1924,21 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             output.error(e.args[0]["err"])
             return
         output.info(pg_verifybackup.get_output()[0].strip())
+
+    def get_wal_file_info(self, filename):
+        """
+        Populate a WalFileInfo object taking into account the server
+        configuration.
+
+        Set compression to 'custom' if no compression is identified
+        and Barman is configured to use custom compression.
+
+        :param str filename: the path of the file to identify
+        :rtype: barman.infofile.WalFileInfo
+        """
+        return WalFileInfo.from_file(
+            filename,
+            compression_manager=self.compression_manager,
+            unidentified_compression=self.compression_manager.unidentified_compression,
+            encryption_manager=self.encryption_manager,
+        )

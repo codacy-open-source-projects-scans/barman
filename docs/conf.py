@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -97,7 +97,7 @@ master_doc = "index"
 
 # General information about the project.
 project = "Barman"
-copyright = "© Copyright EnterpriseDB UK Limited 2011-2024"
+copyright = "© Copyright EnterpriseDB UK Limited 2011-2025"
 author = "EnterpriseDB"
 
 # The version info for the project you"re documenting, acts as replacement for
@@ -334,6 +334,13 @@ man_pages = [
         1,
     ),
     (
+        "user_guide/commands/barman/list_processes.inc",
+        "barman-list-processes",
+        "Barman Sub-Commands",
+        [author],
+        1,
+    ),
+    (
         "user_guide/commands/barman/list_servers.inc",
         "barman-list-servers",
         "Barman Sub-Commands",
@@ -434,6 +441,13 @@ man_pages = [
     (
         "user_guide/commands/barman/sync_wals.inc",
         "barman-sync-wals",
+        "Barman Sub-Commands",
+        [author],
+        1,
+    ),
+    (
+        "user_guide/commands/barman/terminate_process.inc",
+        "barman-terminate-process",
         "Barman Sub-Commands",
         [author],
         1,
@@ -543,6 +557,8 @@ exclude_from_builder = {
 }
 # Internal holding list, anything added here will always be excluded
 _docs_to_remove = []
+
+suppress_warnings = ["toc.not_included"]
 
 
 def builder_inited(app):

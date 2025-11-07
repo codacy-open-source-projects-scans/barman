@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2014-2023
+# © Copyright EnterpriseDB UK Limited 2014-2025
 #
 # This file is part of Barman.
 #
@@ -75,6 +75,7 @@ def build_test_backup_info(
     parent_backup_id=None,
     children_backup_ids=None,
     cluster_size=2048,
+    encryption=None,
 ):
     """
     Create an 'Ad Hoc' BackupInfo object for testing purposes.
@@ -131,6 +132,7 @@ def build_test_backup_info(
         server.config = build_config_from_dicts().get_server("main")
         server.passive_node = False
         server.backup_manager.name = "default"
+        server.meta_directory = "%s/meta" % server.config.backup_directory
 
     backup_info = LocalBackupInfo(**locals())
     return backup_info
@@ -280,6 +282,7 @@ def build_config_dictionary(config_keys=None):
         "active": True,
         "active_model": None,
         "archiver": True,
+        "worm_mode": False,
         "archiver_batch_size": 0,
         "autogenerate_manifest": False,
         "aws_await_snapshots_timeout": 3600,
@@ -306,6 +309,7 @@ def build_config_dictionary(config_keys=None):
         "basebackups_directory": "/some/barman/home/main/base",
         "barman_lock_directory": "/some/barman/home",
         "compression": None,
+        "compression_level": "medium",
         "config_changes_queue": "/some/barman/home/cfg_changes.queue",
         "conninfo": "host=pg01.nowhere user=postgres port=5432",
         "backup_method": "rsync",
@@ -314,11 +318,15 @@ def build_config_dictionary(config_keys=None):
         "custom_decompression_filter": None,
         "custom_compression_magic": None,
         "description": " Text with quotes ",
+        "encryption": None,
+        "encryption_key_id": None,
+        "encryption_passphrase_command": None,
         "gcp_project": None,
         "gcp_zone": None,
         "immediate_checkpoint": False,
         "incoming_wals_directory": "/some/barman/home/main/incoming",
         "keepalive_interval": 60,
+        "combine_mode": "copy",
         "local_staging_path": None,
         "max_incoming_wals_queue": None,
         "minimum_redundancy": "0",
@@ -348,6 +356,7 @@ def build_config_dictionary(config_keys=None):
         "tablespace_bandwidth_limit": None,
         "wal_retention_policy": "main",
         "wals_directory": "/some/barman/home/main/wals",
+        "xlogdb_directory": "/some/barman/home/main/wals",
         "basebackup_retry_sleep": 30,
         "basebackup_retry_times": 0,
         "post_archive_script": None,
@@ -370,6 +379,8 @@ def build_config_dictionary(config_keys=None):
         "disabled": False,
         "msg_list": [],
         "path_prefix": None,
+        "staging_path": None,
+        "staging_location": "local",
         "streaming_archiver": False,
         "streaming_wals_directory": "/some/barman/home/main/streaming",
         "errors_directory": "/some/barman/home/main/errors",
@@ -464,6 +475,7 @@ def build_mocked_server(
     server.path = "/test/bin"
     server.systemid = "6721602258895701769"
     server.postgres.server_version = pg_version
+    server.meta_directory = "%s/meta" % server.config.backup_directory
     return server
 
 
@@ -488,8 +500,11 @@ def build_backup_manager(
     with mock.patch("barman.backup.CompressionManager"):
         manager = BackupManager(server=server)
     manager.compression_manager.unidentified_compression = None
-    manager.compression_manager.get_wal_file_info.side_effect = (
-        lambda filename: WalFileInfo.from_file(filename, manager.compression_manager)
+    manager.get_wal_file_info = mock.Mock()
+    manager.get_wal_file_info.side_effect = lambda filename: WalFileInfo.from_file(
+        filename,
+        manager.compression_manager,
+        encryption_manager=manager.encryption_manager,
     )
     server.backup_manager = manager
     return manager
@@ -525,6 +540,8 @@ def parse_recovery_conf(recovery_conf_file):
     recovery_conf = {}
 
     for line in recovery_conf_file.readlines():
+        if "=" not in line:
+            continue
         key, value = (s.strip() for s in line.strip().split("=", 1))
         recovery_conf[key] = value
 

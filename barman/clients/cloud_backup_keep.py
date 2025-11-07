@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -22,7 +22,6 @@ from contextlib import closing
 from barman.annotations import KeepManager
 from barman.clients.cloud_cli import (
     GeneralErrorExit,
-    NetworkErrorExit,
     OperationErrorExit,
     create_argument_parser,
 )
@@ -31,12 +30,15 @@ from barman.cloud_providers import get_cloud_interface
 from barman.infofile import BackupInfo
 from barman.utils import force_str
 
+_logger = logging.getLogger(__name__)
+
 
 def main(args=None):
     """
-    The main script entry point
-    :param list[str] args: the raw arguments list. When not provided
-        it defaults to sys.args[1:]
+    The main script entry point.
+
+    :param list[str] args: the raw arguments list. When not provided it defaults to
+        sys.args[1:].
     """
     config = parse_arguments(args)
     configure_logging(config)
@@ -45,15 +47,10 @@ def main(args=None):
         cloud_interface = get_cloud_interface(config)
 
         with closing(cloud_interface):
-            if not cloud_interface.test_connectivity():
-                raise NetworkErrorExit()
-            # If test is requested, just exit after connectivity test
-            elif config.test:
+            # Do connectivity test if requested
+            if config.test:
+                cloud_interface.verify_cloud_connectivity_and_bucket_existence()
                 raise SystemExit(0)
-
-            if not cloud_interface.bucket_exists:
-                logging.error("Bucket %s does not exist", cloud_interface.bucket_name)
-                raise OperationErrorExit()
 
             catalog = CloudBackupCatalog(cloud_interface, config.server_name)
             backup_id = catalog.parse_backup_id(config.backup_id)
@@ -70,7 +67,7 @@ def main(args=None):
                 if backup_info.status == BackupInfo.DONE:
                     catalog.keep_backup(backup_id, config.target)
                 else:
-                    logging.error(
+                    _logger.error(
                         "Cannot add keep to backup %s because it has status %s. "
                         "Only backups with status DONE can be kept.",
                         backup_id,
@@ -79,8 +76,8 @@ def main(args=None):
                     raise OperationErrorExit()
 
     except Exception as exc:
-        logging.error("Barman cloud keep exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud keep exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise GeneralErrorExit()
 
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -29,6 +29,7 @@ import re
 import shutil
 import sys
 import tarfile
+import tempfile
 import time
 from collections import namedtuple
 from contextlib import closing, contextmanager
@@ -38,10 +39,12 @@ from tempfile import NamedTemporaryFile
 import dateutil.tz
 
 import barman
-from barman import output, xlog
+from barman import fs, output, xlog
 from barman.backup import BackupManager
 from barman.command_wrappers import BarmanSubProcess, Command, Rsync
+from barman.compression import CustomCompressor
 from barman.copy_controller import RsyncCopyController
+from barman.encryption import get_passphrase_from_command
 from barman.exceptions import (
     ArchiverFailure,
     BackupException,
@@ -97,6 +100,8 @@ from barman.utils import (
     human_readable_timedelta,
     is_power_of_two,
     mkpath,
+    muted,
+    parse_target_tli,
     pretty_size,
     timeout,
 )
@@ -239,7 +244,7 @@ class Server(RemoteStatusMixin):
     This class represents the PostgreSQL server to backup.
     """
 
-    XLOG_DB = "xlog.db"
+    XLOGDB_NAME = "{server}-xlog.db"
 
     # the strategy for the management of the results of the various checks
     __default_check_strategy = CheckOutputStrategy()
@@ -618,6 +623,8 @@ class Server(RemoteStatusMixin):
                 self.check_retention_policy_settings(check_strategy)
                 # Check for backup validity
                 self.check_backup_validity(check_strategy)
+                # Check if encryption works
+                self.check_encryption(check_strategy)
                 # Check WAL archiving is happening
                 self.check_wal_validity(check_strategy)
                 # Executes the backup manager set of checks
@@ -657,33 +664,63 @@ class Server(RemoteStatusMixin):
              of the results of the various checks
         """
         check_strategy.init_check("WAL archive")
-        # Make sure that WAL archiving has been setup
-        # XLOG_DB needs to exist and its size must be > 0
-        # NOTE: we do not need to acquire a lock in this phase
-        xlogdb_empty = True
-        if os.path.exists(self.xlogdb_file_name):
-            with open(self.xlogdb_file_name, "rb") as fxlogdb:
-                if os.fstat(fxlogdb.fileno()).st_size > 0:
-                    xlogdb_empty = False
 
-        # NOTE: This check needs to be only visible if it fails
-        if xlogdb_empty:
-            # Skip the error if we have a terminated backup
-            # with status WAITING_FOR_WALS.
-            # TODO: Improve this check
-            backup_id = self.get_last_backup_id([BackupInfo.WAITING_FOR_WALS])
-            if not backup_id:
-                check_strategy.result(
-                    self.config.name,
-                    False,
-                    hint="please make sure WAL shipping is setup",
+        # If the xlogdb is not empty, we have WALs archived so the archiving works
+        success = not self._is_xlogdb_empty()
+
+        # If the xlogdb is empty and there is a backup waiting for WALs,
+        # it likely means it was the first backup and Barman removed WALs from before
+        # the start of the backup. In this case, just by having such a backup we can assume
+        # the archiving works (otherwise, the user wouldn't have been able to take it)
+        if not success and self.get_last_backup_id([BackupInfo.WAITING_FOR_WALS]):
+            success = True
+
+        # If still no success, try archiving WALs from the incoming/streaming
+        # directories, in case anything is waiting in there
+        if not success:
+            with muted(output):
+                self.archive_wal(verbose=False)
+            success = not self._is_xlogdb_empty()
+
+        # If none succeeded, try a switch-wal followed by an archive command
+        if not success and self.postgres is not None:
+            with muted(output):
+                output.debug(
+                    "Could not find any archived or to-be-archived WALs during the "
+                    "check. Trying to switch a WAL and archive it as a last resort"
                 )
+                # The timeout for the switched WAL to arrive and be archived is
+                # 1/3 of the server's check timeout
+                timeout = self.config.check_timeout // 3
+                self.switch_wal(force=False, archive=True, archive_timeout=timeout)
+            success = not self._is_xlogdb_empty()
+
+        # If none of the above succeeded, we can assume the archiving is not working
+        if not success:
+            check_strategy.result(
+                self.config.name,
+                False,
+                hint="please make sure WAL shipping is setup",
+            )
 
         # Check the number of wals in the incoming directory
         self._check_wal_queue(check_strategy, "incoming", "archiver")
 
         # Check the number of wals in the streaming directory
         self._check_wal_queue(check_strategy, "streaming", "streaming_archiver")
+
+    def _is_xlogdb_empty(self):
+        """
+        Check if the xlogdb file is empty or does not exist.
+
+        :returns bool: ``True`` if the xlogdb is empty or does not exist, ``False``
+            otherwise.
+        """
+        if os.path.exists(self.xlogdb_file_path):
+            with open(self.xlogdb_file_path, "rb") as fxlogdb:
+                if os.fstat(fxlogdb.fileno()).st_size > 0:
+                    return False
+        return True
 
     def _check_wal_queue(self, check_strategy, dir_name, archiver_name):
         """
@@ -884,6 +921,7 @@ class Server(RemoteStatusMixin):
         If WAL-specific connection information *is* defined then we must verify that
         streaming is possible using that connection information *as well as* check
         the replication slot. This check will therefore:
+
           1. Create these connections.
           2. Fetch the remote status of these connections.
           3. Pass the remote status information to :meth:`_check_wal_streaming_preflight`
@@ -892,12 +930,12 @@ class Server(RemoteStatusMixin):
           4. Pass the remote status information to :meth:`_check_replication_slot`
              so that the status of the replication slot can be verified.
 
-        :param CheckStrategy check_strategy: The strategy for the management
-            of the result of this check
+        :param CheckStrategy check_strategy: The strategy for the management of the
+            result of this check.
         """
         # If we have wal-specific conninfo then we must use those to get
         # the remote status information for the check
-        streaming_conninfo, conninfo = self.config.get_wal_conninfo()
+        streaming_conninfo, conninfo = self.config.get_wal_conninfo(check_strategy)
         if conninfo != self.config.conninfo:
             with closing(StreamingConnection(streaming_conninfo)) as streaming, closing(
                 PostgreSQLConnection(conninfo, slot_name=self.config.slot_name)
@@ -1218,6 +1256,45 @@ class Server(RemoteStatusMixin):
             wal_size = wal_info["wal_until_next_size"]
         return wal_age_isok, wal_message, wal_size
 
+    def check_encryption(self, check_strategy):
+        """
+        Check if the configured encryption works.
+
+        It attempts to encrypt a simple text file to assert that encryption works.
+
+        :param CheckStrategy check_strategy: The strategy for the management
+            of the results.
+        """
+        if not self.config.encryption:
+            return
+
+        check_strategy.init_check("encryption")
+        try:
+            self.backup_manager.encryption_manager.validate_config()
+        except ValueError as ex:
+            check_strategy.result(self.config.name, False, hint=force_str(ex))
+            return
+
+        encryption = self.backup_manager.encryption_manager.get_encryption()
+
+        with tempfile.NamedTemporaryFile("w+", prefix="barman-encrypt-test-") as file:
+            file.write("I am a secret message. Encrypt me!")
+            try:
+                dest_dir = os.path.dirname(file.name)
+                encrypted_file = encryption.encrypt(file.name, dest_dir)
+            except CommandFailedException as ex:
+                output.debug("encryption test failed: %s" % force_str(ex))
+                check_strategy.result(
+                    self.config.name,
+                    False,
+                    hint="encryption test failed. Check the log file for more details",
+                )
+                return
+            else:
+                os.unlink(encrypted_file)
+
+        check_strategy.result(self.config.name, True, hint="encryption test succeeded")
+
     def check_wal_validity(self, check_strategy):
         """
         Check if wal archiving requirements are satisfied
@@ -1454,6 +1531,19 @@ class Server(RemoteStatusMixin):
             "status", self.config.name, "disabled", "Disabled", self.config.disabled
         )
 
+        # Show active configuration model information
+        active_model = (
+            self.config.active_model.name if self.config.active_model else None
+        )
+
+        output.result(
+            "status",
+            self.config.name,
+            "active_model",
+            "Active configuration model",
+            active_model,
+        )
+
         # Postgres status is available only if node is not passive
         if not self.passive_node:
             self.status_postgres()
@@ -1530,6 +1620,10 @@ class Server(RemoteStatusMixin):
             result["last_backup_maximum_age"] = msg
         else:
             result["last_backup_maximum_age"] = "None"
+        # Add active model information
+        result["active_model"] = (
+            self.config.active_model.name if self.config.active_model else None
+        )
         output.result("show_server", self.config.name, result)
 
     def delete_backup(self, backup):
@@ -1553,11 +1647,18 @@ class Server(RemoteStatusMixin):
             )
             return False
 
-        # Honour minimum required redundancy
-        available_backups = self.get_available_backups(status_filter=(BackupInfo.DONE,))
+        # Honour minimum required redundancy, considering backups that are not
+        # incremental.
+        available_backups = self.get_available_backups(
+            status_filter=(BackupInfo.DONE,),
+            backup_type_filter=(BackupInfo.NOT_INCREMENTAL),
+        )
         minimum_redundancy = self.config.minimum_redundancy
-        if backup.status == BackupInfo.DONE and minimum_redundancy >= len(
-            available_backups
+        # If the backup is incremental, skip check for minimum redundancy and delete.
+        if (
+            backup.status == BackupInfo.DONE
+            and not backup.is_incremental
+            and minimum_redundancy >= len(available_backups)
         ):
             output.warning(
                 "Skipping delete of backup %s for server %s "
@@ -1659,14 +1760,14 @@ class Server(RemoteStatusMixin):
     def backup(self, wait=False, wait_timeout=None, backup_name=None, **kwargs):
         """
         Performs a backup for the server
+
         :param bool wait: wait for all the required WAL files to be archived
-        :param int|None wait_timeout: the time, in seconds, the backup
-            will wait for the required WAL files to be archived
-            before timing out
-        :param str|None backup_name: a friendly name by which this backup can
-            be referenced in the future
-        :kwparam str parent_backup_id: id of the parent backup when taking a
-            Postgres incremental backup
+        :param int|None wait_timeout: the time, in seconds, the backup will wait for the
+            required WAL files to be archived before timing out
+        :param str|None backup_name: a friendly name by which this backup can be
+            referenced in the future
+        :kwparam str parent_backup_id: id of the parent backup when taking a Postgres
+            incremental backup
         """
         # The 'backup' command is not available on a passive node.
         # We assume that if we get here the node is not passive
@@ -1720,9 +1821,11 @@ class Server(RemoteStatusMixin):
                 self.check_backup(backup_info)
 
             # At this point is safe to remove any remaining WAL file before the
-            # first backup
+            # first backup. The only exception is when worm_mode is enabled, in
+            # which case the storage is expected to be immutable and out of the
+            # grace period, so we skip that.
             previous_backup = self.get_previous_backup(backup_info.backup_id)
-            if not previous_backup:
+            if not previous_backup and self.config.worm_mode is False:
                 self.backup_manager.remove_wal_before_backup(backup_info)
 
             # check if the backup chain (in case it is a Postgres incremental) is consistent
@@ -1753,14 +1856,20 @@ class Server(RemoteStatusMixin):
         except LockFilePermissionDenied as e:
             output.error("Permission denied, unable to access '%s'" % e)
 
-    def get_available_backups(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
+    def get_available_backups(
+        self,
+        status_filter=BackupManager.DEFAULT_STATUS_FILTER,
+        backup_type_filter=BackupManager.DEFAULT_BACKUP_TYPE_FILTER,
+    ):
         """
         Get a list of available backups
 
         param: status_filter: the status of backups to return,
             default to BackupManager.DEFAULT_STATUS_FILTER
         """
-        return self.backup_manager.get_available_backups(status_filter)
+        return self.backup_manager.get_available_backups(
+            status_filter, backup_type_filter
+        )
 
     def get_last_backup_id(self, status_filter=BackupManager.DEFAULT_STATUS_FILTER):
         """
@@ -1807,6 +1916,61 @@ class Server(RemoteStatusMixin):
         """
         # Iterate through backups and see if there is one which matches the name
         return self.backup_manager.get_backup_id_from_name(backup_name, status_filter)
+
+    def get_closest_backup_id_from_target_lsn(
+        self,
+        target_lsn,
+        target_tli,
+        status_filter=BackupManager.DEFAULT_STATUS_FILTER,
+    ):
+        """
+        Get the id of a backup according to the *target_lsn* and *target_tli*.
+
+        :param str target_lsn: The target value with lsn format, e.g.,
+            ``3/64000000``.
+        :param int|None target_tli: The target timeline, if a specific one is required.
+        :param tuple[str, ...] status_filter: The status of the backup to return.
+        :return str|None: ID of the backup.
+        """
+        return self.backup_manager.get_closest_backup_id_from_target_lsn(
+            target_lsn, target_tli, status_filter
+        )
+
+    def get_closest_backup_id_from_target_time(
+        self,
+        target_time,
+        target_tli,
+        status_filter=BackupManager.DEFAULT_STATUS_FILTER,
+    ):
+        """
+        Get the id of a backup according to the *target_time* and *target_tli*, if
+        it exists.
+
+        :param str target_time: The target value with timestamp format
+            ``%Y-%m-%d %H:%M:%S`` with or without timezone.
+        :param int|None target_tli: The target timeline, if a specific one is required.
+        :param tuple[str, ...] status_filter: The status of the backup to return.
+        :return str|None: ID of the backup.
+        """
+        return self.backup_manager.get_closest_backup_id_from_target_time(
+            target_time, target_tli, status_filter
+        )
+
+    def get_last_backup_id_from_target_tli(
+        self,
+        target_tli,
+        status_filter=BackupManager.DEFAULT_STATUS_FILTER,
+    ):
+        """
+        Get the id of a backup according to the *target_tli*.
+
+        :param int target_tli: The recovery target timeline.
+        :param tuple[str, ...] status_filter: The status of the backup to return.
+        :return str|None: ID of the backup.
+        """
+        return self.backup_manager.get_last_backup_id_from_target_tli(
+            target_tli, status_filter
+        )
 
     def list_backups(self):
         """
@@ -1892,27 +2056,21 @@ class Server(RemoteStatusMixin):
             targets.
 
         :param BackupInfo backup: a backup object
-        :param target_tli : target timeline, either a timeline ID or one of the keywords
+        :param target_tli: target timeline, either a timeline ID or one of the keywords
             supported by Postgres
         :param target_time: target time, in epoch
         :param target_xid: target transaction ID
         :param target_lsn: target LSN
-        :param target_immediate: target that ends recovery as soon as
-            consistency is reached. Defaults to ``False``.
+        :param target_immediate: target that ends recovery as soon as consistency is
+            reached. Defaults to ``False``.
         """
         begin = backup.begin_wal
         end = backup.end_wal
 
         # Calculate the integer value of TLI if a keyword is provided
-        calculated_target_tli = target_tli
-        if target_tli and type(target_tli) is str:
-            if target_tli == "current":
-                calculated_target_tli = backup.timeline
-            elif target_tli == "latest":
-                valid_timelines = self.backup_manager.get_latest_archived_wals_info()
-                calculated_target_tli = int(max(valid_timelines.keys()), 16)
-            elif not target_tli.isdigit():
-                raise ValueError("%s is not a valid timeline keyword" % target_tli)
+        calculated_target_tli = parse_target_tli(
+            self.backup_manager, target_tli, backup
+        )
 
         # If timeline isn't specified, assume it is the same timeline
         # of the backup
@@ -2134,7 +2292,13 @@ class Server(RemoteStatusMixin):
         return wal_info
 
     def recover(
-        self, backup_info, dest, tablespaces=None, remote_command=None, **kwargs
+        self,
+        backup_info,
+        dest,
+        wal_dest=None,
+        tablespaces=None,
+        remote_command=None,
+        **kwargs,
     ):
         """
         Performs a recovery of a backup
@@ -2142,6 +2306,9 @@ class Server(RemoteStatusMixin):
         :param barman.infofile.LocalBackupInfo backup_info: the backup
             to recover
         :param str dest: the destination directory
+        :param str|None wal_dest: the destination directory for WALs when doing PITR.
+            See :meth:`~barman.recovery_executor.RecoveryExecutor._set_pitr_targets`
+            for more details.
         :param dict[str,str]|None tablespaces: a tablespace
             name -> location map (for relocation)
         :param str|None remote_command: default None. The remote command to
@@ -2161,7 +2328,7 @@ class Server(RemoteStatusMixin):
             configurations
         """
         return self.backup_manager.recover(
-            backup_info, dest, tablespaces, remote_command, **kwargs
+            backup_info, dest, wal_dest, tablespaces, remote_command, **kwargs
         )
 
     def get_wal(
@@ -2178,7 +2345,7 @@ class Server(RemoteStatusMixin):
 
         :param str wal_name: id of the WAL file to find into the WAL archive
         :param str|None compression: compression format for the output
-        :param bool keep_compression: if True, do not uncompress compressed WAL files
+        :param bool keep_compression: if True, do not decompress compressed WAL files
         :param str|None output_directory: directory where to deposit the
             WAL file
         :param int|None peek: if defined list the next N WAL file
@@ -2353,65 +2520,139 @@ class Server(RemoteStatusMixin):
 
         :param str wal_file: WAL file path
         :param str compression: required compression
-        :param bool keep_compression: if True, do not uncompress compressed WAL files
+        :param bool keep_compression: if True, do not decompress compressed WAL files
         :param destination: file stream to use to write the data
         """
+        backup_manager = self.backup_manager
         # Identify the wal file
-        wal_info = self.backup_manager.compression_manager.get_wal_file_info(wal_file)
-
-        # Get a decompressor for the file (None if not compressed)
-        wal_compressor = self.backup_manager.compression_manager.get_compressor(
-            wal_info.compression
-        )
-
-        # Get a compressor for the output (None if not compressed)
-        out_compressor = self.backup_manager.compression_manager.get_compressor(
-            compression
-        )
+        wal_info = backup_manager.get_wal_file_info(wal_file)
 
         # Initially our source is the stored WAL file and we do not have
-        # any temporary file
+        # any temporary file.
         source_file = wal_file
         uncompressed_file = None
         compressed_file = None
+        tempdir = None
 
-        if not keep_compression:
-            # If the required compression is different from the source we
-            # decompress/compress it into the required format (getattr is
-            # used here to gracefully handle None objects)
-            if getattr(wal_compressor, "compression", None) != getattr(
-                out_compressor, "compression", None
-            ):
-                # If source is compressed, decompress it into a temporary file
-                if wal_compressor is not None:
-                    uncompressed_file = NamedTemporaryFile(
-                        dir=self.config.wals_directory,
-                        prefix=".%s." % os.path.basename(wal_file),
-                        suffix=".uncompressed",
+        # Check if it is not a partial file. In this case, the WAL file is still being
+        # written by pg_receivewal, and surely has not yet been compressed nor encrypted
+        # by the Barman archiver.
+        if not xlog.is_partial_file(wal_info.fullpath(self)):
+            wal_file_compression = None
+            # Before any decompression operation, check for encryption.
+            if wal_info.encryption:
+                # We need to check if `encryption_passphrase_command` is set.
+                if not self.config.encryption_passphrase_command:
+                    output.error(
+                        "Encrypted WAL file '%s' detected, but no "
+                        "'encryption_passphrase_command' is configured. "
+                        "Please set 'encryption_passphrase_command' in the configuration "
+                        "so the correct private key can be identified for decryption.",
+                        wal_info.name,
                     )
-                    # decompress wal file
-                    try:
-                        wal_compressor.decompress(source_file, uncompressed_file.name)
-                    except CommandFailedException as exc:
-                        output.error("Error decompressing WAL: %s", str(exc))
-                        return
-                    source_file = uncompressed_file.name
+                    output.close_and_exit()
 
-                # If output compression is required compress the source
-                # into a temporary file
-                if out_compressor is not None:
-                    compressed_file = NamedTemporaryFile(
-                        dir=self.config.wals_directory,
-                        prefix=".%s." % os.path.basename(wal_file),
-                        suffix=".compressed",
+                passphrase = get_passphrase_from_command(
+                    self.config.encryption_passphrase_command
+                )
+
+                encryption_handler = backup_manager.encryption_manager.get_encryption(
+                    encryption=wal_info.encryption
+                )
+
+                tempdir = tempfile.mkdtemp(
+                    dir=self.config.wals_directory,
+                    prefix=".%s." % os.path.basename(wal_file),
+                )
+                # Decrypt wal to a tmp directory.
+                decrypted_file = encryption_handler.decrypt(
+                    file=source_file, dest=tempdir, passphrase=passphrase
+                )
+                # Now, check compression info.
+                wal_file_compression = (
+                    backup_manager.compression_manager.identify_compression(
+                        decrypted_file
                     )
-                    out_compressor.compress(source_file, compressed_file.name)
-                    source_file = compressed_file.name
+                )
+
+                source_file = decrypted_file
+
+            wal_info_compression = wal_info.compression or wal_file_compression
+            # Get a decompressor for the file (None if not compressed)
+            wal_compressor = backup_manager.compression_manager.get_compressor(
+                wal_info_compression
+            )
+
+            # Get a compressor for the output (None if not compressed)
+            out_compressor = backup_manager.compression_manager.get_compressor(
+                compression
+            )
+
+            # Ignore compression/decompression when:
+            # * It's a partial WAL file; and
+            # * The user wants to decompress on the client side.
+            if not keep_compression:
+                # If the required compression is different from the source we
+                # decompress/compress it into the required format (getattr is
+                # used here to gracefully handle None objects)
+                if getattr(wal_compressor, "compression", None) != getattr(
+                    out_compressor, "compression", None
+                ):
+                    # If source is compressed, decompress it into a temporary file
+                    if wal_compressor is not None:
+                        uncompressed_file = NamedTemporaryFile(
+                            dir=self.config.wals_directory,
+                            prefix=".%s." % os.path.basename(wal_file),
+                            suffix=".uncompressed",
+                        )
+                        # If a custom decompression filter is set, we prioritize using it
+                        # instead of the compression guessed by Barman based on the magic
+                        # number.
+                        is_decompressed = False
+                        if (
+                            self.config.custom_decompression_filter is not None
+                            and not isinstance(wal_compressor, CustomCompressor)
+                        ):
+                            try:
+                                backup_manager.compression_manager.get_compressor(
+                                    "custom"
+                                ).decompress(source_file, uncompressed_file.name)
+                            except CommandFailedException as exc:
+                                output.debug("Error decompressing WAL: %s", str(exc))
+                            else:
+                                is_decompressed = True
+                        # But if a custom decompression filter is not set, or if using the
+                        # custom decompression filter was not successful, then try using
+                        # the decompressor identified by the magic number
+                        if not is_decompressed:
+                            try:
+                                wal_compressor.decompress(
+                                    source_file, uncompressed_file.name
+                                )
+                            except CommandFailedException as exc:
+                                output.error("Error decompressing WAL: %s", str(exc))
+                                return
+
+                        source_file = uncompressed_file.name
+
+                    # If output compression is required compress the source
+                    # into a temporary file
+                    if out_compressor is not None:
+                        compressed_file = NamedTemporaryFile(
+                            dir=self.config.wals_directory,
+                            prefix=".%s." % os.path.basename(wal_file),
+                            suffix=".compressed",
+                        )
+                        out_compressor.compress(source_file, compressed_file.name)
+                        source_file = compressed_file.name
 
         # Copy the prepared source file to destination
         with open(source_file, "rb") as input_file:
             shutil.copyfileobj(input_file, destination)
 
+        # Remove file
+        if tempdir is not None:
+            fs.LocalLibPathDeletionCommand(tempdir).delete()
         # Remove temp files
         if uncompressed_file is not None:
             uncompressed_file.close()
@@ -2580,19 +2821,41 @@ class Server(RemoteStatusMixin):
                         source_suffix,
                     )
                     return
-                # If a file with the same name exists, returns an error.
-                # PostgreSQL archive command will retry again later and,
-                # at that time, Barman's WAL archiver should have already
-                # managed this file.
+                # If a file with the same name exists, checksums are compared.
+                # If checksums mismatch, an error message is generated, the incoming
+                # file is moved to the errors directory.
+                # If checksums are identical, a debug message is generated and the file
+                # is skipped.
+                # In both cases the archiving process will exit with 0, avoiding
+                # that WALs pile up on Postgres.
                 if os.path.exists(item.path):
-                    output.error(
-                        "Impossible to write already existing file '%s' "
-                        "in put-wal for server '%s'%s",
-                        item.name,
-                        self.config.name,
-                        source_suffix,
+                    incoming_dir_file_checksum = file_hash(
+                        file_path=item.path, hash_algorithm=hash_algorithm
                     )
-                    return
+                    if item.checksum == incoming_dir_file_checksum:
+                        output.debug(
+                            "Duplicate Files with Identical Checksums. File %s already "
+                            "exists on server %s, and the checksums are identical. "
+                            "Skipping the file.",
+                            item.name,
+                            self.config.name,
+                        )
+                        continue
+                    else:
+                        self.move_wal_file_to_errors_directory(
+                            item.tmp_path, item.name, "duplicate"
+                        )
+                        output.info(
+                            "\tError: Duplicate Files Detected with Mismatched "
+                            "Checksums. File %s already exists on server %s with "
+                            "checksum %s, but the checksum of the incoming file is%s. "
+                            "The file has been moved to the errors directory.",
+                            item.name,
+                            self.config.name,
+                            incoming_dir_file_checksum,
+                            item.checksum,
+                        )
+                        continue
                 os.rename(item.tmp_path, item.path)
                 fsync_file(item.path)
             fsync_dir(dest_dir)
@@ -2650,7 +2913,8 @@ class Server(RemoteStatusMixin):
         """
         Method that handles the start of an 'archive-wal' sub-process.
 
-        This method must be run protected by ServerCronLock
+        This method must be run protected by ServerCronLock.
+
         :param bool keep_descriptors: whether to keep subprocess descriptors
             attached to this process.
         """
@@ -2691,9 +2955,11 @@ class Server(RemoteStatusMixin):
 
     def background_receive_wal(self, keep_descriptors):
         """
-        Method that handles the start of a 'receive-wal' sub process, running in background.
+        Method that handles the start of a 'receive-wal' sub process, running in
+        background.
 
         This method must be run protected by ServerCronLock
+
         :param bool keep_descriptors: whether to keep subprocess
             descriptors attached to this process.
         """
@@ -2809,9 +3075,12 @@ class Server(RemoteStatusMixin):
                 "on server %s. Skipping to the next server" % self.config.name
             )
 
-    def create_physical_repslot(self):
+    def create_physical_repslot(self, ignore_duplicate=False):
         """
         Create a physical replication slot using the streaming connection
+
+        :param bool ignore_duplicate: If ``True``, do not error out when a slot with the
+            specified name already exists.
         """
         if not self.streaming:
             output.error(
@@ -2852,7 +3121,16 @@ class Server(RemoteStatusMixin):
             self.streaming.create_physical_repslot(self.config.slot_name)
             output.info("Replication slot '%s' created", self.config.slot_name)
         except PostgresDuplicateReplicationSlot:
-            output.error("Replication slot '%s' already exists", self.config.slot_name)
+            if ignore_duplicate:
+                output.info(
+                    "Replication slot '%s' already exists and --if-not-exists was "
+                    "specified. Skipping creation",
+                    self.config.slot_name,
+                )
+            else:
+                output.error(
+                    "Replication slot '%s' already exists", self.config.slot_name
+                )
         except PostgresReplicationSlotsFull:
             output.error(
                 "All replication slots for server '%s' are in use\n"
@@ -2991,6 +3269,13 @@ class Server(RemoteStatusMixin):
                 )
 
     @property
+    def meta_directory(self):
+        """
+        Directory used to store server metadata files.
+        """
+        return os.path.join(self.config.backup_directory, "meta")
+
+    @property
     def systemid(self):
         """
         Get the system identifier, as returned by the PostgreSQL server
@@ -3004,12 +3289,31 @@ class Server(RemoteStatusMixin):
         return status.get("streaming_systemid")
 
     @property
+    def xlogdb_directory(self):
+        """
+        The base directory where the xlogdb file lives
+
+        :return str: the directory that contains the xlogdb file
+        """
+        return self.config.xlogdb_directory
+
+    @property
     def xlogdb_file_name(self):
         """
-        The name of the file containing the XLOG_DB
-        :return str: the name of the file that contains the XLOG_DB
+        The name of the xlogdb file.
+
+        :return str: the dynamic name for the xlogdb file
         """
-        return os.path.join(self.config.wals_directory, self.XLOG_DB)
+        return self.XLOGDB_NAME.format(server=self.config.name)
+
+    @property
+    def xlogdb_file_path(self):
+        """
+        The path of the xlogdb file
+
+        :return str: the full path of the xlogdb file
+        """
+        return os.path.join(self.xlogdb_directory, self.xlogdb_file_name)
 
     @contextmanager
     def xlogdb(self, mode="r"):
@@ -3028,19 +3332,12 @@ class Server(RemoteStatusMixin):
         :param str mode: open the file with the required mode
             (default read-only)
         """
-        if not os.path.exists(self.config.wals_directory):
-            os.makedirs(self.config.wals_directory)
-        xlogdb = self.xlogdb_file_name
+        xlogdb = self.xlogdb_file_path
+
+        if not os.path.exists(xlogdb):
+            self.rebuild_xlogdb(silent=True)
 
         with ServerXLOGDBLock(self.config.barman_lock_directory, self.config.name):
-            # If the file doesn't exist and it is required to read it,
-            # we open it in a+ mode, to be sure it will be created
-            if not os.path.exists(xlogdb) and mode.startswith("r"):
-                if "+" not in mode:
-                    mode = "a%s+" % mode[1:]
-                else:
-                    mode = "a%s" % mode[1:]
-
             with open(xlogdb, mode) as f:
                 # execute the block nested in the with statement
                 try:
@@ -3061,11 +3358,101 @@ class Server(RemoteStatusMixin):
         else:
             return self.config.retention_policy.report()
 
-    def rebuild_xlogdb(self):
+    def rebuild_xlogdb(self, silent=False):
         """
         Rebuild the whole xlog database guessing it from the archive content.
+
+        :param bool silent: Supress output logs if ``True``.
         """
-        return self.backup_manager.rebuild_xlogdb()
+        from os.path import isdir, join
+
+        if not silent:
+            output.info("Rebuilding xlogdb for server %s", self.config.name)
+
+        # create xlogdb directory and xlogdb file if they do not exist yet
+        if not os.path.exists(self.xlogdb_file_path):
+            if not os.path.exists(self.xlogdb_directory):
+                os.makedirs(self.xlogdb_directory)
+            open(self.xlogdb_file_path, mode="a").close()
+
+            # the xlogdb file was renamed in Barman 3.13. In case of a recent
+            # migration, also attempt to delete the old file to clean up leftovers
+            try:
+                os.unlink(os.path.join(self.config.wals_directory, "xlog.db"))
+            except FileNotFoundError:
+                pass
+
+        root = self.config.wals_directory
+        wal_count = label_count = history_count = 0
+        # lock the xlogdb as we are about replacing it completely
+        with self.xlogdb("w") as fxlogdb:
+            xlogdb_dir = os.path.dirname(fxlogdb.name)
+            with tempfile.TemporaryFile(mode="w+", dir=xlogdb_dir) as fxlogdb_new:
+                for name in sorted(os.listdir(root)):
+                    # ignore the xlogdb and its lockfile
+                    if name.startswith(self.xlogdb_file_name):
+                        continue
+                    fullname = join(root, name)
+                    if isdir(fullname):
+                        # all relevant files are in subdirectories
+                        hash_dir = fullname
+                        for wal_name in sorted(os.listdir(hash_dir)):
+                            fullname = join(hash_dir, wal_name)
+                            if isdir(fullname):
+                                _logger.warning(
+                                    "unexpected directory "
+                                    "rebuilding the wal database: %s",
+                                    fullname,
+                                )
+                            else:
+                                if xlog.is_wal_file(fullname):
+                                    wal_count += 1
+                                elif xlog.is_backup_file(fullname):
+                                    label_count += 1
+                                elif fullname.endswith(".tmp"):
+                                    _logger.warning(
+                                        "temporary file found "
+                                        "rebuilding the wal database: %s",
+                                        fullname,
+                                    )
+                                    continue
+                                else:
+                                    _logger.warning(
+                                        "unexpected file "
+                                        "rebuilding the wal database: %s",
+                                        fullname,
+                                    )
+                                    continue
+                                wal_info = self.backup_manager.get_wal_file_info(
+                                    fullname
+                                )
+                                fxlogdb_new.write(wal_info.to_xlogdb_line())
+                    else:
+                        # only history files are here
+                        if xlog.is_history_file(fullname):
+                            history_count += 1
+                            wal_info = self.backup_manager.get_wal_file_info(fullname)
+                            fxlogdb_new.write(wal_info.to_xlogdb_line())
+                        else:
+                            _logger.warning(
+                                "unexpected file rebuilding the wal database: %s",
+                                fullname,
+                            )
+                fxlogdb_new.flush()
+                fxlogdb_new.seek(0)
+                fxlogdb.seek(0)
+                shutil.copyfileobj(fxlogdb_new, fxlogdb)
+                fxlogdb.truncate()
+
+        if not silent:
+            output.info(
+                "Done rebuilding xlogdb for server %s "
+                "(history: %s, backup_labels: %s, wal_file: %s)",
+                self.config.name,
+                history_count,
+                label_count,
+                wal_count,
+            )
 
     def get_backup_ext_info(self, backup_info):
         """
@@ -3373,7 +3760,6 @@ class Server(RemoteStatusMixin):
         :return List[xlog.HistoryFileData]: the list of timelines that
           have the timeline with id 'tli' as parent
         """
-        comp_manager = self.backup_manager.compression_manager
 
         if forked_after:
             forked_after = xlog.parse_lsn(forked_after)
@@ -3391,7 +3777,7 @@ class Server(RemoteStatusMixin):
                 break
 
             # Create the WalFileInfo object using the file
-            wal_info = comp_manager.get_wal_file_info(history_path)
+            wal_info = self.backup_manager.get_wal_file_info(history_path)
             # Get content of the file. We need to pass a compressor manager
             # here to handle an eventual compression of the history file
             history_info = xlog.decode_history_file(
@@ -3569,6 +3955,7 @@ class Server(RemoteStatusMixin):
         The method recover information from the remote master
         server, evaluate if synchronisation with the master is required
         and spawn barman sub processes, syncing backups and WAL files
+
         :param bool keep_descriptors: whether to keep subprocess descriptors
            attached to this process.
         """
@@ -4373,3 +4760,43 @@ class Server(RemoteStatusMixin):
         if self.config.streaming_archiver:
             # Spawn the receive-wal sub-process
             self.background_receive_wal(keep_descriptors=False)
+
+    def move_wal_file_to_errors_directory(self, src, file_name, suffix):
+        """
+        Move an unknown or (mismatching) duplicate WAL file to the ``errors`` directory.
+
+        .. note:
+            The issues can happen when:
+
+            * Unknown WAL file:
+
+                * The asynchronous WAL archiver detects a file in the ``incoming`` or
+                  ``streaming`` directory which is not an WAL file.
+
+            * Duplicate WAL file:
+
+                * ``barman-wal-archive`` attempts to write a file to the ``incoming``
+                  directory which already exists there, but with a different content.
+                * The asynchronous WAL archiver detects a file in the ``incoming`` or
+                  ``streaming`` which already exists in the ``wals`` directory, but with
+                  a different content.
+
+        :param str src: Incoming file to be moved to the ``errors`` directory.
+        :param str file_name: Name of the incoming file.
+        :param str suffix: String which identifies the kind of the issue.
+
+            * ``duplicate``: if *src* is a (mismatching) duplicate WAL file.
+            * ``unknown``: if *src* is not an WAL file.
+        """
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        error_dst = os.path.join(
+            self.config.errors_directory,
+            "%s.%s.%s" % (file_name, stamp, suffix),
+        )
+        # TODO: cover corner case of duplication (unlikely,
+        # but theoretically possible)
+        try:
+            shutil.move(src, error_dst)
+        except IOError as e:
+            if e.errno == errno.ENOENT:
+                _logger.warning("%s not found" % src)

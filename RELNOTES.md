@@ -1,6 +1,987 @@
 # Barman release notes
 
-© Copyright EnterpriseDB UK Limited 2024 - All rights reserved.
+© Copyright EnterpriseDB UK Limited 2025 - All rights reserved.
+
+## 3.16.2 (2025-11-04)
+
+### Bugfixes
+
+- Improve barman-cloud delete workaround to inspect error message content
+
+  Some S3-compatible storages return an "InvalidRequest" error instead of
+  "MissingContentMD5" during delete operations. Since we cannot rely on the error code
+  alone, this updates the logic to also inspect the error message text to detect
+  MissingContentMD5-like issues and apply the appropriate fallback.
+
+  References: BAR-947.
+
+## 3.16.1 (2025-10-14)
+
+### Notable changes
+
+- Automatic bucket creation added to barman-cloud-check-wal-archive
+
+  The `barman-cloud-check-wal-archive` command now verifies whether the target bucket
+  exists in the configured cloud storage (e.g., AWS S3) and automatically creates it
+  if it does not.
+
+  Previously, automatic bucket creation was handled by `barman-cloud-backup`. This
+  change restores compatibility with CloudNativePG (CNPG) automations that depend on
+  this behavior, which were affected after the release of Barman 3.16.0.
+
+  In collaboration with the CloudNativePG team, we have reintroduced this
+  functionality specifically in `barman-cloud-check-wal-archive` to ensure seamless
+  operation of CNPG workflows and internal tests — all while preserving the intended
+  behavior and simplicity for regular Barman users.
+
+  References: BAR-931.
+
+## 3.16.0 (2025-10-02)
+
+### Notable changes
+
+- The `restore_command` for local restores no longer includes `sudo`
+
+  When using `barman restore --get-wal` for a local restore (i.e. without
+  `--remote-ssh-command`), the generated `restore_command` no longer includes a
+  `sudo -u $USER` prefix. This simplifies the process for the common case where the
+  locally restored Postgres cluster is run by the `barman` user, whom already owns the
+  files by the end of the `barman restore` operation.
+
+  **Action Required:** If you intend to run the restored cluster as a different
+  user (e.g., `postgres`), you must now manually add the appropriate
+  `sudo -u postgres` prefix to the `restore_command` in the recovery configuration and
+  ensure file ownership is correct.
+
+  References: BAR-675.
+
+- Deprecate `pygzip` and `pybzip2` compression options
+
+  The `pygzip` and `pybzip2` compression options are now deprecated and will be
+  removed in a future release. Users should migrate to the `gzip` and `bzip2` options,
+  which now use Python's internal libraries.
+
+  This change was made to improve performance and code consistency. Previously, the
+  `gzip` and `bzip2` options relied on external subprocesses, while their `py`
+  counterparts used native Python libraries. The core compression logic for `gzip` and
+  `bzip2` has been updated to also use Python's built-in libraries, making the
+  `pygzip` and `pybzip2` options redundant.
+
+  References: BAR-878.
+
+- Add delta-restore flag and recovery option to barman restore
+
+  Introduces the --delta-restore flag for barman restore, enabling delta
+  restore mode. This mode restores a backup by reusing identical data already present
+  in the destination directory, which drastically reduces restore time and network
+  traffic.
+
+  This feature is also configurable per-server via 'recovery_options' as a new field
+  called delta-restore in the server configuration file.
+
+  References: BAR-788.
+
+- S3 Object Deletion Fallback for Object Stores non-compliant with boto3 >=1.36
+
+  When using `delete_objects()` with some non-compliant S3-compatible object
+  stores, users could encounter a `MissingContentMD5` `ClientError` due to a breaking
+  change in boto3 1.36 that Botocore will no longer automatically compute and populate
+  the `Content-MD5` header.
+
+  To address this, Barman now implements a fallback mechanism:
+
+  - Bulk deletion via `delete_objects()` is still attempted first.
+  - If `delete_objects()` fails with `MissingContentMD5`, Barman automatically falls back
+    to deleting objects individually using `delete_object()`, which does not require a
+    `Content-MD5` header.
+  - Other errors continue to raise exceptions as before.
+
+  This change ensures Barman remains compatible with non-compliant object
+  stores without requiring changes on the user's side.
+
+  Users with older S3-compatible storage can continue performing backup cleanups
+  without failures, while newer object stores are unaffected.
+
+  References: BAR-909.
+
+- Cloud connectivity checks are now only performed with the `-t`/`--test` flag.
+
+  Previously, Barman always tested cloud connectivity and bucket existence
+  for most of the commands, raising errors if connectivity failed or if the bucket
+  did not exist. Both checks are now executed only when the `-t`/`--test` flag is
+  specified. The only exception was `barman-cloud-check-wal-archive`, which still
+  checks connectivity and the existence of the bucket.
+
+  Additionally, buckets are no longer created automatically — Barman assumes the
+  target bucket already exists, making it the user's responsibility to provision
+  the bucket in advance.
+
+  References: BAR-895, BAR-908, BAR-918.
+
+### Minor changes
+
+- Add `combine-mode` option to `barman restore` command
+
+  Added a `--combine-mode` option to the `barman restore` command, which can be used
+  to specify a copy mode for `pg_combinebackup` when combining incremental backups
+  during a restore. Available modes are `copy`, `link`, `clone`, and `copy-file-range`
+  which are equivalent to the `pg_combinebackup` options `--copy`, `--link`,
+  `--clone`, and `--copy-file-range`, respectively. An equivalent `combine_mode`
+  configuration option can be specified in the configuration file.
+
+  This feature allows for greater optimization of the restore process
+  based on the underlying filesystem capabilities.
+
+  References: BAR-870.
+
+- Reorganize fields in barman diagnose JSON
+
+  In the barman diagnose JSON, some fields appeared under the server's "config"
+  section even though they were not actual configuration fields.
+
+  The fields "barman_lock_directory", "lock_directory_cleanup", and
+  "config_changes_queue" were relocated under the "global" key, since they represent
+  global configurations. The "name" field was removed since the server name is already
+  used as the key. Additionally, "msg_list" is now stored under the server's name key.
+
+  References: BAR-134.
+
+- Add '-p JOBS' to barman-wal-restore command when `--get-wal` is `True`
+
+  Adds '-p JOBS' to barman-wal-restore command when `--get-wal` or `get_wal`
+  configuration option is ``True``, `JOBS` being the number of jobs chosen by the user
+  via `-p` flag or `parallel_jobs` configuration option.
+
+  References: BAR-857.
+
+- The `barman show-backup`` command now displays the backup compression method
+
+  The output of the `barman show-backup` command has been enhanced to include a new
+  `Backup Compression` field. If a backup was taken with compression enabled, this
+  field will now display the compression algorithm that was used (e.g., `zstd`). This
+  makes it easier to quickly verify the compression status of a backup.
+
+  References: BAR-901.
+
+### Bugfixes
+
+- Fix parallelism (--parallel option) in barman-wal-restore
+
+  There has been a regression in `barman-wal-restore` when introducing the
+  `--keep-compression` option in Barman 3.12.0, which made the `--parallel` option
+  not invoke processes as expected. This issue has now been fixed.
+
+  References: BAR-865.
+
+- Fix `pg_combinebackup` not being found in `PATH` when `staging_location` is `remote`
+
+  When recovering an incremental backup to a remote server with `staging_location`
+  set to `remote`, Barman checks if `pg_combinebackup` is available in the remote `PATH`.
+  However, a previous issue was making it incorrectly check the local `PATH` as well,
+  leading to errors if `pg_combinebackup` was not installed locally.
+  The problem has been fixed by ensuring that the check is only performed on the
+  server where `pg_combinebackup` is actually executed.
+
+  References: BAR-903.
+
+## 3.15.0 (2025-08-05)
+
+### Notable changes
+
+- Allow incremental backups to be taken with compression and encryption
+
+  Previously, Barman prevented incremental backups to be taken if compression was
+  enabled or if the parent backup was already compressed. Since encryption in Barman
+  requires compression, this also meant that incremental backups could not be taken
+  with encryption.
+
+  This limitation existed due to the complexity of restoring such backups, which
+  involves multiple staging phases for decryption, decompression, and combination of
+  backups.
+
+  After a significant refactoring effort, Barman now fully supports taking incremental
+  backups with both compression and/or encryption. This allows for more flexible backup
+  strategies, enabling users to take advantage of all available features without
+  restrictions.
+
+  References: BAR-764, BAR-801, BAR-841.
+
+- Deprecate `local_staging_path` and `recovery_staging_path` configuration options
+
+  The `local_staging_path` and `recovery_staging_path` configuration options have been
+  deprecated in favor of the new `staging_path` and `staging_location` options.
+  The old options will continue to work for backwards compatibility, but users are
+  encouraged to migrate to the new configuration options for better clarity and
+  flexibility.
+
+  References: BAR-571, BAR-801.
+
+- Improve flexibility and consistency of staging area configuration
+
+  Whenever restoring a compressed, encrypted or incremental backup, Barman needs a
+  staging area to handle intermediate files, such as decompressed or decrypted files,
+  or the combined incremental backup data.
+
+  Previously, Barman used to have different configuration options for each scenario:
+
+  - For incremental backups, the staging area was specified via the `local_staging_path`
+    in the Barman configuration, which could only be a path in the Barman host.
+
+  - For compressed backups, the staging area was specified via the `recovery_staging_path`,
+    which could be a path in the Barman host (in case of local recovery) or a path
+    in the target server (in case of remote recovery to a different server).
+
+  - For encrypted backups, the staging area was specified via the `local_staging_path`
+    in the Barman configuration, which could only be a path in the Barman host.
+    Note that, since encryption requires compression to be enabled, when restoring an
+    encrypted backup, users needed to specify both `recovery_staging_path` and
+    `local_staging_path`.
+
+  Barman now provides a single, unified and more flexible staging area configuration:
+
+  - The new `staging_path` configuration option can be used to specify an absolute path
+    for the staging area, where intermediate files will be stored. The default value
+    is `/tmp`.
+
+  - The new `staging_location` configuration option can be used to specify whether the
+    staging area is on the Barman host (`local`) or on the remote server (`remote`).
+    The default value is `local`.
+
+  This means that, besides having a unified configuration for the staging path, users
+  are now also able to specify with more flexibility where the staging area should
+  be located, either on the Barman host or on the remote Postgres server.
+
+  Storage usage has also been optimized to reduce resource consumption whenever
+  possible. This includes:
+
+  - Removing intermediate files as soon as they are no longer needed.
+  - Avoid using the staging area when not necessary, e.g. when restoring a
+    compressed backup locally, no staging is needed and the backup is decompressed
+    directly to its final destination.
+
+  This change simplifies configuration and improves consistency and resource usage,
+  making the recovery management more transparent and predictable for end users.
+
+  References: BAR-764, BAR-765, BAR-801, BAR-841.
+
+### Minor changes
+
+- Add `--staging-path` and `--staging-location` to `barman restore`
+
+  Added `--staging-path` and `--staging-location` options to `barman restore`
+  command to allow the user to specify a custom path for the staging area
+  during the restore process. `--staging-path` is the absolute path to be used while
+  `--staging-location` defines its location i.e. `local` or `remote`. They also have
+  its equivalent configuration options in `barman.conf` as `staging_path` and
+  `staging_location` respectively.
+
+  References: BAR-570.
+
+- Add option `--if-not-exists` to `barman receive-wal --create-slot`
+
+  A new `--if-not-exists` flag has been added to the `barman receive-wal --create-slot`
+  command. This prevents the command from failing when attempting to create a
+  replication slot that has already been created, making it more reliable for
+  use in scripts.
+
+  Special thanks to @crazybolillo <antonio@zoftko.com> a.k.a @antonag32 for
+  creating a PR and contributing to Barman.
+
+  References: BAR-527.
+
+- Fail gracefully when an unexpected field is found in the backup metadata.
+
+  This update improves how Barman handles backup metadata that includes fields unknown
+  to the current version. This situation can occur when attempting to restore a backup
+  created with a newer version of Barman using an older one. For example, if a newer
+  version adds metadata about encryption, and the older version doesn't recognize that
+  field. That's a case where this change is relevant.
+
+  Previously, this would cause an unhelpful exception. Now, Barman will display a
+  clearer message explaining that the backup was created with a newer version and may
+  not be compatible with the current version.
+
+  References: BAR-763.
+
+- Improve orphan backup warning for proper cleanup
+
+  The warning message for orphan backups has been improved to help users fully
+  clean up incomplete or manually removed backups. Previously, the message did not
+  mention the location of the `backup.info` file, which led to confusion. The updated
+  message now clearly indicates the location of the `backup.info` file to help users
+  properly remove it.
+
+  References: BAR-793.
+
+- Improve tag handling in cloud commands to fix parsing errors
+
+  The `--tags` command-line option in `barman-cloud-backup` and
+  `barman-cloud-wal-archive` has been replaced to improve parsing
+  reliability and align with standard CLI practices. The previous
+  space-separated format could cause parsing errors, especially when
+  placed before positional arguments.
+
+  The commands now accept multiple `--tag` flags, one for each key-value pair.
+
+  **Before:**
+  `barman-cloud-backup ... --tags key1,val1 key2,val2`
+
+  **After:**
+  `barman-cloud-backup ... --tag key1,val1 --tag key2,val2`
+
+  The ``--tags`` option is now deprecated. While existing scripts using the old
+  ``--tags`` format will continue to work, users are encouraged to update their
+  scripts to the new format. This change is backward compatible and does not introduce
+  a breaking change.
+
+  References: BAR-441.
+
+- Clarify `WAL Number` label in barman show-backup output
+
+  Rename misleading `WAL Number` label in `barman show-backup` output to
+  `Number of WALs`.
+
+  References: BAR-791.
+
+- Change "No of files" to "Number of files" in show-backup command
+
+  In the Wal Information section of the show-backup command, the output of
+  "No of files" was changed to "Number of files".
+
+  References: BAR-798.
+
+- Validate options passed for servers and models through `config-update`
+
+  The `barman config-update` command now performs extra validation on each
+  provided section before enqueuing changes. It verifies, among other things,
+  that all required fields are present, that the provided values conform to
+  the expected types, and that each value also passes its respective parser.
+  In addition, the command will now error out if any of the checks fail. This
+  prevents partial or malformed updates from being applied.
+
+  References: BAR-142.
+
+- Add `--check-timeout` argument to `barman check` and `barman backup` commands
+
+  A new CLI option has been introduced for the `barman check` and `barman backup`
+  commands to address situations where the check operation duration exceeds the
+  configured `check_timeout`, preventing backups from being scheduled. This option
+  allows users to disable the timeout or override the default or configured
+  `check_timeout` value.
+
+  References: BAR-219.
+
+- Add `--list-empty-directories` to `barman list-files` command
+
+  Adds a new `--list-empty-directories` argument to the `list-files`
+  command to add empty directories to the listing.
+
+  References: BAR-220.
+
+- Improve archiving check with automatic WAL switching and archiving
+
+  To improve the user experience, especially during initial server configuration, the
+  `barman check` command is now more robust.
+
+  Previously, when the WAL archive was empty, the check would fail and require manual
+  intervention.
+
+  Barman now intelligently handles this by first attempting to archive any existing
+  WAL present in the Barman server. If none exists, it automatically triggers a WAL
+  switch in the Postgres server and tries to archive the resulting file. This enhancement
+  automates a common manual step and makes the initial health check more reliable
+  out-of-the-box.
+
+  References: BAR-718.
+
+- Support shortcuts as backup IDs in Barman cloud scripts
+
+  It is now possible to specify the shortcuts `first`/`oldest`, `last`/`latest` and
+  `last-failed` when referencing backups in the Barman cloud commands. Barman now
+  automatically parses these shortcuts and returns their associated backup ID.
+
+  References: BAR-717.
+
+### Bugfixes
+
+- Ignore data files of temporary tables during backups
+
+  Files that match the pattern of temporary relation files will now be
+  ignored during a `rsync` backup, similar to the exclusion implicitly
+  performed by `pg_basebackup`. This is needed to avoid errors when running
+  Barman in rsync-concurrent mode against a Postgres instance that creates
+  and drops many temporary tables, since rsync might try to copy a temp file
+  that had already been removed, causing Barman to hang until manually unblocked.
+
+  References: BAR-266.
+
+- Improve error message when `pg_combinebackup` is not found
+
+  Previously, when restoring an incremental backup and `pg_combinebackup` was
+  not available in the PATH, Barman did not handle the exception properly, which
+  made it difficult to understand and fix the error.
+  Now, a proper exception is raised with a clear message indicating that
+  `pg_combinebackup` could not found in the target server.
+
+  References: BAR-840.
+
+- Fail on restore if the target data or tablespace directories are not empty.
+
+  Previously, Barman did not verify whether tablespace destination directories were
+  empty before restoring, which could result in their contents being silently
+  overwritten — potentially causing data loss or corruption. Now, the restore process
+  ensures that all destination directories, including those for data and tablespaces,
+  are empty before proceeding. If any are not, Barman will halt the operation and
+  display an appropriate error message, significantly improving safety and data
+  integrity for both local and remote restores.
+
+  References: BAR-787.
+
+- Fix errors when deleting orphaned and obsolete backups
+
+  Resolved an issue where applying retention policies could fail if a backup
+  was both orphaned and obsolete. Barman now verifies that a base backup
+  directory exists before attempting to delete it, preventing errors when the
+  directory has already been removed.
+
+  References: BAR-794.
+
+- Ensure correct WAL segment naming for PG17 boundary LSNs
+
+  Addresses a backup hang issue experienced with PostgreSQL 17 and later versions when
+  using barman backup `<server>` --wait on low-activity instances and modifies the logic
+  within the methods and properties that interact with pg_walfile_name() and
+  pg_walfile_name_offset().
+
+  As described in barman#1041, PostgreSQL 17 altered the behavior where the end WAL of
+  a backup is now the currently written WAL file, rather than the last completed one.
+  On servers with minimal activity, this current WAL file might not be completed or
+  archived promptly, leading to the backup process stalling indefinitely until a
+  pg_switch_wal() occurs.
+
+  More details on the PostgreSQL change can be found at
+  `https://www.postgresql.org/docs/release/17.0/`.
+
+  References: BAR-519.
+
+- Snapshot Backup Now Supports Non-Root EBS Volumes of Nitro instances on AWS
+
+  Resolved an issue where snapshot backups failed to detect non-root EBS volumes on
+  NVMe (Nitro) devices in AWS. Snapshot backups now work reliably with all non-root
+  EBS volumes attached to the instance.
+
+  References: BAR-500.
+
+## 3.14.1 (2025-06-18)
+
+### Bugfixes
+
+- Fix WAL archiving performance issues
+
+  The Barman WAL archiving process was suffering from a performance degradation due to
+  processing of WAL files that would not be archived in the current run. There was also an
+  oversight in the encryption logic introduced in 3.14, that caused Barman to check
+  for encryption in WAL files streamed to the server, which is unnecessary as streamed
+  WALs are never GPG-encrypted, nor compressed. With both issues fixed, the archiving
+  process will be significantly faster and more resource-efficient.
+
+  Thanks to @thealex55 for the detailed analysis in the issue #1087.
+
+  References: BAR-775.
+
+## 3.14.0 (2025-05-15)
+
+### Notable changes
+
+- Implementation of GPG encryption for tar backups and WAL files
+
+  Implement GPG encryption of tar backups. Encryption starts at the end of the backup,
+  encrypting the backup of PGDATA and tablespaces present in the backup directory.
+  Encrypted backup files will have the `.gpg` extension added.
+
+  Barman supports the decryption and restoration of GPG-encrypted backups using a
+  passphrase obtained through the new `encryption_passphrase_command` configuration
+  option. During the restore process, decrypted files are staged in the `local_staging_path`
+  setting on the Barman host, ensuring a reliable and safe restore process.
+
+  New configuration options required for encryption and decryption of backups
+  and WAL files needed to be added. The new options are `encryption`,
+  `encryption_key_id`, and `encryption_passphrase_command`.
+
+  WAL files are all encrypted with GPG when `encryption = gpg`. This includes
+  changing the way that xlogdb records are read and written (maintaining backwards
+  compatibility), and a new logic to detect when files are encrypted and the
+  encryption process itself.
+
+  Decryption of GPG-encrypted WAL files during the restore process when using the
+  get-wal and no-get-wal flags of the barman restore command. This extends the
+  functionality added for decrypting backups via the
+  `encryption_passphrase_command` configuration option.
+
+  There's a new field in `show-backup` to expose if a backup was encrypted, and
+  specifies the encryption method that was used, if any.
+
+  The `barman check` command verifies if the user's encryption settings are
+  correctly configured in the Barman server and functioning as expected.
+
+  References: BAR-683, BAR-687, BAR-693, BAR-669, BAR-671, BAR-692, BAR-685, BAR-680, BAR-670, BAR-681, BAR-702.
+
+- Deprecation of Python versions 3.6 and 3.7
+
+  As of version 3.14 of Barman, we are deprecating support for Python
+  3.6 and 3.7, which are not supported by the Python community anymore.
+  Barman still supports Python 3.8 as it's the newest version available on
+  RHEL 8 systems which contains all needed modules.
+
+  References: BAR-737.
+
+### Minor changes
+
+- Allow compression level to be specified for WAL compression in Barman server
+
+  Add a new `compression_level` parameter to the Barman configuration.
+  This option accepts a valid integer value or one of the predefined options:
+  `low`, `medium`, and `high`. Each option corresponds to a different
+  level depending on the compression algorithm chosen.
+
+  References: BAR-540.
+
+- Add client-side compression to `barman-wal-archive`
+
+  Client-side compression options have been added to `barman-wal-archive`,
+  supporting the same algorithms that are available on a Barman server.
+  When enabled, compression is applied on the client side before sending the WAL to
+  the Barman server. The `--compression-level` parameter allows specifying a desired
+  compression level for the chosen algorithm.
+
+  References: BAR-262.
+
+- Add --compression-level parameter to barman-cloud-wal-archive
+
+  A parameter called `compression-level` was added to `barman-cloud-wal-archive`,
+  which allows a level to be specified for the compression algorithm in use.
+
+  References: BAR-557.
+
+- Add Snappy compression algorithm to Barman server
+
+  The Snappy compression, previously only available in `barman-cloud-wal-archive`, is
+  now also available for standard Barman server. As with all other algorithms, it can
+  be configured by setting `snappy` in the `compression` configuration parameter.
+
+  References: BAR-557.
+
+- Introduce the new `list-processes` sub-command for listing the server processes
+
+  Add a new `list-processes` command that outputs all active subprocesses for
+  a Barman server. The command displays each process's PID and task.
+
+  References: BAR-664.
+
+- Introduce the new `terminate-process` sub-command for terminating Barman subprocesses
+
+  Add a new `terminate-process` command that allows users to terminate an active
+  Barman subprocess for a given server by specifying its task name. Barman will
+  terminate the subprocess as long as it belongs to the specified server and it is
+  currently active.
+
+  References: BAR-665.
+
+- Remove the pin from boto3 version used in cloud scripts
+
+  After thorough investigation of issues with boto3 >= 1.36, we've
+  decided to remove the pin that kept the dependency at version
+  1.35.
+
+  Both AWS and MinIO object stores work correctly with the latest version, and using
+  a version of boto3 that is >= 1.36 ensures the Barman cloud scripts work in a
+  FIPS-compliant environment.
+
+  References: BAR-637.
+
+### Bugfixes
+
+- Ensure minimum redundancy check considers only 'non-incremental backups'
+
+  An issue was reported where the `minimum_redundancy` rule could be violated due to
+  the inclusion of incremental backups in the redundancy count. As an example: in a
+  scenario where the catalog contained one full backup and two dependent incremental
+  backups, and the user had `minimum_redundancy = 2`, the rule was incorrectly
+  considered satisfied. As a result, deleting the full backup triggered cascading
+  deletion of its incremental dependents, leaving zero backups in the catalog.
+
+  This issue has been fixed by updating the `minimum_redundancy` logic to consider
+  only non-incremental backups (i.e. only full, rsync, snapshot). This ensures that
+  full backups cannot be deleted if doing so would violate the configured minimum
+  redundancy level.
+
+  References: BAR-707.
+
+- Fix usage of `barman-wal-restore` with `--keep-compression` using `gzip`, `bzip2`, and `pigz` compression algorithms
+
+  Fix an issue in `barman-wal-restore` where, when trying to restore WALs
+  compressed with `gzip`, `bzip2` or `pigz` while having `--keep-compression`
+  specified, leading to unexpected errors.
+
+  References: BAR-722.
+
+## 3.13.3 (2025-04-24)
+
+### Bugfixes
+
+- Fix local restore of block-level incremental backups
+
+  When performing a local restore of block-level incremental backups, Barman was
+  facing errors like the following:
+
+  ```text
+  ERROR: Destination directory '/home/vagrant/restore/internal_no_get_wal' must be empty
+  ```
+
+  That error was caused by a regression when the option `--staging-wals-directory`
+  was introduced in version 3.13.0. Along with it came a new check to ensure the WAL
+  destination directory was empty before proceeding. However, when restoring
+  block-level incremental backups locally, Barman was setting up the WAL destination
+  directory before performing this check, triggering the error above.
+
+  References: BAR-655.
+
+- Fix regression when running `barman-cloud-backup` as a hook
+
+  Barman 3.13.2 changed the location of the `backup.info` metadata file as part
+  of the work delivered to fix issues in WORM environments.
+
+  However, those changes introduced a regression when using `barman-cloud-backup`
+  as a backup hook in the Barman server: the hook was not aware of the new location
+  of the metadata file.
+
+  This update fixes that issue, so `barman-cloud-backup` becomes aware of the new
+  folder structure, and properly locates the `backup.info` file, avoiding runtime
+  failures.
+
+  References: BAR-696.
+
+- Avoid decompressing partial WAL files when custom compression is configured
+
+  Fixed an issue where Barman attempted to decompress partial WAL files when
+  custom compression was configured. Partial WAL files are never compressed,
+  so any attempt to decompress them is incorrect and caused errors when using
+  the `--partial` flag with `barman-wal-restore` or `barman get-wal`.
+
+  References: BAR-697.
+
+- Fixed `barman-cloud-backup` not recycling temporary part files
+
+  This fixes a `barman-cloud-backup` problem where temporary part files were not
+  deleted after being uploaded to the cloud, leading to disk space exhaustion.
+  The issue happened only when using Python >= 3.12 and it was due to a change
+  in Python that removed the `delete` attribute of named-temporary file
+  objects, which Barman used to rely on when performing internal checks.
+
+  References: BAR-674.
+
+- Fixed backup annotations usage in WORM environments
+
+  Barman previously stored backup annotation files, used to track operations like
+  `barman keep` and `barman delete`, inside the backup directory itself. These
+  annotations help determine whether a backup should be kept or marked for deletion.
+  However, in WORM environments, files in the backup directory cannot be modified or
+  deleted after a certain period, which caused issues with managing backup states.
+  This fix relocates annotation files to a dedicated metadata directory, as to
+  ensure that such operations function correctly in WORM environments.
+
+  References: BAR-663.
+
+## 3.13.2 (2025-03-27)
+
+### Minor changes
+
+- Fix errors when using an immutable storage
+
+  Added a new `worm_mode` configuration to enable WORM (Write Once Read Many)
+  handling in Barman, allowing it to support backups on immutable storage.
+
+  This fix also provides automatic relocation of the backup.info file in a new
+  directory `meta` inside `backup_directory`. This will let Barman update it
+  in future when needed.
+
+  Barman will also _not_ purge the wals directory for WAL files that are not
+  needed when running the first backup. This will add some extra space
+  which will be reclaimed when this first backup is obsolete and removed
+  (by that time, the backups and the WALs will be outside the retention
+  policy window).
+
+  Added additional notes to the documentation explaining limitations when
+  running with an immutable storage for backups. In particular the need
+  for a grace period in the immutability of files and the fact that
+  `barman keep` is not supported in these environments.
+
+  References: BAR-649, BAR-645, BAR-650, BAR-651, BAR-652.
+
+## 3.13.1 (2025-03-20)
+
+### Minor changes
+
+- Improve behavior of the backup shortcuts `last-full` / `latest-full`
+
+  The shortcuts `last-full` / `latest-full` were retrieving not the last full backup of
+  the server, but the last full backup of the server which was eligible as the parent
+  for an incremental backup.
+
+  While this was the expected behavior, the feedback from the community has shown that
+  it was confusing for the users.
+
+  From now on, the shortcuts `last-full` / `latest-full` will retrieve the last full
+  backup of the Barman server, independently if that backup is eligible as the parent
+  for an incremental backup or not.
+
+  The eligibility of the full backup as the parent of an incremental backup will still
+  be validated by Barman in a later step, and a proper message will be displayed in
+  case it doesn't suit as a parent.
+
+  References: BAR-555.
+
+### Bugfixes
+
+- Fix error message when parsing invalid `--target-time` in `barman restore`
+
+  When using the `barman restore` command, the error message when parsing invalid
+  `--target-time` string was:
+
+  ```text
+  EXCEPTION: local variable 'parsed_target' referenced before assignment
+  ```
+
+  That exception was replaced with an understandable error message.
+
+  References: BAR-627.
+
+- Fix mutual exclusive arguments in the cloud restore command
+
+  In the `barman-cloud-restore` command, we were checking that `target_tli` and
+  `target_lsn` were mutually exclusive arguments, where the correct pair to check
+  would be `target_time` and `target_lsn`.
+
+  References: BAR-624.
+
+- Fix Barman not honoring `custom_decompression_filter`
+
+  Fixed an issue where Barman was not honoring the configured
+  `custom_decompression_filter` if the compression algorithm specified
+  was natively supported by Barman. Custom filters now take priority
+  over native handlers when decompressing WAL files.
+
+  References: BAR-584.
+
+- Fix barman restore with --no-get-wal and --standby
+
+  Fixed an issue where Barman was removing the `pg_wal` directory during
+  recovery if `--no-get-wal` and `--standby-mode` were specified together.
+  The issue happened due to Barman incorrectly filling the recovery parameters
+  referencing `pg_wal`, including `recovery_end_command`, which led to this
+  issue. Barman will now ignore filling such parameters as they are not required
+  for this specific case.
+
+  References: BAR-630.
+
+- Fix argument parsing issue in `barman restore` and `barman-cloud-restore`
+
+  In Barman 3.13.0, a regression was introduced causing errors when using
+  `barman restore` and `barman-cloud-restore` commands. Specifically, the
+  `backup_id` positional argument, which was made optional in that version,
+  conflicted with other arguments, causing unrecognized arguments and errors.
+
+  For example, running `barman-cloud-restore` like this:
+
+  ```text
+  barman-cloud-restore source_url server_name backup_id --cloud-provider aws-s3 recovery_dir
+  ```
+
+  Would trigger an error like this:
+
+  ```text
+  barman-cloud-restore: error: unrecognized arguments: recovery_dir
+  ```
+
+  This fix resolves the issue by making `backup_id` a required argument
+  again. Additionally, a new "auto" value is now accepted as a `backup_id`,
+  allowing Barman to automatically choose the best backup for restoration
+  without needing a specific `backup_id`. This update fixes argument handling
+  and still allows a smooth and flexible restoration process for the user.
+
+  References: BAR-596.
+
+## 3.13.0 (2025-02-20)
+
+### Notable changes
+
+- Add new xlogdb_directory configuration
+
+  Introduces a new `xlogdb_directory` configuration option. This parameter can be
+  set either globally or per-server, and allows you to specify a custom directory
+  for the `xlog.db` file. This file stores metadata of archived WAL files and is used
+  internally by Barman in various scenarios. If unset, it defaults to the value of
+  `wals_directory`. Additionally, the file was also renamed to contain the server name
+  as a prefix.
+
+  References: BAR-483.
+
+- Make "backup_id" optional when restoring a backup
+
+  Historically, Barman always required a "backup_id" to restore a backup, and would
+  use that backup as the source for the restore.
+
+  This feature removes the need for specifying which backup to use as a source for
+  restore, making it optional.
+
+  This change applies to both Barman and the barman-cloud scripts.
+
+  Now the user is able to restore a backup in the following ways:
+    1. Provide a "backup_id"
+    2. Do not provide a "backup_id". It will retrieve the most recent backup
+    3. Do not provide a "backup_id", but provide a recovery target, such as:
+      - "target_time" (mutually exclusive with target_lsn)
+        Will get the closest backup prior to the "target_time"
+      - "target_lsn" (mutually exclusive with "target_time")
+        Will get the closest backup prior to the "target_lsn"
+      - "target_tli" (can be used combined with "target_time" or "target_lsn")
+        Will get the most recent backup that matches the timeline. If combined with
+        other recovery targets, it will get the most recent backup prior to the
+        target_time or target_lsn that matches the timeline
+
+  The recovery targets `--target-xid`, `--target-name` and `--target-immediate`
+  are not supported, and will error out with a message if used.
+
+  This feature will provide flexibility and ease when restoring a postgres cluster.
+
+  References: BAR-541, BAR-473.
+
+### Minor changes
+
+- Add current active model to `barman show-server` and `barman status`
+
+  Previously, after applying a configuration model, the only way to check
+  which model is currently active for a server was via the `barman diagnose`
+  command. With this update, the `barman status` and `barman show-server`
+  commands now also display the current active configuration model for a
+  server, if any.
+
+  References: BAR-524, BAR-400.
+
+- Add `--staging-wal-directory` option to `barman restore` command to allow alternative WAL directory on PITR
+
+  A new command line option `--staging-wal-directory` was added to the `restore`/`recover`
+  command to allow an alternative destination directory for WAL files when performing
+  PITR. Previously, WAL files were copied to a `barman_wal` directory within
+  the restore destination directory. This enhancement provides greater flexibility, such as
+  storing WALs on separate partitions during recovery.
+
+  References: BAR-224.
+
+- Pin boto3 version to any version <= 1.35.99
+
+  Boto3 version 1.36 has changed the way S3 integrity is checked making this version
+  incompatible with the current Barman code, generating the following error:
+
+    An error occurred (MissingContentLength) when calling the PutObject operation
+
+  As a temporary workaround, the version for boto3 is pinned to any version <= 1.35.99
+  until support for 1.36 is implemented in Barman.
+
+  References: BAR-535.
+
+- Make barman-wal-archive smarter when dealing with duplicate WAL files
+
+  Under some corner cases, Postgres could attempt to archive the same WAL twice.
+  For example: if `barman-wal-archive` copies the WAL file over to the Barman host,
+  but the script is interrupted before reporting success to Postgres. New executions
+  of `barman-wal-archive` could fail when trying to archive the same file again
+  because the WAL was already copied from Postgres to Barman, but not yet processed by
+  the asynchronous Barman WAL archiver.
+
+  This minor change deals with this situation by verifying the checksum of the
+  existing and the incoming file. If the checksums match the incoming file is
+  ignored, otherwise an output info message is sent and the incoming file is moved to
+  the errors directory. The code will exit with 0 in both situations, avoiding WALs
+  piling up in the Postgres host due to a failing `archive_command`.
+
+  References: BAR-225.
+
+- Document procedure to clear WAL archive failure check
+
+  While redesigning the Barman docs we missed adding a note advising
+  users to run a `switch-wal` command if the server is idle and
+  `barman check` returns a failure on "WAL archiving".
+
+  This addresses the gap left from the previous documentation.
+
+  References: BAR-521.
+
+- Delete WALs by deleting the entire directory at once, when possible
+
+  Previously, when WAL files needed to be deleted (e.g., due to deletion of a backup),
+  Barman would iterate over every WAL file and delete them individually. This could
+  cause performance issues, mainly in systems which use ZFS filesystem. With this
+  change, the entire directory will be deleted whenever noticed that all files in
+  the directory are no longer needed by Barman.
+
+  References: BAR-511.
+
+- Add support for `DefaultAzureCredential` option on Azure authentication
+
+  Users can now explicitly use Azure's `DefaultAzureCredential` for authentication
+  by using the `default` option for `azure_credential` in the server configuration
+  or the `--azure-credential default` option in the case of `barman-cloud-*`.
+  Previously, that could only be set as a fallback when no credential was provided
+  and no environment variables were set.
+
+  References: BAR-539.
+
+- Improve diagnose output for retention policy info
+
+  Improves the output of the barman diagnose command to display a more user-friendly
+  string representations. Specifically, "REDUNDANCY 2" is shown instead of
+  "redundancy 2 b" for the 'retention_policy' attribute, and "MAIN" is shown instead
+  of "simple-wal 2 b" for the 'wal_retention_policy' attribute.
+
+  References: BAR-100.
+
+### Bugfixes
+
+- Fix PITR when using `barman restore` with `--target-tli`
+
+  Barman was not creating the `recovery.signal` nor filling `recovery_target_timeline`
+  in `postgresql.auto.conf` in these cases:
+
+  - The only recovery target passed to `barman restore` was `--target-tli`; or
+  - `--target-tli` was specified with some other `--target-*` option, but the
+    specified target timeline was the same as the timeline of the chosen backup.
+
+  Now, if any `--target-*` option is passed to `barman restore`, that will be
+  correctly treated as PITR.
+
+  References: BAR-543.
+
+- Fix bug when AWS 'profile' variable is referenced before assignment
+
+  An issue was introduced by BAR-242 as part of the Barman 3.12.0 release.
+  The issue was causing `barman-cloud-backup-delete` (and possibly other
+  commands) to fail with errors like this when `--aws-profile` argument or
+  `aws_profile` configuration were not set:
+
+  ```bash
+  ERROR: Barman cloud backup delete exception: local
+  variable 'profile' referenced before assignment`
+  ```
+
+  References: BAR-518.
+
+- Fix --zstd flag on barman-cloud-wal-archive
+
+  Fixed a bug with the `--zstd` flag on `barman-cloud-wal-archive` where it was
+  essentially being ignored and not really compressing the WAL file before upload.
+
+  References: BAR-567.
 
 ## 3.12.1 (2024-12-09)
 

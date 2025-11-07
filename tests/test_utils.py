@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -30,8 +30,14 @@ from distutils.version import LooseVersion
 import mock
 import pytest
 from dateutil import tz
+from testing_helpers import (
+    build_backup_manager,
+    build_mocked_server,
+    build_test_backup_info,
+)
 
 import barman.utils
+from barman.infofile import BackupInfo, WalFileInfo, load_datetime_tz
 from barman.lockfile import LockFile
 
 LOGFILE_NAME = "logfile.log"
@@ -263,7 +269,7 @@ class TestConfigureLogging(object):
         handler_mock.setFormatter.assert_called_with(mock.ANY)
 
         # check if a warning has been raised
-        mocks["_logger"].warn.assert_called_with(mock.ANY)
+        mocks["_logger"].warning.assert_called_with(mock.ANY)
 
     def test_file_error_file(self, **mocks):
         test_file = "/test/log/file.log"
@@ -285,7 +291,7 @@ class TestConfigureLogging(object):
         handler_mock.setFormatter.assert_called_with(mock.ANY)
 
         # check if a warning has been raised
-        mocks["_logger"].warn.assert_called_with(mock.ANY)
+        mocks["_logger"].warning.assert_called_with(mock.ANY)
 
 
 # noinspection PyMethodMayBeStatic
@@ -1020,6 +1026,356 @@ class TestCheckBackupNames(object):
         # THEN None is returned
         assert backup_info is None
 
+    @pytest.mark.parametrize(
+        "shortcut",
+        (
+            "latest",
+            "last",
+            "oldest",
+            "first",
+            "last-failed",
+            "latest-full",
+            "last-full",
+            "12345",
+        ),
+    )
+    @mock.patch("barman.utils.is_backup_id")
+    def test_get_backup_id_using_shortcut(
+        self,
+        mock_is_backup_id,
+        shortcut,
+    ):
+        backup_manager = build_backup_manager()
+        server = backup_manager.server
+        barman.utils.get_backup_id_using_shortcut(server, shortcut, BackupInfo)
+        if shortcut in ("latest", "last"):
+            server.get_last_backup_id.assert_called_once_with()
+        elif shortcut in ("oldest", "first"):
+            server.get_first_backup_id.assert_called_once_with()
+        elif shortcut in ("last-failed"):
+            server.get_last_backup_id.assert_called_once_with([BackupInfo.FAILED])
+        elif shortcut in ("latest-full", "last-full"):
+            server.get_last_full_backup_id.assert_called_once_with()
+        else:
+            mock_is_backup_id.assert_called_once_with(shortcut)
+
+    def test_get_backup_info_from_name(self):
+        """
+        Test the `get_backup_info_from_name` from utils will return the correct
+        backup based on a named backup.
+        """
+        backup_manager = build_backup_manager()
+
+        available_backups = {
+            "20250108T120000": {
+                "status": "DONE",
+            },
+            "20250107T120000": {
+                "status": "DONE",
+            },
+            "20250106T120000": {
+                "status": "DONE",
+                "backup_name": "my_test_backup",
+            },
+        }
+
+        backups = dict(
+            (
+                bkp_id,
+                build_test_backup_info(
+                    server=backup_manager.server, backup_id=bkp_id, **bkp_metadata
+                ),
+            )
+            for bkp_id, bkp_metadata in available_backups.items()
+        )
+
+        backup_info = barman.utils.get_backup_info_from_name(
+            backups.values(), "my_test_backup"
+        )
+
+        assert backup_info == backups["20250106T120000"]
+
+
+class TestBackupRecoveryTargets(object):
+    @pytest.mark.parametrize(
+        ("target_time", "expected_backup_id"),
+        [
+            ("2025-01-08 12:15:00", "20250108T120000"),
+            ("2025-01-07 12:15:00", "20250107T120000"),
+            ("2025-01-06 12:15:00", "20250106T120000"),
+        ],
+    )
+    def test_get_backup_id_from_target_time(self, target_time, expected_backup_id):
+        """
+        Test the get_backup_id_from_target_time from utils will return the correct
+        backup based on recovery target "target_time".
+        """
+        backup_manager = build_backup_manager()
+
+        available_backups = {
+            "20250108T120000": {
+                "end_time": load_datetime_tz("2025-01-08 12:00:00"),
+                "end_xlog": "3/61000000",
+                "status": "DONE",
+            },
+            "20250107T120000": {
+                "end_time": load_datetime_tz("2025-01-07 12:00:00"),
+                "end_xlog": "3/5E000000",
+                "status": "DONE",
+            },
+            "20250106T120000": {
+                "end_time": load_datetime_tz("2025-01-06 12:00:00"),
+                "end_xlog": "3/5B000000",
+                "status": "DONE",
+            },
+        }
+
+        backups = dict(
+            (
+                bkp_id,
+                build_test_backup_info(
+                    server=backup_manager.server, backup_id=bkp_id, **bkp_metadata
+                ),
+            )
+            for bkp_id, bkp_metadata in available_backups.items()
+        )
+
+        backup_id = barman.utils.get_backup_id_from_target_time(
+            backups.values(), target_time
+        )
+
+        assert backup_id == expected_backup_id
+
+    def test_get_backup_id_from_target_time_raise_error(self):
+        """
+        Test the get_backup_id_from_target_time from utils will raise the correct error
+        and output the correct error.
+        """
+        available_backups = mock.Mock()
+
+        target_time = "2025-10-1020:00:00"
+
+        error_msg = (
+            "Unable to parse the target time parameter '2025-10-1020:00:00': "
+            "Unknown string format: 2025-10-1020:00:00"
+        )
+
+        with pytest.raises(ValueError, match=error_msg):
+            _ = barman.utils.get_backup_id_from_target_time(
+                available_backups.values(), target_time
+            )
+
+    @pytest.mark.parametrize(
+        ("target_lsn", "expected_backup_id"),
+        [
+            ("3/61000000", "20250108T120000"),
+            ("3/62000000", "20250108T120000"),
+            ("3/5E000000", "20250107T120000"),
+            ("3/5F000000", "20250107T120000"),
+            ("3/5B000000", "20250106T120000"),
+            ("3/5C000000", "20250106T120000"),
+        ],
+    )
+    def test_get_backup_id_from_target_lsn(self, target_lsn, expected_backup_id):
+        """
+        Test the get_backup_id_from_target_lsn from utils will return the correct
+        backup based on recovery target "target_lsn".
+        """
+        backup_manager = build_backup_manager()
+
+        available_backups = {
+            "20250108T120000": {
+                "end_time": load_datetime_tz("2025-01-08 12:00:00"),
+                "end_xlog": "3/61000000",
+                "status": "DONE",
+            },
+            "20250107T120000": {
+                "end_time": load_datetime_tz("2025-01-07 12:00:00"),
+                "end_xlog": "3/5E000000",
+                "status": "DONE",
+            },
+            "20250106T120000": {
+                "end_time": load_datetime_tz("2025-01-06 12:00:00"),
+                "end_xlog": "3/5B000000",
+                "status": "DONE",
+            },
+        }
+
+        backups = dict(
+            (
+                bkp_id,
+                build_test_backup_info(
+                    server=backup_manager.server, backup_id=bkp_id, **bkp_metadata
+                ),
+            )
+            for bkp_id, bkp_metadata in available_backups.items()
+        )
+
+        backup_id = barman.utils.get_backup_id_from_target_lsn(
+            backups.values(), target_lsn
+        )
+
+        assert backup_id == expected_backup_id
+
+    @pytest.mark.parametrize(
+        ("target_tli", "expected_backup_id"),
+        [
+            (3, None),
+            (2, "20250111T120000"),
+            (1, "20250108T120000"),
+        ],
+    )
+    def test_get_backup_id_from_target_tli(self, target_tli, expected_backup_id):
+        """
+        Test the get_backup_id_from_target_tli from utils will return the correct
+        backup based on recovery target "target_tli".
+        """
+        backup_manager = build_backup_manager()
+
+        available_backups = {
+            "20250111T120000": {
+                "end_time": load_datetime_tz("2025-01-11 12:00:00"),
+                "end_xlog": "3/FF000000",
+                "status": "DONE",
+                "timeline": 2,
+            },
+            "20250110T120000": {
+                "end_time": load_datetime_tz("2025-01-10 12:00:00"),
+                "end_xlog": "3/74000000",
+                "status": "DONE",
+                "timeline": 2,
+            },
+            "20250109T120000": {
+                "end_time": load_datetime_tz("2025-01-09 12:00:00"),
+                "end_xlog": "3/70000000",
+                "status": "DONE",
+                "timeline": 2,
+            },
+            "20250108T120000": {
+                "end_time": load_datetime_tz("2025-01-08 12:00:00"),
+                "end_xlog": "3/61000000",
+                "status": "DONE",
+                "timeline": 1,
+            },
+            "20250107T120000": {
+                "end_time": load_datetime_tz("2025-01-07 12:00:00"),
+                "end_xlog": "3/5E000000",
+                "status": "DONE",
+                "timeline": 1,
+            },
+            "20250106T120000": {
+                "end_time": load_datetime_tz("2025-01-06 12:00:00"),
+                "end_xlog": "3/5B000000",
+                "status": "DONE",
+                "timeline": 1,
+            },
+        }
+
+        backups = dict(
+            (
+                bkp_id,
+                build_test_backup_info(
+                    server=backup_manager.server, backup_id=bkp_id, **bkp_metadata
+                ),
+            )
+            for bkp_id, bkp_metadata in available_backups.items()
+        )
+
+        backup_id = barman.utils.get_backup_id_from_target_tli(
+            backups.values(), target_tli
+        )
+
+        assert backup_id == expected_backup_id
+
+    @pytest.mark.parametrize(
+        ("target_tli", "expected_target_tli"),
+        [("current", 1), ("latest", 3), ("1", 1), (None, None)],
+    )
+    def test_parse_target_tli_with_backup_id(self, target_tli, expected_target_tli):
+        """
+        Test the parse_target_tli from utils will return the correct
+        timeline based on shortcuts (``latest``, ``current``), string value and None.
+        """
+        server = build_mocked_server()
+
+        current_bkp_metadata = {
+            "backup_id": "20250108T120000",
+            "end_time": load_datetime_tz("2025-01-08 12:00:00"),
+            "end_xlog": "3/61000000",
+            "status": "DONE",
+            "timeline": 1,
+        }
+        backup_info = build_test_backup_info(server=server, **current_bkp_metadata)
+
+        mock_get_latest_archived_wals_info = (
+            server.backup_manager.get_latest_archived_wals_info
+        )
+        mock_get_latest_archived_wals_info.return_value = {
+            "00000001": WalFileInfo(),
+            "00000002": WalFileInfo(),
+            "00000003": WalFileInfo(),
+        }
+        calculated_target_tli = barman.utils.parse_target_tli(
+            server.backup_manager, target_tli, backup_info
+        )
+
+        assert calculated_target_tli == expected_target_tli
+
+    @pytest.mark.parametrize(
+        ("target_tli", "expected_target_tli"),
+        [("current", None), ("latest", 3), ("1", 1), (None, None)],
+    )
+    def test_parse_target_tli_without_backup_id(self, target_tli, expected_target_tli):
+        """
+        Test the parse_target_tli from utils will return the correct
+        timeline or error msg based on shortcuts (``latest``, ``current``), string value
+        and None.
+        """
+        server = build_mocked_server()
+        mock_get_latest_archived_wals_info = (
+            server.backup_manager.get_latest_archived_wals_info
+        )
+        mock_get_latest_archived_wals_info.return_value = {
+            "00000001": WalFileInfo(),
+            "00000002": WalFileInfo(),
+            "00000003": WalFileInfo(),
+        }
+        if target_tli == "current":
+            with pytest.raises(ValueError) as e:
+                _ = barman.utils.parse_target_tli(server, target_tli)
+
+            assert (
+                "'current' is not a valid timeline keyword when recovering without a backup_id"
+                in str(e)
+            )
+        else:
+            calculated_target_tli = barman.utils.parse_target_tli(
+                server.backup_manager, target_tli
+            )
+
+            assert calculated_target_tli == expected_target_tli
+
+    @pytest.mark.parametrize(
+        ("target_tli", "error_msg"),
+        [
+            ("a1", "'a1' is not a valid timeline keyword"),
+            ("1.0", "'1.0' is not a valid timeline keyword"),
+        ],
+    )
+    def test_parse_target_tli_invalid_keyword(self, target_tli, error_msg):
+        """
+        Test the parse_target_tli from utils will raise an error
+        when using incorrect targets.
+        """
+        server = build_mocked_server()
+
+        backup_info = None
+
+        with pytest.raises(ValueError) as e:
+            _ = barman.utils.parse_target_tli(server, target_tli, backup_info)
+
+        assert error_msg in str(e)
+
 
 class TestAWSSnapshotLock(object):
     """
@@ -1174,3 +1530,212 @@ class TestEditConfig:
 
         # Clean up the temporary file
         os.remove(file_path)
+
+
+class TestAWSTags:
+    """
+    Unit tests for AWS tag related utility functions in `barman.utils`.
+
+    This test class verifies the behavior of the `check_tag` and
+    `has_duplicate_first_keys` function. The first parses and validates tag strings in
+    the format "key,value". It checks for correct parsing, validation of key and value
+    lengths, reserved prefixes, allowed characters, and proper error handling for
+    invalid inputs. The second ...TODO
+    """
+
+    def test_check_tag_valid_tag(self):
+        """
+        Test that valid tag strings are correctly parsed into key-value tuples.
+
+        - Checks parsing of simple and complex tag strings.
+        """
+        assert barman.utils.check_tag("owner,data-team") == ("owner", "data-team")
+        assert barman.utils.check_tag("key,value with spaces") == (
+            "key",
+            "value with spaces",
+        )
+        assert barman.utils.check_tag(
+            "key_with.allowed:chars@/+=-,value_with.allowed:chars@/+=-"
+        ) == ("key_with.allowed:chars@/+=-", "value_with.allowed:chars@/+=-")
+
+    def test_check_tag_none_or_empty(self):
+        """
+        Test that `None` or empty strings return `None` from `check_tag`.
+        """
+        assert barman.utils.check_tag("") is None
+        assert barman.utils.check_tag(None) is None
+
+    def test_check_tag_missing_comma(self):
+        """
+        Test that a tag string missing a comma raises a `ValueError`.
+
+        :raises ValueError: If the tag format is invalid.
+        """
+        with pytest.raises(
+            ValueError, match="Invalid tag format. Expected 'key,value'."
+        ):
+            barman.utils.check_tag("keyvalue")
+
+    def test_check_tag_key_too_short(self):
+        """
+        Test that a tag key with zero length raises a `ValueError`.
+
+        :raises ValueError: If the tag key is too short.
+        """
+        with pytest.raises(
+            ValueError, match="Tag key must be between 1 and 128 characters."
+        ):
+            barman.utils.check_tag(",value")
+
+    def test_check_tag_key_too_long(self):
+        """
+        Test that a tag key longer than 128 characters raises a `ValueError`.
+
+        :raises ValueError: If the tag key is too long.
+        """
+        long_key = "k" * 129
+        with pytest.raises(
+            ValueError, match="Tag key must be between 1 and 128 characters."
+        ):
+            barman.utils.check_tag(f"{long_key},value")
+
+    def test_check_tag_key_reserved_prefix(self):
+        """
+        Test that a tag key starting with the reserved prefix 'aws:' raises a
+        `ValueError`.
+
+        :raises ValueError: If the tag key starts with 'aws:'.
+        """
+        with pytest.raises(
+            ValueError, match="Tag key cannot start with the reserved prefix 'aws:'."
+        ):
+            barman.utils.check_tag("aws:owner,value")
+
+    def test_check_tag_key_invalid_characters(self):
+        """
+        Test that a tag key containing invalid characters raises a `ValueError`.
+
+        :raises ValueError: If the tag key contains invalid characters.
+        """
+        with pytest.raises(ValueError, match="Tag key contains invalid characters."):
+            barman.utils.check_tag("key$,value")
+
+    def test_check_tag_value_too_long(self):
+        """
+        Test that a tag value longer than 256 characters raises a `ValueError`.
+
+        :raises ValueError: If the tag value is too long.
+        """
+        long_val = "v" * 257
+        with pytest.raises(
+            ValueError, match="Tag value must be 256 characters or less."
+        ):
+            barman.utils.check_tag(f"key,{long_val}")
+
+    def test_check_tag_value_invalid_characters(self):
+        """
+        Test that a tag value containing invalid characters raises a `ValueError`.
+
+        :raises ValueError: If the tag value contains invalid characters.
+        """
+        with pytest.raises(ValueError, match="Tag value contains invalid characters."):
+            barman.utils.check_tag("key,value$")
+
+    def test_check_tag_strip_spaces(self):
+        """
+        Test that leading and trailing spaces in key and value are stripped before
+        validation and parsing.
+        """
+        assert barman.utils.check_tag("  key  ,  value  ") == ("key", "value")
+
+
+class TestIsSubdirectory:
+    def test_direct_subdirectory(self, tmpdir):
+        parent = tmpdir.mkdir("parent")
+        child = parent.mkdir("child")
+        assert barman.utils.is_subdirectory(str(parent), str(child)) is True
+
+    def test_nested_subdirectory(self, tmpdir):
+        parent = tmpdir.mkdir("parent")
+        child = parent.mkdir("child").mkdir("grandchild")
+        assert barman.utils.is_subdirectory(str(parent), str(child)) is True
+
+    def test_same_directory(self, tmpdir):
+        parent = tmpdir.mkdir("parent")
+        assert barman.utils.is_subdirectory(str(parent), str(parent)) is True
+
+    def test_not_a_subdirectory(self, tmpdir):
+        parent = tmpdir.mkdir("parent")
+        sibling = tmpdir.mkdir("sibling")
+        assert barman.utils.is_subdirectory(str(parent), str(sibling)) is False
+
+    def test_relative_paths(self, tmpdir):
+        parent = tmpdir.mkdir("parent")
+        parent.mkdir("child")
+        cwd = os.getcwd()
+        try:
+            os.chdir(str(tmpdir))
+            assert barman.utils.is_subdirectory("parent", "parent/child") is True
+        finally:
+            os.chdir(cwd)
+
+    def test_root_and_subdirectory(self, tmpdir):
+        # On Unix, '/' is the root
+        child = tmpdir.mkdir("child")
+        assert barman.utils.is_subdirectory("/", str(child)) is True
+
+    def test_empty_paths(self):
+        # Empty path resolves to the current directory
+        assert barman.utils.is_subdirectory("", "") is True
+        assert barman.utils.is_subdirectory("/", "") is True
+        assert barman.utils.is_subdirectory("", "/tmp") is False
+
+
+class TestGetMajorVersion:
+    def test_none_input(self):
+        assert barman.utils.get_major_version(None) is None
+
+    def test_no_version_in_string(self):
+        assert barman.utils.get_major_version("no version here") is None
+
+    def test_integer_version(self):
+        assert barman.utils.get_major_version("PostgreSQL 17") == "17"
+        assert barman.utils.get_major_version("version: 42") == "42"
+        assert barman.utils.get_major_version("v1") == "1"
+
+    def test_decimal_version(self):
+        assert barman.utils.get_major_version("PostgreSQL 17.5") == "17"
+        assert barman.utils.get_major_version("version: 42.0") == "42"
+        assert barman.utils.get_major_version("v1.2") == "1"
+
+    def test_version_embedded_in_text(self):
+        assert barman.utils.get_major_version("abc 9.6devel") == "9"
+        assert barman.utils.get_major_version("release 10rc1") == "10"
+        assert barman.utils.get_major_version("foo 11.2beta") == "11"
+
+    def test_multiple_numbers(self):
+        # Only the first number should be considered
+        assert barman.utils.get_major_version("version 12.3 and 13.4") == "12"
+        assert barman.utils.get_major_version("foo 8 bar 9.1") == "8"
+        assert barman.utils.get_major_version("18beta2") == "18"
+
+    def test_leading_text(self):
+        assert barman.utils.get_major_version("v17.5.3") == "17"
+        assert barman.utils.get_major_version("release-20.1") == "20"
+
+    def test_trailing_text(self):
+        assert barman.utils.get_major_version("17.5beta") == "17"
+        assert barman.utils.get_major_version("10devel") == "10"
+
+    def test_leading_client_name_text(self):
+        assert (
+            barman.utils.get_major_version("pg_combinebackup (PostgreSQL) 17.5") == "17"
+        )
+        assert barman.utils.get_major_version("pg_basebackup (PostgreSQL) 17.5") == "17"
+        assert (
+            barman.utils.get_major_version("pg_verifybackup (PostgreSQL) 17.5") == "17"
+        )
+        assert (
+            barman.utils.get_major_version("pg_combinebackup (PostgreSQL) 18beta2")
+            == "18"
+        )

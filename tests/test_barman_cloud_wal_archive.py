@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # Client Utilities for Barman, Backup and Recovery Manager for PostgreSQL
 #
@@ -19,13 +19,17 @@
 import bz2
 import gzip
 import logging
+import lzma
 import os
 
+import lz4.frame
 import mock
 import pytest
 import snappy
+import zstandard
 
 from barman.clients import cloud_walarchive
+from barman.clients.cloud_cli import NetworkErrorExit
 from barman.clients.cloud_walarchive import CloudWalUploader
 from barman.cloud_providers.aws_s3 import S3CloudInterface
 from barman.cloud_providers.azure_blob_storage import AzureCloudInterface
@@ -59,8 +63,9 @@ class TestMain(object):
             cloud_interface=cloud_object_interface_mock,
             server_name="test-server",
             compression=None,
+            compression_level=None,
         )
-        cloud_object_interface_mock.setup_bucket.assert_called_once_with()
+        cloud_object_interface_mock.setup_bucket.assert_not_called()
         uploader_object_mock.upload_wal.assert_called_once_with(
             "/tmp/000000080000ABFF000000C1"
         )
@@ -82,8 +87,9 @@ class TestMain(object):
             cloud_interface=cloud_object_interface_mock,
             server_name="test-server",
             compression=None,
+            compression_level=None,
         )
-        cloud_object_interface_mock.setup_bucket.assert_called_once_with()
+        cloud_object_interface_mock.setup_bucket.assert_not_called()
         uploader_object_mock.upload_wal.assert_called_once_with(
             "/tmp/000000080000ABFF000000C1"
         )
@@ -105,8 +111,9 @@ class TestMain(object):
             cloud_interface=cloud_object_interface_mock,
             server_name="test-server",
             compression=None,
+            compression_level=None,
         )
-        cloud_object_interface_mock.setup_bucket.assert_called_once_with()
+        cloud_object_interface_mock.setup_bucket.assert_not_called()
         uploader_object_mock.upload_wal.assert_called_once_with(
             "/tmp/000000080000ABFF000000C1"
         )
@@ -140,18 +147,21 @@ class TestMain(object):
                 ]
             )
         assert excinfo.value.code == 0
-        uploader_mock.assert_called_once_with(
-            cloud_interface=cloud_object_interface_mock,
-            server_name="test-server",
-            compression=None,
-        )
-        cloud_object_interface_mock.test_connectivity.assert_called_once_with()
+        uploader_mock.assert_not_called()
+        cloud_object_interface_mock.verify_cloud_connectivity_and_bucket_existence.assert_called_once_with()
 
         # Failing connectivity test
         uploader_mock.reset_mock()
         cloud_interface_mock.reset_mock()
         cloud_object_interface_mock.test_connectivity.return_value = False
-        with pytest.raises(SystemExit) as excinfo:
+
+        def raise_error(error):
+            return error
+
+        cloud_object_interface_mock.verify_cloud_connectivity_and_bucket_existence.side_effect = raise_error(
+            NetworkErrorExit
+        )
+        with pytest.raises(NetworkErrorExit) as excinfo:
             cloud_walarchive.main(
                 [
                     "-t",
@@ -161,12 +171,8 @@ class TestMain(object):
                 ]
             )
         assert excinfo.value.code == 2
-        uploader_mock.assert_called_once_with(
-            cloud_interface=cloud_object_interface_mock,
-            server_name="test-server",
-            compression=None,
-        )
-        cloud_object_interface_mock.test_connectivity.assert_called_once_with()
+        uploader_mock.assert_not_called()
+        cloud_object_interface_mock.verify_cloud_connectivity_and_bucket_existence.assert_called_once_with()
 
     @mock.patch("barman.clients.cloud_walarchive.CloudWalUploader")
     def test_ko(self, uploader_mock, caplog):
@@ -199,8 +205,6 @@ class TestMain(object):
             "expected_override_tags",
         ),
         [
-            # With a standard WAL file, the cloud interface should be created with tags
-            # and no override tags are expected
             (
                 "/tmp/000000080000ABFF000000C1",
                 ["--tags", "foo,bar", '"b,az",qux'],
@@ -208,14 +212,40 @@ class TestMain(object):
                 [("foo", "bar"), ("b,az", "qux")],
                 None,
             ),
-            # With a history WAL file, the cloud interface should be created with tags
-            # and override tags should be included on WAL upload
             (
                 "/tmp/00000008.history",
                 ["--tags", "foo,bar", "baz,qux"],
                 ["--history-tags", "historyfoo,historybar", '"historyb,az",historyqux'],
                 [("foo", "bar"), ("baz", "qux")],
                 [("historyfoo", "historybar"), ("historyb,az", "historyqux")],
+            ),
+            # With a standard WAL file, the cloud interface should be created with tags
+            # and no override tags are expected
+            (
+                "/tmp/000000080000ABFF000000C1",
+                ["--tag", "foo,bar", "--tag", "baz,qux"],
+                [
+                    "--history-tag",
+                    "historyfoo,historybar",
+                    "--history-tag",
+                    "historybaz,historyqux",
+                ],
+                [("foo", "bar"), ("baz", "qux")],
+                None,
+            ),
+            # With a history WAL file, the cloud interface should be created with tags
+            # and override tags should be included on WAL upload
+            (
+                "/tmp/00000008.history",
+                ["--tag", "foo,bar", "--tag", "baz,qux"],
+                [
+                    "--history-tag",
+                    "historyfoo,historybar",
+                    "--history-tag",
+                    "historyb,historyqux",
+                ],
+                [("foo", "bar"), ("baz", "qux")],
+                [("historyfoo", "historybar"), ("historyb", "historyqux")],
             ),
         ],
     )
@@ -266,7 +296,6 @@ class TestMain(object):
     @pytest.mark.parametrize(
         ("tags_args"),
         [
-            # Newline in tag
             ["--tags", "foo,bar\nbaz,qux"],
             # Newline in history_tag
             ["--history-tags", "foo,bar\nbaz,qux"],
@@ -278,6 +307,38 @@ class TestMain(object):
             ["--tags", "foo,bar,baz"],
             # Too many values in history tag
             ["--history-tags", "foo,bar,baz"],
+            # Newline in tag
+            ["--tag", "foo,bar\nbaz,qux"],
+            # Newline in history_tag
+            ["--history-tag", "foo,bar\nbaz,qux"],
+            # Carriage return in tag
+            ["--tag", "foo,bar\r\nbaz,qux"],
+            # Carriage return in history_tag
+            ["--history-tag", "foo,bar\r\nbaz,qux"],
+            # Too many values in tag
+            ["--tag", "foo,bar,baz"],
+            # Too many values in history tag
+            ["--history-tag", "foo,bar,baz"],
+            # Invalid ',' char in tag
+            ["--tag", "'fo,o',baz"],
+            # Invalid ',' char in history tag
+            ["--history-tag", "'fo,o',baz"],
+            # Invalid '$' char in tag
+            ["--tag", "'fo$o',baz"],
+            # Invalid '$' char in history tag
+            ["--history-tag", "'fo$o',baz"],
+            # Too long key in tag
+            ["--tag", "%s,baz" % "a" * 129],
+            # Too long key in history tag
+            ["--history-tag", "%s,baz" % "a" * 129],
+            # Too short key in tag
+            ["--tag", ",baz"],
+            # Too short key in history tag
+            ["--history-tag", ",baz"],
+            # Too long value in tag
+            ["--tag", "a,%s" % "a" * 257],
+            # Too long value in history tag
+            ["--history-tag", "a,%s" % "a" * 257],
         ],
     )
     @mock.patch("barman.clients.cloud_walarchive.CloudWalUploader")
@@ -535,6 +596,55 @@ class TestWalUploader(object):
         assert snappy.StreamDecompressor().decompress(
             open_file.read()
         ) == "something".encode("utf-8")
+
+    def test_retrieve_zstd_file_obj(self, tmpdir):
+        """
+        Test the retrieve_file_obj method with a zstd file
+        """
+        # Setup the WAL
+        source = tmpdir.join("wal_dir/000000080000ABFF000000C1")
+        source.write("something".encode("utf-8"), ensure=True)
+        # Create a simple CloudWalUploader obj
+        uploader = CloudWalUploader(mock.MagicMock(), "test-server", compression="zstd")
+        open_file = uploader.retrieve_file_obj(source.strpath)
+        # Check the in memory file received
+        assert open_file
+        # Decompress on the fly to check content
+        assert zstandard.ZstdDecompressor().stream_reader(
+            open_file
+        ).read() == "something".encode("utf-8")
+
+    def test_retrieve_lz4_file_obj(self, tmpdir):
+        """
+        Test the retrieve_file_obj method with a lz4 file
+        """
+        # Setup the WAL
+        source = tmpdir.join("wal_dir/000000080000ABFF000000C1")
+        source.write("something".encode("utf-8"), ensure=True)
+        # Create a simple CloudWalUploader obj
+        uploader = CloudWalUploader(mock.MagicMock(), "test-server", compression="lz4")
+        open_file = uploader.retrieve_file_obj(source.strpath)
+        # Check the in memory file received
+        assert open_file
+        # Decompress on the fly to check content
+        assert lz4.frame.open(open_file, mode="rb").read() == "something".encode(
+            "utf-8"
+        )
+
+    def test_retrieve_xz_file_obj(self, tmpdir):
+        """
+        Test the retrieve_file_obj method with a xz file
+        """
+        # Setup the WAL
+        source = tmpdir.join("wal_dir/000000080000ABFF000000C1")
+        source.write("something".encode("utf-8"), ensure=True)
+        # Create a simple CloudWalUploader obj
+        uploader = CloudWalUploader(mock.MagicMock(), "test-server", compression="xz")
+        open_file = uploader.retrieve_file_obj(source.strpath)
+        # Check the in memory file received
+        assert open_file
+        # Decompress on the fly to check content
+        assert lzma.open(open_file, "rb").read() == "something".encode("utf-8")
 
     def test_retrieve_normal_file_name(self):
         """

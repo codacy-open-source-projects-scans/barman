@@ -10,14 +10,15 @@
   barman-cloud-check-wal-archive
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
+                  [ { --azure-credential | --credential } 
+                    { azure-cli | managed-identity | default } ]
                   [ --timeline TIMELINE ]
                   DESTINATION_URL SERVER_NAME
 
@@ -26,6 +27,14 @@
 Verify that the WAL archive destination for a server is suitable for use with a new
 Postgres cluster. By default, the check will succeed if the WAL archive is empty or if
 the target bucket is not found. Any other conditions will result in a failure.
+
+.. note::
+  The ``barman-cloud-check-wal-archive`` command performs an initial ``HeadBucket`` call
+  to verify whether the target bucket already exists in the S3 storage. If the bucket
+  does not exist, the command will attempt to automatically create it.
+
+  This is the only Barman command that performs these operations (bucket existence check
+  and automatic creation).
 
 .. note::
   For GCP, only authentication with ``GOOGLE_APPLICATION_CREDENTIALS`` env is supported.
@@ -94,3 +103,4 @@ the target bucket is not found. Any other conditions will result in a failure.
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.

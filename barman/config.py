@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -19,6 +19,9 @@
 """
 This module is responsible for all the things related to
 Barman configuration, such as parsing configuration file.
+
+:data COMPRESSIONS: A list of supported compression algorithms for WAL files.
+:data COMPRESSION_LEVELS: A list of supported compression levels for WAL files.
 """
 
 import collections
@@ -34,6 +37,7 @@ from glob import iglob
 from typing import List
 
 from barman import output, utils
+from barman.compression import compression_registry
 
 try:
     from ConfigParser import ConfigParser, NoOptionError
@@ -76,6 +80,20 @@ CREATE_SLOT_VALUES = ["manual", "auto"]
 
 # Config values relating to pg_basebackup compression
 BASEBACKUP_COMPRESSIONS = ["gzip", "lz4", "zstd", "none"]
+
+# WAL compression options
+COMPRESSIONS = compression_registry.keys()
+
+# WAL compression level options
+COMPRESSION_LEVELS = ["low", "medium", "high"]
+
+# Encryption options
+ENCRYPTION_VALUES = ["none", "gpg"]
+
+# Staging location options. Indicates whether staging_path is a local or remote path
+STAGING_LOCATIONS = ["local", "remote"]
+
+COMBINE_MODES = ["copy", "link", "clone", "copy-file-range"]
 
 
 class CsvOption(set):
@@ -179,9 +197,10 @@ class RecoveryOptions(CsvOption):
 
     # constants containing labels for allowed values
     GET_WAL = "get-wal"
+    DELTA_RESTORE = "delta-restore"
 
     # list holding all the allowed values for the RecoveryOptions class
-    value_list = [GET_WAL]
+    value_list = [GET_WAL, DELTA_RESTORE]
 
 
 def parse_boolean(value):
@@ -195,7 +214,10 @@ def parse_boolean(value):
         return True
     if _FALSE_RE.match(value):
         return False
-    raise ValueError("Invalid boolean representation (use 'true' or 'false')")
+    raise ValueError(
+        "Invalid boolean representation (must be one in: "
+        "true|t|yes|1|on | false|f|no|0|off)"
+    )
 
 
 def parse_time_interval(value):
@@ -341,6 +363,27 @@ def parse_backup_compression_location(value):
     raise ValueError("Invalid value (must be either `client` or `server`)")
 
 
+def parse_encryption(value):
+    """
+    Parse a string to valid encryption value.
+
+    Valid values are defined in :data:`ENCRYPTION_VALUES`.
+
+    :param str value: string value to be parsed
+    :raises ValueError: if the *value* is invalid
+    """
+    if value is not None:
+        value = value.lower()
+        if value == "none":
+            return None
+        if value not in ENCRYPTION_VALUES:
+            raise ValueError(
+                "Invalid encryption value '%s'. Allowed values are: %s."
+                % (value, ", ".join(ENCRYPTION_VALUES))
+            )
+    return value
+
+
 def parse_backup_method(value):
     """
     Parse a string to a valid backup_method value.
@@ -359,10 +402,80 @@ def parse_backup_method(value):
     )
 
 
+def parse_compression(value):
+    """
+    Parse a string to a valid compression option.
+
+    Valid values are the compression algorithms supported by Barman, as defined in
+    :data:`barman.compression.compression_registry`.
+
+    :param str value: compression value
+    :raises ValueError: if the value is invalid
+    """
+    if value:
+        value = value.lower()
+        if value not in COMPRESSIONS:
+            raise ValueError(
+                "Invalid value: '%s' (must be one in: %s)"
+                % (value, ", ".join(COMPRESSIONS))
+            )
+    return value
+
+
+def parse_compression_level(value):
+    """
+    Parse a string to a valid compression level option.
+
+    Valid values are ``low``, ``medium``, ``high`` and any integer number.
+
+    :param str value: compression_level value
+    :raises ValueError: if the value is invalid
+    """
+    if value:
+        value = value.lower()
+        # Handle negative compression levels
+        # Among the supported, only zstd allows negatives for now
+        if value.lstrip("-").isdigit():
+            value = int(value)
+        elif value not in COMPRESSION_LEVELS:
+            raise ValueError(
+                "Invalid value: '%s' (must be one in [%s] or an acceptable integer)"
+                % (value, ", ".join(COMPRESSION_LEVELS))
+            )
+    return value
+
+
 def parse_staging_path(value):
+    """
+    Parse a valid ``staging_path`` value.
+
+    It must be an absolute path.
+
+    :param str|None value: value to be parsed
+    :raises:
+        :exc:`ValueError`: if the value is invalid
+    """
     if value is None or os.path.isabs(value):
         return value
     raise ValueError("Invalid value : '%s' (must be an absolute path)" % value)
+
+
+def parse_staging_location(value):
+    """
+    Parse a valid ``staging_location`` value.
+
+    It must one of the options in :data:`STAGING_LOCATIONS`.
+
+    :param str|None value: value to be parsed
+    :raises:
+        :exc:`ValueError`: if the value is invalid
+    """
+    if value is not None and value not in STAGING_LOCATIONS:
+        raise ValueError(
+            "Invalid value: %s (options are: %s)"
+            % (value, ", ".join(STAGING_LOCATIONS))
+        )
+    return value
 
 
 def parse_slot_name(value):
@@ -421,12 +534,28 @@ def parse_create_slot(value):
     )
 
 
+def parse_combine_mode(value):
+    """
+    Parse a string to a valid ``combine_mode`` value.
+
+    Valid values are defined in :data:`COMBINE_MODES`.
+    """
+    if value is None:
+        return None
+    value = value.lower()
+    if value not in COMBINE_MODES:
+        raise ValueError(
+            "Invalid value: %s (options are: %s)" % (value, ", ".join(COMBINE_MODES))
+        )
+    return value
+
+
 class BaseConfig(object):
     """
     Contains basic methods for handling configuration of Servers and Models.
 
     You are expected to inherit from this class and define at least the
-    :cvar:`PARSERS` dictionary with a mapping of parsers for each suported
+    :attr:`PARSERS` dictionary with a mapping of parsers for each suported
     configuration option.
     """
 
@@ -513,12 +642,16 @@ class ServerConfig(BaseConfig):
         "check_timeout",
         "cluster",
         "compression",
+        "compression_level",
         "conninfo",
         "custom_compression_filter",
         "custom_decompression_filter",
         "custom_compression_magic",
         "description",
         "disabled",
+        "encryption",
+        "encryption_key_id",
+        "encryption_passphrase_command",
         "errors_directory",
         "forward_config_path",
         "gcp_project",
@@ -529,7 +662,8 @@ class ServerConfig(BaseConfig):
         "last_backup_maximum_age",
         "last_backup_minimum_size",
         "last_wal_maximum_age",
-        "local_staging_path",
+        "combine_mode",
+        "local_staging_path",  # Deprecated, replaced by staging_path and staging_location
         "max_incoming_wals_queue",
         "minimum_redundancy",
         "network_compression",
@@ -561,7 +695,7 @@ class ServerConfig(BaseConfig):
         "primary_conninfo",
         "primary_ssh_command",
         "recovery_options",
-        "recovery_staging_path",
+        "recovery_staging_path",  # Deprecated, replaced by staging_path and staging_location
         "create_slot",
         "retention_policy",
         "retention_policy_mode",
@@ -573,6 +707,8 @@ class ServerConfig(BaseConfig):
         "snapshot_provider",
         "snapshot_zone",  # Deprecated, replaced by gcp_zone
         "ssh_command",
+        "staging_path",
+        "staging_location",
         "streaming_archiver",
         "streaming_archiver_batch_size",
         "streaming_archiver_name",
@@ -584,6 +720,8 @@ class ServerConfig(BaseConfig):
         "wal_retention_policy",
         "wal_streaming_conninfo",
         "wals_directory",
+        "worm_mode",
+        "xlogdb_directory",
     ]
 
     BARMAN_KEYS = [
@@ -612,11 +750,15 @@ class ServerConfig(BaseConfig):
         "basebackup_retry_times",
         "check_timeout",
         "compression",
+        "compression_level",
         "configuration_files_directory",
         "create_slot",
         "custom_compression_filter",
         "custom_decompression_filter",
         "custom_compression_magic",
+        "encryption",
+        "encryption_key_id",
+        "encryption_passphrase_command",
         "forward_config_path",
         "gcp_project",
         "immediate_checkpoint",
@@ -624,6 +766,7 @@ class ServerConfig(BaseConfig):
         "last_backup_maximum_age",
         "last_backup_minimum_size",
         "last_wal_maximum_age",
+        "combine_mode",
         "local_staging_path",
         "max_incoming_wals_queue",
         "minimum_redundancy",
@@ -661,12 +804,16 @@ class ServerConfig(BaseConfig):
         "slot_name",
         "snapshot_gcp_project",  # Deprecated, replaced by gcp_project
         "snapshot_provider",
+        "staging_path",
+        "staging_location",
         "streaming_archiver",
         "streaming_archiver_batch_size",
         "streaming_archiver_name",
         "streaming_backup_name",
         "tablespace_bandwidth_limit",
         "wal_retention_policy",
+        "worm_mode",
+        "xlogdb_directory",
     ]
 
     DEFAULTS = {
@@ -683,12 +830,15 @@ class ServerConfig(BaseConfig):
         "basebackups_directory": "%(backup_directory)s/base",
         "check_timeout": "30",
         "cluster": "%(name)s",
+        "compression_level": "medium",
         "disabled": "false",
+        "encryption": "none",
         "errors_directory": "%(backup_directory)s/errors",
         "forward_config_path": "false",
         "immediate_checkpoint": "false",
         "incoming_wals_directory": "%(backup_directory)s/incoming",
         "keepalive_interval": "60",
+        "combine_mode": "copy",
         "minimum_redundancy": "0",
         "network_compression": "false",
         "parallel_jobs": "1",
@@ -698,6 +848,13 @@ class ServerConfig(BaseConfig):
         "recovery_options": "",
         "create_slot": "manual",
         "retention_policy_mode": "auto",
+        "staging_location": "local",
+        # TODO: uncomment `staging_path` after removing deprecated options
+        # `recovery_staging_path` and `local_staging_path`. We cannot make this change
+        # while we still support these options because of the override logic implemented
+        # in `MainRecoveryExecutor._handle_deprecated_staging_options`` and
+        # cli.restore().
+        # "staging_path": "/tmp",
         "streaming_archiver": "off",
         "streaming_archiver_batch_size": "0",
         "streaming_archiver_name": "barman_receive_wal",
@@ -706,6 +863,8 @@ class ServerConfig(BaseConfig):
         "streaming_wals_directory": "%(backup_directory)s/streaming",
         "wal_retention_policy": "main",
         "wals_directory": "%(backup_directory)s/wals",
+        "worm_mode": "off",
+        "xlogdb_directory": "%(wals_directory)s",
     }
 
     FIXED = [
@@ -730,13 +889,17 @@ class ServerConfig(BaseConfig):
         "basebackup_retry_sleep": int,
         "basebackup_retry_times": int,
         "check_timeout": int,
+        "compression": parse_compression,
+        "compression_level": parse_compression_level,
         "disabled": parse_boolean,
+        "encryption": parse_encryption,
         "forward_config_path": parse_boolean,
         "keepalive_interval": int,
         "immediate_checkpoint": parse_boolean,
         "last_backup_maximum_age": parse_time_interval,
         "last_backup_minimum_size": parse_si_suffix,
         "last_wal_maximum_age": parse_time_interval,
+        "combine_mode": parse_combine_mode,
         "local_staging_path": parse_staging_path,
         "max_incoming_wals_queue": int,
         "network_compression": parse_boolean,
@@ -749,9 +912,12 @@ class ServerConfig(BaseConfig):
         "create_slot": parse_create_slot,
         "reuse_backup": parse_reuse_backup,
         "snapshot_disks": parse_snapshot_disks,
+        "staging_path": parse_staging_path,
+        "staging_location": parse_staging_location,
         "streaming_archiver": parse_boolean,
         "streaming_archiver_batch_size": int,
         "slot_name": parse_slot_name,
+        "worm_mode": parse_boolean,
     }
 
     def __init__(self, config, name):
@@ -880,16 +1046,15 @@ class ServerConfig(BaseConfig):
               * ``source``: the file which provides the effective value, if
                 the option has been configured by the user, otherwise ``None``.
         """
-        json_dict = dict(vars(self))
-
         # remove references that should not go inside the
-        # `servers -> SERVER -> config` key in the barman diagnose output
-        # ideally we should change this later so we only consider configuration
-        # options, as things like `msg_list` are going to the `config` key,
-        # i.e. we might be interested in considering only `ServerConfig.KEYS`
-        # here instead of `vars(self)`
-        for key in ["config", "_active_model_file", "active_model"]:
-            del json_dict[key]
+        # `servers -> SERVER -> config` key in the barman diagnose output.
+        # Consider only configuration options, from `ServerConfig.KEYS`. Things like
+        # `msg_list` is going to be a sibling of `config` key.
+        json_dict = {
+            key: getattr(self, key)
+            for key in self.KEYS
+            if key not in {"config", "_active_model_file", "active_model"}
+        }
 
         # options that are override by the model
         override_options = set()
@@ -946,7 +1111,7 @@ class ServerConfig(BaseConfig):
         self.msg_list.extend(msg_list)
         self.disabled = True
 
-    def get_wal_conninfo(self):
+    def get_wal_conninfo(self, check_strategy=False):
         """
         Return WAL-specific conninfo strings for this server.
 
@@ -959,17 +1124,31 @@ class ServerConfig(BaseConfig):
         :return: Tuple consisting of the ``wal_streaming_conninfo`` and
             ``wal_conninfo``.
         """
-        # If `wal_streaming_conninfo` is not set, fall back to `streaming_conninfo`
-        wal_streaming_conninfo = self.wal_streaming_conninfo or self.streaming_conninfo
+        overrides = {}
+        if self.wal_streaming_conninfo is not None:
+            overrides["streaming_conninfo"] = self.wal_streaming_conninfo
+        # If `wal_streaming_conninfo` is not set, fall back to `streaming_conninfo`.
+        wal_streaming_conninfo = overrides.get(
+            "streaming_conninfo", self.streaming_conninfo
+        )
 
         # If `wal_conninfo` is not set, fall back to `wal_streaming_conninfo`. If
         # `wal_streaming_conninfo` is not set, fall back to `conninfo`.
         if self.wal_conninfo is not None:
-            wal_conninfo = self.wal_conninfo
+            overrides["conninfo"] = self.wal_conninfo
         elif self.wal_streaming_conninfo is not None:
-            wal_conninfo = self.wal_streaming_conninfo
-        else:
-            wal_conninfo = self.conninfo
+            overrides["conninfo"] = self.wal_streaming_conninfo
+        wal_conninfo = overrides.get("conninfo", self.conninfo)
+
+        if overrides:
+            message_parts = [
+                f"'{key}' overridden with '{value}'" for key, value in overrides.items()
+            ]
+            # Only display message if its not a check command!
+            if not check_strategy:
+                output.info(
+                    "Configuration overrides applied: %s", " and ".join(message_parts)
+                )
         return wal_streaming_conninfo, wal_conninfo
 
 
@@ -995,6 +1174,11 @@ class ModelConfig(BaseConfig):
         "incoming_wals_directory",
         "streaming_wals_directory",
         "wals_directory",
+        # Although xlogdb_directory could be set with the same value for two
+        # servers (the xlog.db is now called SERVER-xlog.db, avoiding conflicts)
+        # we exclude it from models to follow the same pattern defined for all
+        # the path settings.
+        "xlogdb_directory",
         # Hook related options
         "post_archive_retry_script",
         "post_archive_script",
@@ -1316,6 +1500,15 @@ class Config(object):
         """
         json_dict = dict(self._global_config)
 
+        # Add global configuration to output of diagnose that are not present in
+        # `_global_config`.
+        json_dict.update(
+            dict(
+                barman_lock_directory=self.barman_lock_directory,
+                lock_directory_cleanup=self.lock_directory_cleanup,
+                config_changes_queue=self.config_changes_queue,
+            )
+        )
         if with_source:
             for option, value in json_dict.items():
                 json_dict[option] = {
@@ -1341,7 +1534,7 @@ class Config(object):
             return
 
         if not os.path.isdir(os.path.expanduser(config_files_directory)):
-            _logger.warn(
+            _logger.warning(
                 'Ignoring the "configuration_files_directory" option as "%s" '
                 "is not a directory",
                 config_files_directory,
@@ -1369,10 +1562,12 @@ class Config(object):
                     raise SystemExit("FATAL: %s" % msg)
             else:
                 # Add an warning message that a file has been discarded
-                _logger.warn("Discarding configuration file: %s (not a file)", filename)
+                _logger.warning(
+                    "Discarding configuration file: %s (not a file)", filename
+                )
         else:
             # Add an warning message that a file has been discarded
-            _logger.warn("Discarding configuration file: %s (not found)", filename)
+            _logger.warning("Discarding configuration file: %s (not found)", filename)
 
     def _is_model(self, name):
         """
@@ -1795,10 +1990,13 @@ class ConfigChange(BaseChange):
 
 
 class ConfigChangeSet(BaseChange):
-    """Represents a set of :class:`ConfigChange` for a given configuration section.
+    """
+    Represents a set of :class:`ConfigChange` for a given configuration section.
 
     :ivar section str: name of the configuration section related with the changes.
-    :ivar changes_set List[:class:`ConfigChange`]: list of configuration changes to be applied to the section.
+
+    :ivar changes_set List[:class:`ConfigChange`]: list of configuration changes to be
+        applied to the section.
     """
 
     _fields = ["section", "changes_set"]
@@ -1957,104 +2155,143 @@ class ConfigChangesProcessor:
         # Get all the available configuration change files in order
         changes_list = []
         for section in changes:
-            original_section = deepcopy(section)
-            section_name = None
-            scope = section.pop("scope")
-
-            if scope not in ["server", "model"]:
-                output.warning(
-                    "%r has been ignored because 'scope' is "
-                    "invalid: '%s'. It should be either 'server' "
-                    "or 'model'.",
-                    original_section,
-                    scope,
-                )
-                continue
-            elif scope == "server":
-                try:
-                    section_name = section.pop("server_name")
-                except KeyError:
-                    output.warning(
-                        "%r has been ignored because 'server_name' is missing.",
-                        original_section,
-                    )
-                    continue
-            elif scope == "model":
-                try:
-                    section_name = section.pop("model_name")
-                except KeyError:
-                    output.warning(
-                        "%r has been ignored because 'model_name' is missing.",
-                        original_section,
-                    )
-                    continue
-
-            server_obj = self.config.get_server(section_name)
-            model_obj = self.config.get_model(section_name)
-
-            if scope == "server":
-                # the section already exists as a model
-                if model_obj is not None:
-                    output.warning(
-                        "%r has been ignored because '%s' is a model, not a server.",
-                        original_section,
-                        section_name,
-                    )
-                    continue
-            elif scope == "model":
-                # the section already exists as a server
-                if server_obj is not None:
-                    output.warning(
-                        "%r has been ignored because '%s' is a server, not a model.",
-                        original_section,
-                        section_name,
-                    )
-                    continue
-
-                # If the model does not exist yet in Barman
-                if model_obj is None:
-                    # 'model=on' is required for models, so force that if the
-                    # user forgot 'model' or set it to something invalid
-                    section["model"] = "on"
-
-                    if "cluster" not in section:
-                        output.warning(
-                            "%r has been ignored because it is a "
-                            "new model but 'cluster' is missing.",
-                            original_section,
-                        )
-                        continue
+            raw_section = deepcopy(section)
+            # Validate server and model configurations
+            ok, section_name, opts = self._validate_section(section)
+            if not ok:
+                output.error("Aborting config‐update: invalid section %r", raw_section)
+                output.close_and_exit()
 
             # Instantiate the ConfigChangeSet object
             chg_set = ConfigChangeSet(section=section_name)
-            for json_cng in section:
-                file_name = self.config._config.get_config_source(
-                    section_name, json_cng
+            for key, value in opts.items():
+                file_name = str(
+                    self.config._config.get_config_source(section_name, key)
                 )
                 # if the configuration change overrides a default value
                 # then the source file is ".barman.auto.conf"
                 if file_name == "default":
                     file_name = os.path.expanduser(
-                        "%s/.barman.auto.conf" % self.config.barman_home
+                        f"{self.config.barman_home}/.barman.auto.conf"
                     )
-                chg = None
                 # Instantiate the configuration change object
-                chg = ConfigChange(
-                    json_cng,
-                    section[json_cng],
-                    file_name,
-                )
+                chg = ConfigChange(key, value, file_name)
                 chg_set.changes_set.append(chg)
             changes_list.append(chg_set)
 
         # If there are no configuration change we've nothing to do here
-        if len(changes_list) == 0:
-            _logger.debug("No valid changes submitted")
+        if not changes_list:
+            _logger.debug("No valid changes submitted.")
             return
 
         # Extend the queue with the new changes
         with ConfigChangesQueue(self.config.config_changes_queue) as changes_queue:
             changes_queue.queue.extend(changes_list)
+
+    def _validate_section(self, section):
+        """
+        Validate a single section from the JSON payload of ``config-update``.
+
+        This method:
+
+        1. Removes and checks the ``scope`` field (``server`` or ``model``).
+        2. Removes and returns the matching ``server_name`` or ``model_name``.
+        3. Verifies you're not updating a model as a server (or vice versa).
+        4. Ensures new models declare ``cluster``.
+        5. Runs each remaining key/value through its parser (if any).
+
+        :param section: a dictionary representing the section to validate.
+
+        :return: a tuple of 3 items:
+
+            * ok: ``True`` if all checks passed.
+            * name: extracted section name, if ``ok`` is ``True``, otherwise ``None``.
+            * opts: the leftover option→value pairs to apply, if ``ok`` is ``True``,
+                otherwise ``None``.
+
+        :rtype: tuple[bool, str|None, dict|None]
+        """
+        original = deepcopy(section)
+
+        failure = (False, None, None)
+
+        # Scope validation
+        scope = section.pop("scope", None)
+        if scope not in ("server", "model"):
+            output.error(
+                "Invalid section %r: 'scope' is invalid: '%s'. It should be either 'server' or 'model'.",
+                original,
+                scope,
+            )
+            return failure
+
+        # Extract name
+        name_key = "server_name" if scope == "server" else "model_name"
+        if name_key not in section:
+            output.error("Invalid section %r: '%s' is missing.", original, name_key)
+            return failure
+
+        name = section.pop(name_key)
+        server_obj = self.config.get_server(name)
+        model_obj = self.config.get_model(name)
+
+        if scope == "server" and model_obj is not None:
+            # the section already exists as a model
+            output.error(
+                "Invalid section %r: '%s' is a model, not a server.",
+                original,
+                name,
+            )
+            return failure
+
+        if scope == "model":
+            # the section already exists as a server
+            if server_obj is not None:
+                output.error(
+                    "Invalid section %r: '%s' is a server, not a model.",
+                    original,
+                    name,
+                )
+                return failure
+            # If the model does not exist yet in Barman
+            if model_obj is None:
+                # 'model=on' is required for models, so force that if the
+                # user forgot 'model' or set it to something invalid
+                section.setdefault("model", "on")
+                if "cluster" not in section:
+                    output.error(
+                        "Invalid section %r: new model but 'cluster' is missing.",
+                        original,
+                    )
+                    return failure
+
+        # Prepare parsers and allowed key‐set
+        valid_keys = ServerConfig.KEYS if scope == "server" else ModelConfig.KEYS
+        parsers = ServerConfig.PARSERS if scope == "server" else ModelConfig.PARSERS
+
+        opts = section.copy()
+        for key, val in opts.items():
+            if key not in valid_keys:
+                output.error("Invalid option '%s' for %s '%s'", key, scope, name)
+                return failure
+            # if there's no special parser, accept the raw value
+            parser = parsers.get(key)
+            if parser is None:
+                continue
+            # value parsing
+            try:
+                if inspect.isclass(parser) and issubclass(parser, CsvOption):
+                    parser(val, key, f"{scope} '{name}'")
+                else:
+                    parser(val)
+            except Exception as e:
+                output.error(
+                    "Validation failed for %s '%s': key '%s' -> %s", scope, name, key, e
+                )
+                return failure
+
+        opts = section.copy()
+        return True, name, opts
 
     def process_conf_changes_queue(self):
         """

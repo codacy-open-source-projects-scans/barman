@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -35,7 +35,12 @@ import barman.utils
 from barman import output
 from barman.annotations import KeepManager
 from barman.backup_manifest import BackupManifest
-from barman.config import ConfigChangesProcessor, RecoveryOptions, parse_staging_path
+from barman.config import (
+    ConfigChangesProcessor,
+    RecoveryOptions,
+    parse_combine_mode,
+    parse_staging_path,
+)
 from barman.exceptions import (
     BadXlogSegmentName,
     LockFileBusy,
@@ -45,6 +50,7 @@ from barman.exceptions import (
 )
 from barman.infofile import BackupInfo, WalFileInfo
 from barman.lockfile import ConfigUpdateLock
+from barman.process import ProcessManager
 from barman.server import Server
 from barman.storage.local_file_manager import LocalFileManager
 from barman.utils import (
@@ -61,6 +67,7 @@ from barman.utils import (
     get_backup_id_using_shortcut,
     get_log_levels,
     parse_log_level,
+    parse_target_tli,
 )
 from barman.xlog import check_archive_usable
 
@@ -185,17 +192,26 @@ def argument(*name_or_flags, **kwargs):
 
 
 def command(args=None, parent=subparsers, cmd_aliases=None):
-    """Decorator to define a new subcommand in a sanity-preserving way.
+    """
+    Decorator to define a new subcommand in a sanity-preserving way.
     The function will be stored in the ``func`` variable when the parser
-    parses arguments so that it can be called directly like so::
+    parses arguments so that it can be called directly like so:
+
+    Usage example:
+    .. code-block:: python
+
         args = cli.parse_args()
         args.func(args)
-    Usage example::
+
+    .. code-block:: python
+
         @command([argument("-d", help="Enable debug mode", action="store_true")])
         def command(args):
             print(args)
-    Then on the command line::
-        $ python cli.py command -d
+
+    Then on the command line:
+    .. code:: bash
+    $ python cli.py command -d
     """
 
     if args is None:
@@ -275,6 +291,36 @@ def list_servers(args):
         if server.passive_node:
             description += " (Passive)"
         output.result("list_server", name, description)
+    output.close_and_exit()
+
+
+@command(
+    [argument("server_name", help="specifies the server name")],
+    cmd_aliases=["list-process"],
+)
+def list_processes(args=None):
+    """
+    List all the active subprocesses started by the specified server.
+    """
+    server = get_server(args)
+    proc_manager = ProcessManager(server.config)
+    processes = proc_manager.list()
+    output.result("list_processes", processes, server.config.name)
+    output.close_and_exit()
+
+
+@command(
+    [
+        argument("server_name", help="specifies the server name"),
+        argument("task", help="the task name to terminate (e.g. backup, receive-wal)"),
+    ],
+)
+def terminate_process(args):
+    """
+    Terminate a Barman server subprocess specified by task name.
+    """
+    server = get_server(args)
+    server.kill(args.task)
     output.close_and_exit()
 
 
@@ -505,6 +551,14 @@ def backup_completer(prefix, parsed_args, **kwargs):
             action="store_false",
             default=SUPPRESS,
         ),
+        argument(
+            "--check-timeout",
+            help="Specifies the time limit, in seconds, for the check operation. "
+            "Set to zero to disable the timeout.",
+            metavar="CHECK_TIMEOUT",
+            default=None,
+            type=check_non_negative,
+        ),
     ]
 )
 def backup(args):
@@ -554,6 +608,8 @@ def backup(args):
             )
         if hasattr(args, "bwlimit"):
             server.config.bandwidth_limit = args.bwlimit
+        if args.check_timeout is not None:
+            server.config.check_timeout = args.check_timeout
         with closing(server):
             server.backup(
                 wait=args.wait,
@@ -756,6 +812,12 @@ def rebuild_xlogdb(args):
             help="the directory where the new server is created",
         ),
         argument(
+            "--staging-wal-directory",
+            help="a staging directory in the target host for WAL files when performing "
+            "PITR. If unspecified, it uses a `barman_wal` directory inside the "
+            "destination directory.",
+        ),
+        argument(
             "--bwlimit",
             help="maximum transfer rate in kilobytes per second. "
             "A value of 0 means no limit. Overrides 'bandwidth_limit' "
@@ -867,12 +929,55 @@ def rebuild_xlogdb(args):
             ),
         ),
         argument(
+            "--staging-path",
+            help=(
+                "A path where intermediate files are staged during restore. When "
+                "restoring a compressed backup, it serves as a temporary location for "
+                "decompression before copying to the final destination. When restoring "
+                "an incremental backup, it is where backups are combined before "
+                "copying to the final destination. This location must have enough "
+                "space to store the decompressed/combined backup."
+            ),
+        ),
+        argument(
+            "--staging-location",
+            choices=["local", "remote"],
+            help=(
+                "Specifies whether `--staging-path` is a local or remote path. Valid"
+                "values are `local` and `remote`."
+            ),
+        ),
+        argument(
+            "--combine-mode",
+            help=(
+                "Specifies a copy mode for `pg_combinebackup` when combining "
+                "incremental backups during a restore."
+            ),
+            type=parse_combine_mode,
+            dest="combine_mode",
+            choices=["copy", "link", "clone", "copy-file-range"],
+        ),
+        argument(
             "--recovery-conf-filename",
             dest="recovery_conf_filename",
             help=(
                 "Name of the file to which recovery configuration options will be "
                 "added for PostgreSQL 12 and later (default: postgresql.auto.conf)."
             ),
+        ),
+        argument(
+            "--delta-restore",
+            dest="delta_restore",
+            help="Enable delta restore mode.",
+            action="store_true",
+            default=SUPPRESS,
+        ),
+        argument(
+            "--no-delta-restore",
+            help="Disable delta restore mode.",
+            dest="delta_restore",
+            action="store_false",
+            default=SUPPRESS,
         ),
         argument(
             "--snapshot-recovery-instance",
@@ -908,9 +1013,111 @@ def restore(args):
     """
     server = get_server(args)
 
-    # Retrieves the backup
-    backup_id = parse_backup_id(server, args)
-    if backup_id.status not in BackupInfo.STATUS_COPY_DONE:
+    # PostgreSQL supports multiple parameters to specify when the recovery
+    # process will end, and in that case the last entry in recovery
+    # configuration files will be used. See [1]
+    #
+    # Since the meaning of the target options is not dependent on the order
+    # of parameters, we decided to make the target options mutually exclusive.
+    #
+    # [1]: https://www.postgresql.org/docs/current/static/
+    #   recovery-target-settings.html
+
+    target_options = [
+        "target_time",
+        "target_xid",
+        "target_lsn",
+        "target_name",
+        "target_immediate",
+    ]
+
+    specified_target_options = [
+        option for option in target_options if getattr(args, option, None)
+    ]
+    if len(specified_target_options) > 1:
+        output.error("You cannot specify multiple targets for the recovery operation")
+        output.close_and_exit()
+
+    target_option = (
+        specified_target_options[0] if len(specified_target_options) == 1 else None
+    )
+    target_tli = None
+    backup_info = None
+    if args.backup_id != "auto":
+        backup_info = parse_backup_id(server, args)
+    else:
+        target = getattr(args, target_option) if target_option else None
+        # "Parse" the string value to integer for target_tli if passed as a string
+        # ("current", "latest")
+        target_tli = parse_target_tli(
+            obj=server.backup_manager, target_tli=args.target_tli
+        )
+        #  Error out on recovery targets that are not allowed.
+        if target_option in {"target_immediate", "target_xid", "target_name"}:
+            output.error(
+                "For PITR without a backup_id, the only possible recovery targets "
+                "are target_time and target_lsn. '%s' recovery target is not "
+                "allowed without a backup_id." % target_option
+            )
+            output.close_and_exit()
+        # Search for a candidate backup based on recovery targets if "backup_id" is None
+        elif target_option is None:
+            if target_tli is not None:
+                backup_id = server.get_last_backup_id_from_target_tli(target_tli)
+            else:
+                backup_id = server.get_last_backup_id()
+        elif target_option == "target_time":
+            backup_id = server.get_closest_backup_id_from_target_time(
+                target, target_tli
+            )
+        elif target_option == "target_lsn":
+            backup_id = server.get_closest_backup_id_from_target_lsn(target, target_tli)
+        # If no candidate backup_id is found, error out.
+        if backup_id is None:
+            output.error("Cannot find any candidate backup for recovery.")
+            output.close_and_exit()
+
+        backup_info = server.get_backup(backup_id)
+
+    # Parse and overrides the staging path if set
+    if args.staging_path is not None:
+        try:
+            staging_path = parse_staging_path(args.staging_path)
+        except ValueError as exc:
+            output.error("Cannot parse staging path: %s", str(exc))
+            output.close_and_exit()
+        server.config.staging_path = staging_path
+
+    # Parse and overrides the staging location if set
+    if args.staging_location is not None:
+        if args.staging_location == "remote" and not args.remote_ssh_command:
+            output.error(
+                "--staging-location as remote requires --remote-ssh-command to be set"
+            )
+            output.close_and_exit()
+        server.config.staging_location = args.staging_location
+
+    # TODO: remove once we remove the deprecated recovery_staging_path option
+    # Parse and overrides the recovery staging path if set
+    if args.recovery_staging_path is not None:
+        try:
+            recovery_staging_path = parse_staging_path(args.recovery_staging_path)
+        except ValueError as exc:
+            output.error("Cannot parse recovery staging path: %s", str(exc))
+            output.close_and_exit()
+        server.config.recovery_staging_path = recovery_staging_path
+
+    # TODO: remove once we remove the deprecated local_staging_path option
+    # Parse and overrides the local staging path if set
+    if args.local_staging_path is not None:
+        try:
+            local_staging_path = parse_staging_path(args.local_staging_path)
+        except ValueError as exc:
+            output.error("Cannot parse local staging path: %s", str(exc))
+            output.close_and_exit()
+        server.config.local_staging_path = local_staging_path
+
+    if backup_info.status not in BackupInfo.STATUS_COPY_DONE:
         output.error(
             "Cannot restore from backup '%s' of server '%s': "
             "backup status is not DONE",
@@ -919,58 +1126,84 @@ def restore(args):
         )
         output.close_and_exit()
 
-    # If the backup to be recovered is compressed then there are additional
-    # checks to be carried out
-    if backup_id.compression is not None:
-        # Set the recovery staging path from the cli if it is set
-        if args.recovery_staging_path is not None:
-            try:
-                recovery_staging_path = parse_staging_path(args.recovery_staging_path)
-            except ValueError as exc:
-                output.error("Cannot parse recovery staging path: %s", str(exc))
-                output.close_and_exit()
-            server.config.recovery_staging_path = recovery_staging_path
-        # If the backup is compressed but there is no recovery_staging_path
-        # then this is an error - the user *must* tell barman where recovery
-        # data can be staged.
-        if server.config.recovery_staging_path is None:
-            output.error(
-                "Cannot restore from backup '%s' of server '%s': "
-                "backup is compressed with %s compression but no recovery "
-                "staging path is provided. Either set recovery_staging_path "
-                "in the Barman config or use the --recovery-staging-path "
-                "argument.",
-                args.backup_id,
-                server.config.name,
-                backup_id.compression,
-            )
-            output.close_and_exit()
+    # TODO: rethink the logic below after we remove the deprecated
+    # recovery_staging_path and local_staging_path options
 
-    # If the backup to be recovered is incremental then there are additional
-    # checks to be carried out
-    if backup_id.is_incremental:
-        # Set the local staging path from the cli if it is set
-        if args.local_staging_path is not None:
-            try:
-                local_staging_path = parse_staging_path(args.local_staging_path)
-            except ValueError as exc:
-                output.error("Cannot parse local staging path: %s", str(exc))
+    # If the user does not have a staging path set, check if maybe they are using the
+    # old staging options (recovery_staging_path or local_staging_path), which are
+    # deprecated, but still supported. The whole block below handles that
+    if (
+        any(
+            [
+                backup_info.is_incremental,
+                backup_info.compression,
+                backup_info.encryption,
+            ]
+        )
+        and not server.config.staging_path
+    ):
+        if (
+            not server.config.recovery_staging_path
+            and not server.config.local_staging_path
+        ):
+            # As we can't put the default value in the config module until the
+            # deprecated options get dropped, we set the default here if they are not
+            # being used.
+            server.config.staging_path = "/tmp"
+        else:
+            # If the backup is encrypted and staging_path is not set, the equivalent old
+            # option local_staging_path should be
+            if backup_info.encryption and not server.config.local_staging_path:
+                output.error(
+                    "Cannot restore from backup '%s' of server '%s': "
+                    "backup is encrypted with '%s' and it will be decrypted in the "
+                    "barman host but no staging path and location was provided. "
+                    "Please set staging_path and staging_location in the server "
+                    "configuration file, or use their equivalent CLI options "
+                    "--staging-path and --staging-location",
+                    args.backup_id,
+                    server.config.name,
+                    backup_info.encryption,
+                )
                 output.close_and_exit()
-            server.config.local_staging_path = local_staging_path
-        # If the backup is incremental but there is no local_staging_path
-        # then this is an error - the user *must* tell barman where recovery
-        # data can be staged.
-        if server.config.local_staging_path is None:
-            output.error(
-                "Cannot restore from backup '%s' of server '%s': "
-                "backup will be combined with pg_combinebackup in the "
-                "barman host but no local staging path is provided. "
-                "Either set local_staging_path in the Barman config "
-                "or use the --local-staging-path argument.",
-                args.backup_id,
-                server.config.name,
+            # If the backup is compressed and staging_path is not set, the equivalent old
+            # option recovery_staging_path should be
+            if backup_info.compression and not server.config.recovery_staging_path:
+                output.error(
+                    "Cannot restore from backup '%s' of server '%s': "
+                    "backup is compressed with %s compression and it will be "
+                    "decompressed in a staging area but no staging "
+                    "path was provided. Please set staging_path and staging_location "
+                    "in the server configuration file, or use their equivalent CLI "
+                    "options --staging-path and --staging-location",
+                    args.backup_id,
+                    server.config.name,
+                    backup_info.compression,
+                )
+                output.close_and_exit()
+            # If the backup is incremental and staging_path is not set, the equivalent old
+            # option local_staging_path should be
+            if backup_info.is_incremental and not server.config.local_staging_path:
+                output.error(
+                    "Cannot restore from backup '%s' of server '%s': "
+                    "backup has to be combined with pg_combinebackup in a "
+                    "staging area but no staging path and location was provided. "
+                    "Please set staging_path and staging_location in the server "
+                    "configuration file, or use their equivalent CLI options "
+                    "--staging-path and --staging-location",
+                    args.backup_id,
+                    server.config.name,
+                )
+                output.close_and_exit()
+            # If we got here then the user is using one the old staging options
+            # which are deprecated, but supported, so issue a warning about it
+            output.warning(
+                "recovery_staging_path and local_staging_path, and their equivalent CLI "
+                "options --recovery-staging-path and --local-staging-path, are "
+                "deprecated and will be removed in a future release. "
+                "Please use staging_path and staging_location, and their equivalent CLI "
+                "options --staging-path and --staging-location, instead.",
             )
-            output.close_and_exit()
 
     # decode the tablespace relocation rules
     tablespaces = {}
@@ -989,9 +1222,9 @@ def restore(args):
 
     # validate the rules against the tablespace list
     valid_tablespaces = []
-    if backup_id.tablespaces:
+    if backup_info.tablespaces:
         valid_tablespaces = [
-            tablespace_data.name for tablespace_data in backup_id.tablespaces
+            tablespace_data.name for tablespace_data in backup_info.tablespaces
         ]
     for item in tablespaces:
         if item not in valid_tablespaces:
@@ -1030,30 +1263,8 @@ def restore(args):
         server.config.parallel_jobs_start_batch_period = args.jobs_start_batch_period
     if hasattr(args, "bwlimit"):
         server.config.bandwidth_limit = args.bwlimit
-
-    # PostgreSQL supports multiple parameters to specify when the recovery
-    # process will end, and in that case the last entry in recovery
-    # configuration files will be used. See [1]
-    #
-    # Since the meaning of the target options is not dependent on the order
-    # of parameters, we decided to make the target options mutually exclusive.
-    #
-    # [1]: https://www.postgresql.org/docs/current/static/
-    #   recovery-target-settings.html
-
-    target_options = [
-        "target_time",
-        "target_xid",
-        "target_lsn",
-        "target_name",
-        "target_immediate",
-    ]
-    specified_target_options = len(
-        [option for option in target_options if getattr(args, option)]
-    )
-    if specified_target_options > 1:
-        output.error("You cannot specify multiple targets for the recovery operation")
-        output.close_and_exit()
+    if args.combine_mode is not None:
+        server.config.combine_mode = args.combine_mode
 
     if hasattr(args, "network_compression"):
         if args.network_compression and args.remote_ssh_command is None:
@@ -1066,7 +1277,37 @@ def restore(args):
             output.close_and_exit()
         server.config.network_compression = args.network_compression
 
-    if backup_id.snapshots_info is not None:
+    if hasattr(args, "delta_restore"):
+        if args.delta_restore:
+            server.config.recovery_options.add(RecoveryOptions.DELTA_RESTORE)
+        elif RecoveryOptions.DELTA_RESTORE in server.config.recovery_options:
+            server.config.recovery_options.remove(RecoveryOptions.DELTA_RESTORE)
+
+    delta_restore = RecoveryOptions.DELTA_RESTORE in server.config.recovery_options
+    if delta_restore:
+        # Local restore does not support delta for non-plain backups.
+        if not args.remote_ssh_command:
+            if any(
+                [
+                    backup_info.is_incremental,
+                    backup_info.compression,
+                    backup_info.encryption,
+                ]
+            ):
+                output.error(
+                    "Cannot restore a backup locally with delta mode when the backup is "
+                    "not plain."
+                )
+                output.close_and_exit()
+        # Remote restore does not support delta when staging_location is remote.
+        elif server.config.staging_location == "remote":
+            output.error(
+                "Cannot restore a backup remotely with delta mode when "
+                "'staging_location=remote'."
+            )
+            output.close_and_exit()
+
+    if backup_info.snapshots_info is not None:
         missing_args = []
         if not args.snapshot_recovery_instance:
             missing_args.append("--snapshot-recovery-instance")
@@ -1074,7 +1315,7 @@ def restore(args):
             output.error(
                 "Backup %s is a snapshot backup and the following required arguments "
                 "have not been provided: %s",
-                backup_id.backup_id,
+                backup_info.backup_id,
                 ", ".join(missing_args),
             )
             output.close_and_exit()
@@ -1082,7 +1323,7 @@ def restore(args):
             output.error(
                 "Backup %s is a snapshot backup therefore tablespace relocation rules "
                 "cannot be used.",
-                backup_id.backup_id,
+                backup_info.backup_id,
             )
             output.close_and_exit()
         # Set the snapshot keyword arguments to be passed to the recovery executor
@@ -1109,7 +1350,7 @@ def restore(args):
             output.error(
                 "Backup %s is not a snapshot backup but the following snapshot "
                 "arguments have been used: %s",
-                backup_id.backup_id,
+                backup_info.backup_id,
                 ", ".join(unexpected_args),
             )
             output.close_and_exit()
@@ -1120,8 +1361,9 @@ def restore(args):
     with closing(server):
         try:
             server.recover(
-                backup_id,
+                backup_info,
                 args.destination_directory,
+                wal_dest=args.staging_wal_directory,
                 tablespaces=tablespaces,
                 target_tli=args.target_tli,
                 target_time=args.target_time,
@@ -1246,6 +1488,14 @@ def switch_wal(args):
         argument(
             "--nagios", help="Nagios plugin compatible output", action="store_true"
         ),
+        argument(
+            "--check-timeout",
+            help="Specifies the time limit, in seconds, for the check operation. "
+            "Set to zero to disable the timeout.",
+            metavar="TIMEOUT",
+            default=None,
+            type=check_non_negative,
+        ),
     ]
 )
 def check(args):
@@ -1261,6 +1511,8 @@ def check(args):
     for name in sorted(servers):
         server = servers[name]
 
+        if args.check_timeout is not None:
+            server.config.check_timeout = args.check_timeout
         # Validate the returned server
         if not manage_server_command(
             server,
@@ -1443,6 +1695,12 @@ def show_backup(args):
                        backup and the following one (if any) or the end of the log) and
                        full (same as data + wal). Defaults to %(default)s""",
         ),
+        argument(
+            "--list-empty-directories",
+            help="Also includes empty directories in the list.",
+            action="store_true",
+            default=False,
+        ),
     ]
 )
 def list_files(args):
@@ -1454,7 +1712,9 @@ def list_files(args):
     # Retrieves the backup
     backup_info = parse_backup_id(server, args)
     try:
-        for line in backup_info.get_list_of_files(args.target):
+        for line in backup_info.get_directory_entries(
+            args.target, empty_dirs=args.list_empty_directories
+        ):
             output.info(line, log=False)
     except BadXlogSegmentName as e:
         output.error(
@@ -1684,6 +1944,11 @@ def archive_wal(args):
             action="store_true",
         ),
         argument(
+            "--if-not-exists",
+            help="Do not error out when --create-slot is specified and a slot with the specified name already exists.",
+            action="store_true",
+        ),
+        argument(
             "--drop-slot",
             help="drop the replication slot, if it exists",
             action="store_true",
@@ -1714,7 +1979,7 @@ def receive_wal(args):
         server.kill("receive-wal")
     elif args.create_slot:
         with closing(server):
-            server.create_physical_repslot()
+            server.create_physical_repslot(ignore_duplicate=args.if_not_exists)
     elif args.drop_slot:
         with closing(server):
             server.drop_repslot()
@@ -1921,7 +2186,7 @@ def check_wal_archive(args):
                 server.config.name,
                 force_str(err),
             )
-            logging.error(msg)
+            _logger.error(msg)
             output.error(msg)
             output.close_and_exit()
 

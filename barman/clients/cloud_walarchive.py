@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -24,7 +24,6 @@ from contextlib import closing
 from barman.clients.cloud_cli import (
     CLIErrorExit,
     GeneralErrorExit,
-    NetworkErrorExit,
     UrlArgumentType,
     add_tag_argument,
     create_argument_parser,
@@ -32,9 +31,12 @@ from barman.clients.cloud_cli import (
 from barman.clients.cloud_compression import compress
 from barman.cloud import configure_logging
 from barman.cloud_providers import get_cloud_interface
+from barman.config import parse_compression_level
 from barman.exceptions import BarmanException
-from barman.utils import check_positive, check_size, force_str
+from barman.utils import check_positive, check_size, check_tag, force_str
 from barman.xlog import hash_dir, is_any_xlog_file, is_history_file
+
+_logger = logging.getLogger(__name__)
 
 
 def __is_hook_script():
@@ -75,27 +77,23 @@ def main(args=None):
 
     # Validate the WAL file name before uploading it
     if not is_any_xlog_file(config.wal_path):
-        logging.error("%s is an invalid name for a WAL file" % config.wal_path)
+        _logger.error("%s is an invalid name for a WAL file" % config.wal_path)
         raise CLIErrorExit()
 
     try:
         cloud_interface = get_cloud_interface(config)
 
         with closing(cloud_interface):
+            if config.test:
+                cloud_interface.verify_cloud_connectivity_and_bucket_existence()
+                raise SystemExit(0)
+
             uploader = CloudWalUploader(
                 cloud_interface=cloud_interface,
                 server_name=config.server_name,
                 compression=config.compression,
+                compression_level=config.compression_level,
             )
-
-            if not cloud_interface.test_connectivity():
-                raise NetworkErrorExit()
-            # If test is requested, just exit after connectivity test
-            elif config.test:
-                raise SystemExit(0)
-
-            # TODO: Should the setup be optional?
-            cloud_interface.setup_bucket()
 
             upload_kwargs = {}
             if is_history_file(config.wal_path):
@@ -104,8 +102,8 @@ def main(args=None):
             uploader.upload_wal(config.wal_path, **upload_kwargs)
 
     except Exception as exc:
-        logging.error("Barman cloud WAL archiver exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud WAL archiver exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise GeneralErrorExit()
 
 
@@ -132,8 +130,7 @@ def parse_arguments(args=None):
     compression.add_argument(
         "-z",
         "--gzip",
-        help="gzip-compress the WAL while uploading to the cloud "
-        "(should not be used with python < 3.2)",
+        help="gzip-compress the WAL while uploading to the cloud",
         action="store_const",
         const="gzip",
         dest="compression",
@@ -141,16 +138,14 @@ def parse_arguments(args=None):
     compression.add_argument(
         "-j",
         "--bzip2",
-        help="bzip2-compress the WAL while uploading to the cloud "
-        "(should not be used with python < 3.3)",
+        help="bzip2-compress the WAL while uploading to the cloud",
         action="store_const",
         const="bzip2",
         dest="compression",
     )
     compression.add_argument(
         "--xz",
-        help="xz-compress the WAL while uploading to the cloud "
-        "(should not be used with python < 3.3)",
+        help="xz-compress the WAL while uploading to the cloud",
         action="store_const",
         const="xz",
         dest="compression",
@@ -169,6 +164,7 @@ def parse_arguments(args=None):
         "(requires optional zstandard library)",
         action="store_const",
         const="zstd",
+        dest="compression",
     )
     compression.add_argument(
         "--lz4",
@@ -178,15 +174,43 @@ def parse_arguments(args=None):
         const="lz4",
         dest="compression",
     )
-    add_tag_argument(
-        parser,
-        name="tags",
-        help="Tags to be added to archived WAL files in cloud storage",
+    parser.add_argument(
+        "--compression-level",
+        help="A compression level for the specified compression algorithm",
+        dest="compression_level",
+        type=parse_compression_level,
+        default=None,
     )
+
+    tag_arguments = parser.add_mutually_exclusive_group()
     add_tag_argument(
-        parser,
+        tag_arguments,
+        name="tags",
+        dest="tags_list",
+        help="Tags to be added to all uploaded files in cloud storage",
+    )
+    tag_arguments.add_argument(
+        "--tag",
+        help="Tags to be added to archived WAL files in cloud storage",
+        action="append",
+        type=check_tag,
+        default=[],
+        dest="tags_append",
+    )
+    history_tag_arguments = parser.add_mutually_exclusive_group()
+    add_tag_argument(
+        history_tag_arguments,
         name="history-tags",
+        dest="history_tags_list",
         help="Tags to be added to archived history files in cloud storage",
+    )
+    history_tag_arguments.add_argument(
+        "--history-tag",
+        help="Tags to be added to archived history files in cloud storage",
+        action="append",
+        type=check_tag,
+        default=[],
+        dest="history_tags_append",
     )
     gcs_arguments = parser.add_argument_group(
         "Extra options for google-cloud-storage cloud provider"
@@ -237,7 +261,13 @@ def parse_arguments(args=None):
         default="64MB",
         type=check_size,
     )
-    return parser.parse_args(args=args)
+
+    parsed_args = parser.parse_args(args=args)
+    parsed_args.tags = parsed_args.tags_append or parsed_args.tags_list
+    parsed_args.history_tags = (
+        parsed_args.history_tags_append or parsed_args.history_tags_list
+    )
+    return parsed_args
 
 
 class CloudWalUploader(object):
@@ -245,18 +275,27 @@ class CloudWalUploader(object):
     Cloud storage upload client
     """
 
-    def __init__(self, cloud_interface, server_name, compression=None):
+    def __init__(
+        self,
+        cloud_interface,
+        server_name,
+        compression=None,
+        compression_level=None,
+    ):
         """
         Object responsible for handling interactions with cloud storage
 
         :param CloudInterface cloud_interface: The interface to use to
           upload the backup
         :param str server_name: The name of the server as configured in Barman
-        :param str compression: Compression algorithm to use
+        :param str|None compression: Compression algorithm to use
+        :param str|int|None compression_level: Compression level for the specified
+            algorithm
         """
 
         self.cloud_interface = cloud_interface
         self.compression = compression
+        self.compression_level = compression_level
         self.server_name = server_name
 
     def upload_wal(self, wal_path, override_tags=None):
@@ -311,7 +350,7 @@ class CloudWalUploader(object):
         if not self.compression:
             return wal_file
 
-        return compress(wal_file, self.compression)
+        return compress(wal_file, self.compression, self.compression_level)
 
     def retrieve_wal_name(self, wal_path):
         """

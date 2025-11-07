@@ -1,3 +1,4 @@
+'\" t
 .\" Man page generated from reStructuredText.
 .
 .
@@ -27,7 +28,7 @@ level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
 .in \\n[rst2man-indent\\n[rst2man-indent-level]]u
 ..
-.TH "BARMAN" "5" "Dec 09, 2024" "3.12" "Barman"
+.TH "BARMAN" "5" "Oct 02, 2025" "3.16" "Barman"
 .SH NAME
 barman \- Barman Configurations
 .sp
@@ -186,39 +187,13 @@ Specifies the directory for lock files. The default is \fBbarman_home\fP\&.
 \fBNOTE:\fP
 .INDENT 0.0
 .INDENT 3.5
-The \fBbarman_lock_directory\fP should be on a non\-network local filesystem.
+The \fBbarman_lock_directory\fP should be on a non\-network local filesystem. If using
+NFS, or any other network filesystem to store the backups and WAL files, make sure
+that the lock directory lives in a local filesystem.
 .UNINDENT
 .UNINDENT
 .sp
 Scope: Global.
-.sp
-\fBbasebackup_retry_sleep\fP
-.sp
-Sets the number of seconds to wait after a failed base backup copy before retrying.
-Default is \fB30\fP seconds. Must be a non\-negative integer.
-.sp
-\fBNOTE:\fP
-.INDENT 0.0
-.INDENT 3.5
-This applies to both backup and recovery operations.
-.UNINDENT
-.UNINDENT
-.sp
-Scope: Global / Server / Model.
-.sp
-\fBbasebackup_retry_times\fP
-.sp
-Defines the number of retry attempts for a base backup copy after an error occurs.
-Default is \fB0\fP (no retries). Must be a non\-negative integer.
-.sp
-\fBNOTE:\fP
-.INDENT 0.0
-.INDENT 3.5
-This applies to both backup and recovery operations.
-.UNINDENT
-.UNINDENT
-.sp
-Scope: Global / Server / Model.
 .sp
 \fBcheck_timeout\fP
 .sp
@@ -264,8 +239,8 @@ Scope: Global.
 Specifies the connection string used by Barman to connect to the Postgres server.
 This is a libpq connection string. Commonly used keys include: \fBhost\fP, \fBhostaddr\fP,
 \fBport\fP, \fBdbname\fP, \fBuser\fP and \fBpassword\fP\&. See the
-\X'tty: link https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING'\fI\%PostgreSQL documentation\fP\X'tty: link'
-for details.
+\X'tty: link https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING'\fI\%libpq\-connstring\fP\X'tty: link'
+PostgreSQL documentation for details.
 .sp
 Scope: Server / Model.
 .sp
@@ -296,6 +271,35 @@ failed to be archived and take appropriate actions (dispose of, store somewhere 
 replace the duplicate file archived before, etc.)
 .sp
 Scope: Server.
+.sp
+\fBencryption\fP
+.sp
+Specifies the encryption method used for encrypting backups and WAL files. Supported
+values are:
+.INDENT 0.0
+.IP \(bu 2
+\fBnone\fP (default): No encryption is applied.
+.IP \(bu 2
+\fBgpg\fP: Uses \fI\%GPG\fP for encryption. Requires \fI\%GPG\fP to be installed
+and properly configured on the system.
+.UNINDENT
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBencryption_key_id\fP
+.sp
+Specifies the encryption key ID used for encrypting backups and WAL files. This option
+is required when \fBencryption = gpg\fP and must correspond to a valid \fI\%GPG\fP key ID
+available on the system.
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBencryption_passphrase_command\fP
+.sp
+Specifies a command used to retrieve the encryption passphrase for decrypting
+backups and WAL files. The command must write the passphrase to standard output.
+.sp
+Scope: Global / Server / Model.
 .sp
 \fBforward_config_path\fP
 .sp
@@ -414,9 +418,9 @@ Scope: Global / Server / Model.
 \fBpath_prefix\fP
 .sp
 Lists one or more absolute paths, separated by colons, where Barman looks for executable
-files. These paths are checked before the \fBPATH\fP environment variable. This option can
-be set for each server and needs to point to the \fBbin\fP directory for the appropriate
-\fBPG_MAJOR_VERSION\fP\&.
+files such as PostgreSQL binaries (from the appropriate \fBbin\fP directory for the
+\fBPG_MAJOR_VERSION\fP), \fBrsync\fP, encryption, and compression tools. These paths are
+prepended to the \fBPATH\fP environment variable and are checked before any others.
 .sp
 Scope: Global / Server / Model.
 .sp
@@ -516,8 +520,8 @@ This is a boolean option that allows for the automatic creation of backup manife
 files. The manifest file, which is a JSON document, lists all files included in the
 backup. It is generated upon completion of the backup and saved in the backup
 directory. The format of the manifest file adheres to the specifications outlined in the
-\X'tty: link https://www.postgresql.org/docs/current/backup-manifest-format.html'\fI\%PostgreSQL documentation\fP\X'tty: link'
-and is compatible with the \fBpg_verifybackup\fP tool. Default is \fBfalse\fP\&.
+\X'tty: link https://www.postgresql.org/docs/current/backup-manifest-format.html'\fI\%backup manifest format\fP\X'tty: link'
+PostgreSQL documentation and is compatible with the \fBpg_verifybackup\fP tool. Default is \fBfalse\fP\&.
 .sp
 \fBNOTE:\fP
 .INDENT 0.0
@@ -665,6 +669,34 @@ Specifies the directory where base backups are stored. Defaults to
 .sp
 Scope: Server.
 .sp
+\fBbasebackup_retry_sleep\fP
+.sp
+Sets the number of seconds to wait after a failed base backup copy before retrying.
+Default is \fB30\fP seconds. Must be a non\-negative integer.
+.sp
+\fBNOTE:\fP
+.INDENT 0.0
+.INDENT 3.5
+This applies to both backup and recovery operations.
+.UNINDENT
+.UNINDENT
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBbasebackup_retry_times\fP
+.sp
+Defines the number of retry attempts for a base backup copy after an error occurs.
+Default is \fB0\fP (no retries). Must be a non\-negative integer.
+.sp
+\fBNOTE:\fP
+.INDENT 0.0
+.INDENT 3.5
+This applies to both backup and recovery operations.
+.UNINDENT
+.UNINDENT
+.sp
+Scope: Global / Server / Model.
+.sp
 \fBreuse_backup\fP
 .sp
 Controls incremental backup support when using \fBbackup_method=rsync\fP by reusing the
@@ -686,6 +718,13 @@ creating a hard link of the unchanged files (for backup space and time reduction
 This option will be ignored when \fBbackup_method=postgres\fP\&.
 .UNINDENT
 .UNINDENT
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBworm_mode\fP
+.sp
+If set to \fBon\fP, enables support for WORM (Write Once Read Many) storage, allowing
+Barman to handle backups on immutable storage correctly. Default is \fBoff\fP\&.
 .sp
 Scope: Global / Server / Model.
 .SS Cloud Backups
@@ -804,9 +843,9 @@ Scope: Global / Server / Model.
 .sp
 \fBazure_credential\fP
 .sp
-Specifies the type of Azure credential to use for authentication, either \fBazure\-cli\fP
-or \fBmanaged\-identity\fP\&. If not provided, the default Azure authentication method will
-be used.
+Specifies the type of Azure credential to use for authentication, either \fBazure\-cli\fP,
+\fBmanaged\-identity\fP or \fBdefault\fP\&. If not provided, the default Azure authentication
+method will be used.
 .sp
 \fBNOTE:\fP
 .INDENT 0.0
@@ -1083,7 +1122,12 @@ These configuration options are related to how Barman will manage the Write\-Ahe
 \fBcompression\fP
 .sp
 Specifies the standard compression algorithm for WAL files. Options include: \fBlz4\fP,
-\fBxz\fP, \fBzstd\fP, \fBgzip\fP, \fBpybzip2\fP, \fBpigz\fP, \fBbzip2\fP, \fBpybzip2\fP and \fBcustom\fP\&.
+\fBxz\fP, \fBzstd\fP, \fBgzip\fP, \fBpygzip\fP, \fBpigz\fP, \fBbzip2\fP, \fBpybzip2\fP, \fBsnappy\fP
+and \fBcustom\fP\&.
+.sp
+Deprecated since version 3.16: The \fBpygzip\fP and \fBpybzip2\fP compression options are deprecated and will be
+removed in a future release. Use their equivalents \fBgzip\fP and \fBbzip2\fP instead.
+
 .sp
 \fBNOTE:\fP
 .INDENT 0.0
@@ -1146,6 +1190,17 @@ Magic Number: \fBFD 37 7A 58 5A 00\fP
 Hex String: \fBfd377a585a00\fP
 .UNINDENT
 .sp
+As Barman expects the value of \fBcustom_compression_magic\fP to be prefixed with
+\fB0x\fP, you would need to set that config option like this:
+.INDENT 0.0
+.INDENT 3.5
+.sp
+.EX
+custom_compression_magic = 0xfd377a585a00
+.EE
+.UNINDENT
+.UNINDENT
+.sp
 Reference: \X'tty: link https://tukaani.org/xz/xz-file-format-1.0.4.txt'\fI\%xz\-file\-format\fP\X'tty: link'
 .UNINDENT
 .UNINDENT
@@ -1167,6 +1222,104 @@ compression algorithm used.
 This is the same as running \fBxz \-c \-d > \(dq$2\(dq < \(dq$1\(dq;\fP\&.
 .UNINDENT
 .UNINDENT
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBcompression_level\fP
+.sp
+Specifies the compression level to be used by the selected compression algorithm. Valid
+values are integers within the supported range of the chosen algorithm or one
+of the predefined labels: \fBlow\fP, \fBmedium\fP, and \fBhigh\fP, which serve as shortcuts.
+.INDENT 0.0
+.IP \(bu 2
+\fBlow\fP: uses low level of compression, favoring compression speed over compression ratio.
+.IP \(bu 2
+\fBmedium\fP: uses a medium level of compression, balancing between compression speed and compression ratio.
+.IP \(bu 2
+\fBhigh\fP: uses a high level of compression, favoring compression ratio over compression speed.
+.UNINDENT
+.sp
+Predefined labels map to algorithm\-specific levels, as detailed below:
+.SS Compression levels
+.TS
+box center;
+l|l|l|l|l.
+T{
+Algorithm
+T}	T{
+Level range
+T}	T{
+low
+T}	T{
+medium
+T}	T{
+high
+T}
+_
+T{
+\fBlz4\fP
+T}	T{
+0 to 16
+T}	T{
+0
+T}	T{
+6
+T}	T{
+10
+T}
+_
+T{
+\fBxz\fP
+T}	T{
+1 to 9
+T}	T{
+1
+T}	T{
+3
+T}	T{
+5
+T}
+_
+T{
+\fBzstd\fP
+T}	T{
+\-22 to 22
+T}	T{
+1
+T}	T{
+4
+T}	T{
+9
+T}
+_
+T{
+\fBgzip\fP, \fBpygzip\fP and \fBpigz\fP
+T}	T{
+1 to 9
+T}	T{
+1
+T}	T{
+6
+T}	T{
+9
+T}
+_
+T{
+\fBbzip2\fP and \fBpybzip2\fP
+T}	T{
+1 to 9
+T}	T{
+1
+T}	T{
+5
+T}	T{
+9
+T}
+.TE
+.sp
+If the specified compression level is greater than the algorithm\(aqs maximum level, that
+maximum level is used. Similarly, if it is lower than the minimum level, that minimum
+level is used. The default value is \fBmedium\fP\&.
 .sp
 Scope: Global / Server / Model.
 .sp
@@ -1246,6 +1399,14 @@ Scope: Server / Model.
 Directory containing WAL files. Defaults to \fB<backup_directory>/wals\fP\&.
 .sp
 Scope: Server.
+.sp
+\fBxlogdb_directory\fP
+.sp
+A custom directory for the \fBSERVER\-xlog.db\fP file, \fBSERVER\fP being the server name.
+This file stores metadata of archived WAL files and is used internally by Barman. If
+unset, it defaults to the value of \fBwals_directory\fP\&.
+.sp
+Scope: Global / Server.
 .SS Restore
 .sp
 These configuration options are related to how Barman manages restoration backups.
@@ -1263,14 +1424,20 @@ Applies only when \fBbackup_method = postgres\fP\&.
 .UNINDENT
 .UNINDENT
 .sp
+Deprecated since version 3.15: \fBlocal_staging_path\fP is deprecated and will be removed in a future release.
+Use \fBstaging_path\fP and \fBstaging_location\fP instead.
+
+.sp
 Scope: Global / Server / Model.
 .sp
 \fBrecovery_options\fP
 .sp
-Options for recovery operations. Currently, only \fBget\-wal\fP is supported. This option
-enables the creation of a basic \fBrestore_command\fP in the recovery configuration,
-which uses the barman \fBget\-wal\fP command to retrieve WAL files directly from Barman\(aqs
-WAL archive. This setting accepts a comma\-separated list of values and defaults to
+Options for recovery operations. Currently, only \fBget\-wal\fP and \fBdelta\-restore\fP are
+supported. \fBget\-wal\fP enables the creation of a basic \fBrestore_command\fP in the
+recovery configuration, which uses the barman \fBget\-wal\fP command to retrieve WAL files
+directly from Barman\(aqs WAL archive. \fBdelta\-restore\fP allows barman to restore a backup
+into a pre\-existing destination directory along with existing custom tablespaces by
+overwriting it. This setting accepts a comma\-separated list of values and defaults to
 empty.
 .sp
 Scope: Global / Server / Model.
@@ -1287,6 +1454,54 @@ Applies only for commpressed backups.
 .UNINDENT
 .UNINDENT
 .sp
+Deprecated since version 3.15: \fBrecovery_staging_path\fP is deprecated and will be removed in a future release.
+Use \fBstaging_path\fP and \fBstaging_location\fP instead.
+
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBstaging_path\fP
+.sp
+A path where intermediate files are staged during restore. When restoring a compressed
+backup, it serves as a temporary location for decompression before copying to the final
+destination. When restoring an incremental backup, it is where backups are combined
+before copying to the final destination. This location must have enough space to store
+the decompressed/combined backup. The default is \fB/tmp\fP\&.
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBstaging_location\fP
+.sp
+Specifies whether \fBstaging_path\fP is a local or remote path. Valid values are
+\fBlocal\fP and \fBremote\fP\&. The default is \fBlocal\fP\&.
+.sp
+Scope: Global / Server / Model.
+.sp
+\fBcombine_mode\fP
+.sp
+Specifies a copy mode for \fBpg_combinebackup\fP when combining incremental backups
+during a restore.
+.sp
+Options include:
+.INDENT 0.0
+.IP \(bu 2
+\fBcopy\fP (default): Use standard file copying when combining incremental backups.
+.IP \(bu 2
+\fBlink\fP: Use hard links when combining incremental backups. Reconstruction of the
+synthetic backup might be faster (no file copying) and use less disk space.
+.IP \(bu 2
+\fBclone\fP: Use efficient file cloning (also known as “reflinks” on some systems)
+instead of copying files to the new data directory, which can result in
+near\-instantaneous copying of the data files.
+.IP \(bu 2
+\fBcopy\-file\-range\fP: Use the \fBcopy_file_range\fP system call for efficient copying.
+On some file systems this gives results similar to \fBclone\fP, sharing physical disk
+blocks, while on others it may still copy blocks, but do so via an optimized path.
+.UNINDENT
+.sp
+Refer to the \X'tty: link https://www.postgresql.org/docs/current/app-pgcombinebackup.html'\fI\%pg_combinebackup documentation\fP\X'tty: link'
+for more details and restrictions of each mode.
+.sp
 Scope: Global / Server / Model.
 .SS Retention Policies
 .sp
@@ -1298,7 +1513,7 @@ backups.
 Defines the time frame within which the latest backup must fall. If the latest backup
 is older than this period, the barman check command will report an error. If left
 empty (default), the latest backup is always considered valid. The accepted format is
-\fB\(dqn {DAYS|WEEKS|MONTHS}\(dq\fP, where \fBn\fP is an integer greater than zero.
+\fB\(dqn {DAYS|WEEKS|MONTHS|HOURS}\(dq\fP, where \fBn\fP is an integer greater than zero.
 .sp
 Scope: Global / Server / Model.
 .sp
@@ -1411,6 +1626,6 @@ various sets of overrides as necessary.
 .SH AUTHOR
 EnterpriseDB
 .SH COPYRIGHT
-© Copyright EnterpriseDB UK Limited 2011-2024
+© Copyright EnterpriseDB UK Limited 2011-2025
 .\" Generated by docutils manpage writer.
 .

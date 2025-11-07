@@ -10,9 +10,10 @@ Synopsis
     
     backup 
         [ --bwlimit KBPS ]
+        [ { -h | --help } ]
         [ --incremental BACKUP_ID ]
         [ --immediate-checkpoint ]
-        [ { -j, --jobs } PARALLEL_WORKERS ]
+        [ { -j | --jobs } PARALLEL_WORKERS ]
         [ --jobs-start-batch-period PERIOD ]
         [ --jobs-start-batch-size SIZE ]
         [ --keepalive-interval SECONDS ]
@@ -26,7 +27,7 @@ Synopsis
         [ --reuse-backup { off | copy | link } ]
         [ { --wait | -w } ]
         [ --wait-timeout SECONDS ]
-        SERVER_NAME [ ... ]
+        SERVER_NAME [ SERVER_NAME ... ]
 
 Description
 ^^^^^^^^^^^
@@ -45,6 +46,9 @@ Parameters
 ``--bwlimit``
     Specify the maximum transfer rate in kilobytes per second. A value of 0 indicates no
     limit. This setting overrides the ``bandwidth_limit`` configuration option.
+
+``-h`` / ``--help``
+    Show a help message and exit. Provides information about command usage.
     
 ``--incremental``
     Execute a block-level incremental backup. You must provide a ``BACKUP_ID`` or a

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -23,7 +23,6 @@ from contextlib import closing
 from barman.clients.cloud_cli import (
     CLIErrorExit,
     GeneralErrorExit,
-    NetworkErrorExit,
     OperationErrorExit,
     create_argument_parser,
 )
@@ -35,7 +34,18 @@ from barman.cloud_providers import (
 from barman.exceptions import ConfigurationException
 from barman.fs import UnixLocalCommand
 from barman.recovery_executor import SnapshotRecoveryExecutor
-from barman.utils import force_str, with_metaclass
+from barman.utils import (
+    check_tli,
+    force_str,
+    get_backup_id_from_target_lsn,
+    get_backup_id_from_target_time,
+    get_backup_id_from_target_tli,
+    get_last_backup_id,
+    parse_target_tli,
+    with_metaclass,
+)
+
+_logger = logging.getLogger(__name__)
 
 
 def _validate_config(config, backup_info):
@@ -69,22 +79,53 @@ def main(args=None):
         cloud_interface = get_cloud_interface(config)
 
         with closing(cloud_interface):
-            if not cloud_interface.test_connectivity():
-                raise NetworkErrorExit()
-            # If test is requested, just exit after connectivity test
-            elif config.test:
+            # Do connectivity test if requested
+            if config.test:
+                cloud_interface.verify_cloud_connectivity_and_bucket_existence()
                 raise SystemExit(0)
 
-            if not cloud_interface.bucket_exists:
-                logging.error("Bucket %s does not exist", cloud_interface.bucket_name)
-                raise OperationErrorExit()
-
             catalog = CloudBackupCatalog(cloud_interface, config.server_name)
-            backup_id = catalog.parse_backup_id(config.backup_id)
+            backup_id = None
+            if config.backup_id != "auto":
+                backup_id = catalog.parse_backup_id(config.backup_id)
+            else:
+                target_options = ["target_time", "target_lsn"]
+                target_option = None
+                for option in target_options:
+                    target = getattr(config, option, None)
+                    if target is not None:
+                        target_option = option
+                        break
+
+                # "Parse" the string value to integer for `target_tli` if passed as a
+                # string ("current", "latest")
+                target_tli = parse_target_tli(obj=catalog, target_tli=config.target_tli)
+
+                available_backups = catalog.get_backup_list().values()
+                if target_option is None:
+                    if target_tli is not None:
+                        backup_id = get_backup_id_from_target_tli(
+                            available_backups, target_tli
+                        )
+                    else:
+                        backup_id = get_last_backup_id(available_backups)
+                elif target_option == "target_time":
+                    backup_id = get_backup_id_from_target_time(
+                        available_backups, target, target_tli
+                    )
+                elif target_option == "target_lsn":
+                    backup_id = get_backup_id_from_target_lsn(
+                        available_backups, target, target_tli
+                    )
+                # If no candidate backup_id is found, error out.
+                if backup_id is None:
+                    _logger.error("Cannot find any candidate backup for recovery.")
+                    raise OperationErrorExit()
 
             backup_info = catalog.get_backup_info(backup_id)
+            _logger.info("Restoring from backup_id: %s" % backup_id)
             if not backup_info:
-                logging.error(
+                _logger.error(
                     "Backup %s for server %s does not exists",
                     backup_id,
                     config.server_name,
@@ -115,12 +156,12 @@ def main(args=None):
                 )
 
     except KeyboardInterrupt as exc:
-        logging.error("Barman cloud restore was interrupted by the user")
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud restore was interrupted by the user")
+        _logger.debug("Exception details:", exc_info=exc)
         raise OperationErrorExit()
     except Exception as exc:
-        logging.error("Barman cloud restore exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud restore exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise GeneralErrorExit()
 
 
@@ -175,6 +216,14 @@ def parse_arguments(args=None):
         "--azure-resource-group",
         help="Resource group containing the instance and disks for the snapshot recovery",
     )
+    parser.add_argument("--target-tli", help="target timeline", type=check_tli)
+    target_args = parser.add_mutually_exclusive_group()
+    target_args.add_argument("--target-lsn", help="target LSN (Log Sequence Number)")
+    target_args.add_argument(
+        "--target-time",
+        help="target time. You can use any valid unambiguous representation. "
+        'e.g: "YYYY-MM-DD HH:MM:SS.mmm"',
+    )
     return parser.parse_args(args=args)
 
 
@@ -188,7 +237,7 @@ def tablespace_map(rules):
         try:
             tablespaces.update([rule.split(":", 1)])
         except ValueError:
-            logging.error(
+            _logger.error(
                 "Invalid tablespace relocation rule '%s'\n"
                 "HINT: The valid syntax for a relocation rule is "
                 "NAME:LOCATION",
@@ -239,7 +288,7 @@ class CloudBackupDownloaderObjectStore(CloudBackupDownloader):
         """
         # Validate the destination directory before starting recovery
         if os.path.exists(destination_dir) and os.listdir(destination_dir):
-            logging.error(
+            _logger.error(
                 "Destination %s already exists and it is not empty", destination_dir
             )
             raise OperationErrorExit()
@@ -267,7 +316,7 @@ class CloudBackupDownloaderObjectStore(CloudBackupDownloader):
                         target_dir = tblspc.location
                         if tblspc.name in tablespaces:
                             target_dir = os.path.realpath(tablespaces[tblspc.name])
-                        logging.debug(
+                        _logger.debug(
                             "Tablespace %s (oid=%s) will be located at %s",
                             tblspc.name,
                             oid,
@@ -285,7 +334,7 @@ class CloudBackupDownloaderObjectStore(CloudBackupDownloader):
 
             # Validate the destination directory before starting recovery
             if os.path.exists(target_dir) and os.listdir(target_dir):
-                logging.error(
+                _logger.error(
                     "Destination %s already exists and it is not empty", target_dir
                 )
                 raise OperationErrorExit()
@@ -296,7 +345,7 @@ class CloudBackupDownloaderObjectStore(CloudBackupDownloader):
         # Now it's time to download the files
         for file_info, target_dir in copy_jobs:
             # Download the file
-            logging.debug(
+            _logger.debug(
                 "Extracting %s to %s (%s)",
                 file_info.path,
                 target_dir,

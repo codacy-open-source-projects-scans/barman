@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -35,6 +35,9 @@ from barman.cloud import (
     VolumeMetadata,
 )
 from barman.exceptions import CommandException, SnapshotBackupException
+
+_logger = logging.getLogger(__name__)
+
 
 try:
     # Python 3.x
@@ -180,7 +183,7 @@ class AzureCloudInterface(CloudInterface):
         else:
             # We are dealing with emulated storage so we use the following form:
             # http://<local-machine-address>:<port>/<account-name>/<resource-path>
-            logging.info("Using emulated storage URL: %s " % url)
+            _logger.info("Using emulated storage URL: %s " % url)
             if "AZURE_STORAGE_CONNECTION_STRING" not in os.environ:
                 raise ValueError(
                     "A connection string must be provided when using emulated storage"
@@ -204,7 +207,7 @@ class AzureCloudInterface(CloudInterface):
             # Any supplied credential takes precedence over the environment
             credential = self.credential
         elif "AZURE_STORAGE_CONNECTION_STRING" in os.environ:
-            logging.info("Authenticating to Azure with connection string")
+            _logger.info("Authenticating to Azure with connection string")
             self.container_client = ContainerClient.from_connection_string(
                 conn_str=os.getenv("AZURE_STORAGE_CONNECTION_STRING"),
                 container_name=self.bucket_name,
@@ -212,13 +215,13 @@ class AzureCloudInterface(CloudInterface):
             return
         else:
             if "AZURE_STORAGE_SAS_TOKEN" in os.environ:
-                logging.info("Authenticating to Azure with SAS token")
+                _logger.info("Authenticating to Azure with SAS token")
                 credential = os.getenv("AZURE_STORAGE_SAS_TOKEN")
             elif "AZURE_STORAGE_KEY" in os.environ:
-                logging.info("Authenticating to Azure with shared key")
+                _logger.info("Authenticating to Azure with shared key")
                 credential = os.getenv("AZURE_STORAGE_KEY")
             else:
-                logging.info("Authenticating to Azure with default credentials")
+                _logger.info("Authenticating to Azure with default credentials")
                 # azure-identity is not part of azure-storage-blob so only import
                 # it if needed
                 try:
@@ -255,7 +258,7 @@ class AzureCloudInterface(CloudInterface):
             self.bucket_exists = self._check_bucket_existence()
             return True
         except (HttpResponseError, ServiceRequestError) as exc:
-            logging.error("Can't connect to cloud provider: %s", exc)
+            _logger.error("Can't connect to cloud provider: %s", exc)
             return False
 
     def _check_bucket_existence(self):
@@ -270,7 +273,9 @@ class AzureCloudInterface(CloudInterface):
         :rtype: bool
         """
         try:
-            self.container_client.list_blobs().next()
+            self.container_client.list_blobs(
+                name_starts_with=self.path.strip("/"),
+            ).next()
         except ResourceNotFoundError:
             return False
         except StopIteration:
@@ -461,7 +466,7 @@ class AzureCloudInterface(CloudInterface):
             # the response objects in its `parts` attribute.
             # We therefore set responses to reference the response in the exception and
             # treat it the same way we would a regular response.
-            logging.warning(
+            _logger.warning(
                 "PartialBatchErrorException received from Azure: %s" % exc.message
             )
             responses = exc.parts
@@ -471,13 +476,13 @@ class AzureCloudInterface(CloudInterface):
         errors = False
         for resp in responses:
             if resp.status_code == 404:
-                logging.warning(
+                _logger.warning(
                     "Deletion of object %s failed because it could not be found"
                     % resp.request.url
                 )
             elif resp.status_code != 202:
                 errors = True
-                logging.error(
+                _logger.error(
                     'Deletion of object %s failed with error code: "%s"'
                     % (resp.request.url, resp.status_code)
                 )
@@ -559,7 +564,8 @@ class AzureCloudSnapshotInterface(CloudSnapshotInterface):
             resources accessed through this interface belong.
         :param str resource_group|None: The resource_group to which the resources
             accessed through this interface belong.
-        :param azure.identity.AzureCliCredential|azure.identity.ManagedIdentityCredential
+        :param azure.identity.AzureCliCredential|azure.identity.ManagedIdentityCredential|
+            azure.identity.DefaultAzureCredential
             The Azure credential to be used when authenticating against the Azure API.
             If omitted then a DefaultAzureCredential will be created and used.
         """
@@ -629,7 +635,7 @@ class AzureCloudSnapshotInterface(CloudSnapshotInterface):
         :return: The name used to reference the snapshot with Azure.
         """
         snapshot_name = "%s-%s" % (disk_name, backup_info.backup_id.lower())
-        logging.info("Taking snapshot '%s' of disk '%s'", snapshot_name, disk_name)
+        _logger.info("Taking snapshot '%s' of disk '%s'", snapshot_name, disk_name)
         resp = self.client.snapshots.begin_create_or_update(
             resource_group,
             snapshot_name,
@@ -640,7 +646,7 @@ class AzureCloudSnapshotInterface(CloudSnapshotInterface):
             },
         )
 
-        logging.info("Waiting for snapshot '%s' completion", snapshot_name)
+        _logger.info("Waiting for snapshot '%s' completion", snapshot_name)
         resp.wait()
 
         if (
@@ -652,7 +658,7 @@ class AzureCloudSnapshotInterface(CloudSnapshotInterface):
                 % (snapshot_name, resp.status(), resp.result())
             )
 
-        logging.info("Snapshot '%s' completed", snapshot_name)
+        _logger.info("Snapshot '%s' completed", snapshot_name)
         return snapshot_name
 
     def take_snapshot_backup(self, backup_info, instance_name, volumes):
@@ -731,7 +737,7 @@ class AzureCloudSnapshotInterface(CloudSnapshotInterface):
                 % (snapshot_name, resp.status(), resp.result())
             )
 
-        logging.info("Snapshot %s deleted", snapshot_name)
+        _logger.info("Snapshot %s deleted", snapshot_name)
 
     def delete_snapshot_backup(self, backup_info):
         """
@@ -740,7 +746,7 @@ class AzureCloudSnapshotInterface(CloudSnapshotInterface):
         :param barman.infofile.LocalBackupInfo backup_info: Backup information.
         """
         for snapshot in backup_info.snapshots_info.snapshots:
-            logging.info(
+            _logger.info(
                 "Deleting snapshot '%s' for backup %s",
                 snapshot.identifier,
                 backup_info.backup_id,

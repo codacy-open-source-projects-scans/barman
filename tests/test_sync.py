@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -82,35 +82,44 @@ EXPECTED_MINIMAL = {
             "parent_backup_id": None,
             "children_backup_ids": None,
             "cluster_size": 2048,
+            "encryption": None,
         }
     },
     "config": {},
     "last_name": "000000010000000000000005",
-    "last_position": 209,
+    "last_position": 229,
     "wals": [
         {
             "time": 1406019026.0,
             "size": 16777216,
             "compression": None,
+            "encryption": None,
             "name": "000000010000000000000002",
+            "encryption": None,
         },
         {
             "time": 1406019026.0,
             "size": 16777216,
             "compression": None,
+            "encryption": None,
             "name": "000000010000000000000003",
+            "encryption": None,
         },
         {
             "time": 1406019329.9300001,
             "size": 16777216,
             "compression": None,
+            "encryption": None,
             "name": "000000010000000000000004",
+            "encryption": None,
         },
         {
             "time": 1406019330.84,
             "size": 16777216,
             "compression": None,
+            "encryption": None,
             "name": "000000010000000000000005",
+            "encryption": None,
         },
     ],
     "version": barman.__version__,
@@ -189,11 +198,11 @@ class TestSync(object):
         # Create a test xlog.db
         tmp_path = tmpdir.join("xlog.db")
         tmp_path.write(
-            "000000010000000000000001\t16777216\t1406019022.4\tNone\n"
-            "000000010000000000000002\t16777216\t1406019026.0\tNone\n"
-            "000000010000000000000003\t16777216\t1406019026.0\tNone\n"
-            "000000010000000000000004\t16777216\t1406019329.93\tNone\n"
-            "000000010000000000000005\t16777216\t1406019330.84\tNone\n"
+            "000000010000000000000001\t16777216\t1406019022.4\tNone\tNone\n"
+            "000000010000000000000002\t16777216\t1406019026.0\tNone\tNone\n"
+            "000000010000000000000003\t16777216\t1406019026.0\tNone\tNone\n"
+            "000000010000000000000004\t16777216\t1406019329.93\tNone\tNone\n"
+            "000000010000000000000005\t16777216\t1406019330.84\tNone\tNone\n"
         )
 
         # Build a server, replacing some function to use the tmpdir objects
@@ -380,8 +389,6 @@ class TestSync(object):
 
         # Prepare paths
         backup_dir = tmpdir.mkdir(server_name)
-        basebackup_dir = backup_dir.mkdir("base")
-        full_backup_path = basebackup_dir.mkdir(backup_name)
 
         self._create_primary_info_file(tmpdir, backup_dir)
 
@@ -428,7 +435,6 @@ class TestSync(object):
         rsync_mock.reset_mock()
         server.backup_manager._backup_cache = {}
         rsync_mock.side_effect = CommandFailedException("TestFailure")
-        full_backup_path.remove(rec=1)
         server.sync_backup(backup_name)
         backup_info = server.get_backup(backup_name)
         assert backup_info.status == BackupInfo.FAILED
@@ -441,7 +447,6 @@ class TestSync(object):
         # Check the error message for the KeyboardInterrupt event
         rsync_mock.reset_mock()
         rsync_mock.side_effect = CommandFailedException("TestFailure")
-        full_backup_path.remove(rec=1)
         rsync_mock.side_effect = KeyboardInterrupt()
         server.sync_backup(backup_name)
         backup_info = server.get_backup(backup_name)
@@ -455,7 +460,6 @@ class TestSync(object):
         # Expect a error message on stderr
         rsync_mock.reset_mock()
         rsync_mock.side_effect = CommandFailedException("TestFailure")
-        full_backup_path.remove(rec=1)
         server.sync_backup("wrong_backup_name")
 
         (out, err) = capsys.readouterr()
@@ -684,10 +688,10 @@ class TestSync(object):
         assert err == ""
         # check the xlog content for primary.info wals
         exp_xlog = [
-            "000000010000000000000002\t16777216\t1406019026.0\tNone\n",
-            "000000010000000000000003\t16777216\t1406019026.0\tNone\n",
-            "000000010000000000000004\t16777216\t1406019329.93\tNone\n",
-            "000000010000000000000005\t16777216\t1406019330.84\tNone\n",
+            "000000010000000000000002\t16777216\t1406019026.0\tNone\tNone\n",
+            "000000010000000000000003\t16777216\t1406019026.0\tNone\tNone\n",
+            "000000010000000000000004\t16777216\t1406019329.93\tNone\tNone\n",
+            "000000010000000000000005\t16777216\t1406019330.84\tNone\tNone\n",
         ]
         with server.xlogdb() as fxlogdb:
             xlog = fxlogdb.readlines()

@@ -14,21 +14,26 @@ Synopsis
         [ --bwlimit KBPS ]
         [ --exclusive ]
         [ --gcp-zone GCP_ZONE ]
-        [ --get-wal | --no-get-wal ]
+        [ { --get-wal | --no-get-wal } ]
+        [ { -h | --help } ]
         [ { -j | --jobs } PARALLEL_WORKERS ]
         [ --jobs-start-batch-period SECONDS ]
         [ --jobs-start-batch-size NUMBER ]
         [ --local-staging-path PATH ]
-        [ --network-compression | --no-network-compression ]
+        [ { --network-compression | --no-network-compression } ]
         [ --no-retry ]
         [ --recovery-conf-filename FILENAME ]
         [ --recovery-staging-path PATH ]
+        [ --staging-path STAGING_PATH ]
+        [ --staging-location STAGING_LOCATION ]
+        [ --combine-mode COMBINE_MODE ]
         [ --remote-ssh-command STRING ]
         [ --retry-sleep SECONDS ]
         [ --retry-times NUMBER ]
         [ --snapshot-recovery-instance INSTANCE_NAME ]
+        [ --snapshot-recovery-zone GCP_ZONE ]
         [ --standby-mode ]
-        [ --tablespace NAME:LOCATION ]
+        [ --tablespace NAME:LOCATION [ --tablespace NAME:LOCATION ... ] ]
         [ --target-action { pause | shutdown | promote } ]
         [ --target-immediate ]
         [ --target-lsn LSN ]
@@ -36,6 +41,7 @@ Synopsis
         [ --target-time TIMESTAMP ]
         [ --target-tli TLI ]
         [ --target-xid XID ]
+        [ --staging-wal-directory ]
         SERVER_NAME BACKUP_ID DESTINATION_DIR
 
 Description
@@ -55,7 +61,8 @@ Parameters
     Name of the server in barman node
 
 ``BACKUP_ID``
-    Id of the backup in barman catalog.
+    Id of the backup in the barman catalog. Use ``auto`` to have Barman automatically
+    find the most suitable backup for the restore operation.
 
 ``DESTINATION_DIR``
     Destination directory to restore the backup.
@@ -75,6 +82,10 @@ Parameters
     indicates no limit. This setting overrides the ``bandwidth_limit`` configuration
     option.
 
+``--delta-restore`` / ``--no-delta-restore``
+    Enable/disable usage of ``delta-restore`` for a delta recovery. Default is based on
+    ``recovery_options`` setting.
+
 ``--exclusive``
     Set target (time, XID or LSN) to be non inclusive.
 
@@ -86,6 +97,9 @@ Parameters
 ``--get-wal`` / ``--no-get-wal``
     Enable/disable usage of ``get-wal`` for WAL fetching during recovery. Default is based on
     ``recovery_options`` setting.
+
+``-h`` / ``--help``
+    Show a help message and exit. Provides information about command usage.
 
 ``-j`` / ``--jobs``
     Specify the number of parallel workers to use for copying files during the backup.
@@ -108,6 +122,10 @@ Parameters
     path will be removed upon completion of the restore process. This option is
     necessary for restoring from block-level incremental backups and has no effect
     otherwise.
+
+    .. deprecated:: 3.15
+        ``--local-staging-path`` is deprecated and will be removed in a future release.
+        Use ``--staging-path`` and ``--staging-location`` instead.
     
 ``--network-compression`` / ``--no-network-compression``
     Enable/disable network compression during remote restore. Default is based on
@@ -128,11 +146,45 @@ Parameters
 
 ``--recovery-staging-path``
     Specify a path on the recovery host where files for a compressed backup will be
-    staged before being uncompressed to the destination directory. Backups will be
+    staged before being decompressed to the destination directory. Backups will be
     staged in their own directory within the staging path, following the naming
     convention: ``barman-staging-SERVER_NAME-BACKUP_ID``. This staging directory will be
     removed after the restore process is complete. This option is mandatory for
     restoring from compressed backups and has no effect otherwise.
+
+    .. deprecated:: 3.15
+        ``--recovery-staging-path`` is deprecated and will be removed in a future release.
+        Use ``--staging-path`` and ``--staging-location`` instead.
+
+``--staging-path``
+    A path where intermediate files are staged during restore. When restoring a
+    compressed backup, it serves as a temporary location for decompression before
+    copying to the final destination. When restoring an incremental backup, it is where
+    backups are combined before copying to the final destination. This location must
+    have enough space to store the decompressed/combined backup.
+
+``--staging-location``
+    Specifies whether ``--staging-path`` is a local or remote path. Valid values are
+    ``local`` and ``remote``.
+
+``--combine-mode``
+    Specifies a copy mode for ``pg_combinebackup`` when combining incremental backups
+    during a restore.
+
+    Options include:
+
+    * ``copy`` (default): Use standard file copying when combining incremental backups.
+    * ``link``: Use hard links when combining incremental backups. Reconstruction of the
+      synthetic backup might be faster (no file copying) and use less disk space.
+    * ``clone``: Use efficient file cloning (also known as “reflinks” on some systems)
+      instead of copying files to the new data directory, which can result in
+      near-instantaneous copying of the data files.
+    * ``copy-file-range``: Use the ``copy_file_range`` system call for efficient copying.
+      On some file systems this gives results similar to ``clone``, sharing physical disk
+      blocks, while on others it may still copy blocks, but do so via an optimized path.
+
+    Refer to the `pg_combinebackup documentation <https://www.postgresql.org/docs/current/app-pgcombinebackup.html>`_
+    for more details and restrictions of each mode.
 
 ``--remote-ssh-command``
     This option enables remote restore by specifying the secure shell command to
@@ -153,6 +205,10 @@ Parameters
     Specify the name of the instance where the disks recovered from the snapshots are
     attached. This option is necessary when recovering backups created with
     ``backup_method=snapshot``.
+
+``--snapshot-recovery-zone`` (deprecated)
+    Zone containing the instance and disks for the snapshot recovery (deprecated:
+    replaced by ``--gcp-zone``)
     
 ``--standby-mode``
     Whether to start the Postgres server as a standby.
@@ -194,6 +250,12 @@ Parameters
 ``--target-xid``
     Recover to the specified transaction ID.
 
+.. _commands-barman-restore-staging-wal-directory:
+
+``--staging-wal-directory``
+    A staging directory on the destination host for WAL files when performing PITR. If
+    unspecified, it uses a ``barman_wal`` directory inside the destination directory.
+
 .. only:: man
 
     Shortcuts
@@ -212,7 +274,6 @@ Parameters
         * - **last/latest**
           - Most recent available backup for the server, in chronological order.
         * - **last-full/latest-full**
-          - Most recent full backup eligible for a block-level incremental backup using the
-            ``--incremental`` option.
+          - Most recent full backup taken with methods ``rsync`` or ``postgres``.
         * - **last-failed**
           - Most recent backup that failed, in chronological order.

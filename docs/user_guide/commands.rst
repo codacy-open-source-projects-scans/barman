@@ -12,6 +12,8 @@ behavior of the sub-commands and can be used as follows:
 
 .. include:: commands/barman/barman.inc.rst
 
+.. _commands-shortcuts:
+
 Shortcuts
 ---------
 
@@ -32,8 +34,7 @@ servers:
     * - **last/latest**
       - Most recent available backup for the server, in chronological order.
     * - **last-full/latest-full**
-      - Most recent full backup eligible for a block-level incremental backup using the
-        ``--incremental`` option.
+      - Most recent full backup taken with methods ``rsync`` or ``postgres``.
     * - **last-failed**
       - Most recent backup that failed, in chronological order.
 
@@ -69,10 +70,12 @@ quickly navigate to it.
 .. include:: commands/barman/keep.inc.rst
 .. include:: commands/barman/list_backups.inc.rst
 .. include:: commands/barman/list_files.inc.rst
+.. include:: commands/barman/list_processes.inc.rst
 .. include:: commands/barman/list_servers.inc.rst
 .. include:: commands/barman/lock_directory_cleanup.inc.rst
 .. include:: commands/barman/put_wal.inc.rst
 .. include:: commands/barman/rebuild_xlogdb.inc.rst
+.. include:: commands/barman/recover.inc.rst
 .. include:: commands/barman/receive_wal.inc.rst
 .. include:: commands/barman/restore.inc.rst
 .. include:: commands/barman/replication_status.inc.rst
@@ -84,6 +87,7 @@ quickly navigate to it.
 .. include:: commands/barman/sync_backup.inc.rst
 .. include:: commands/barman/sync_info.inc.rst
 .. include:: commands/barman/sync_wals.inc.rst
+.. include:: commands/barman/terminate_process.inc.rst
 .. include:: commands/barman/verify_backup.inc.rst
 .. include:: commands/barman/verify.inc.rst
 

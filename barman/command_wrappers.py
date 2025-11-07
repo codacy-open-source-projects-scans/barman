@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -35,7 +35,11 @@ import time
 from distutils.version import LooseVersion as Version
 
 import barman.utils
-from barman.exceptions import CommandFailedException, CommandMaxRetryExceeded
+from barman.exceptions import (
+    CommandException,
+    CommandFailedException,
+    CommandMaxRetryExceeded,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -122,6 +126,7 @@ class Command(object):
         args=None,
         env_append=None,
         path=None,
+        skip_path_check=False,
         shell=False,
         check=False,
         allowed_retval=(0,),
@@ -138,6 +143,10 @@ class Command(object):
 
         If the `env_append` argument is present its content will be appended to
         the environment of every invocation.
+
+        If *skip_path_check* is ``True`` the command existence will not be checked
+        during the object construction. This is useful if the path is checked
+        earlier/later or in different ways e.g. on a remote host instead of locally.
 
         The subprocess output and error stream will be processed through
         the output and error handler, respectively defined through the
@@ -207,6 +216,7 @@ class Command(object):
         self.retry_sleep = retry_sleep
         self.retry_handler = retry_handler
         self.path = path
+        self.skip_path_check = skip_path_check
         self.ret = None
         self.out = None
         self.err = None
@@ -215,8 +225,8 @@ class Command(object):
         # If path has been provided, replace it in the environment
         if path:
             env_append["PATH"] = path
-        # Find the absolute path to the command to execute
-        if not self.shell:
+        # Find the absolute path to the command to execute if necessary
+        if not self.shell and not self.skip_path_check:
             full_path = barman.utils.which(self.cmd, self.path)
             if not full_path:
                 raise CommandFailedException("%s not in PATH" % self.cmd)
@@ -1124,14 +1134,14 @@ class PgVerifyBackup(PostgreSQLClient):
     ):
         """
         Constructor
+
         :param str data_path: backup data directory
         :param str command: the command to use
-        :param PostgreSQL connection: an object representing
-          a database connection
+        :param PostgreSQL connection: an object representing a database connection
         :param Version version: the command version
         :param str app_name: the application name to use for the connection
-        :param bool check: check if the return value is in the list of
-          allowed values of the Command obj
+        :param bool check: check if the return value is in the list of allowed values of
+            the Command obj
         :param List[str] args: additional arguments
         """
         PostgreSQLClient.__init__(
@@ -1161,6 +1171,7 @@ class PgCombineBackup(PostgreSQLClient):
         destination,
         command,
         tbs_mapping=None,
+        copy_mode=None,
         connection=None,
         version=None,
         app_name=None,
@@ -1174,6 +1185,8 @@ class PgCombineBackup(PostgreSQLClient):
         :param str destination: destination directory path
         :param str command: the command to use
         :param None|Dict[str, str] tbs_mapping: used for tablespace
+        :param None|str copy_mode: the copy mode to use, valid options are
+            `copy`, `link`, `clone` or `copy-file-range`
         :param PostgreSQL connection: an object representing
           a database connection
         :param Version version: the command version
@@ -1201,6 +1214,9 @@ class PgCombineBackup(PostgreSQLClient):
                 self.args.append(
                     "--tablespace-mapping=%s=%s" % (tbs_source, tbs_destination)
                 )
+
+        if copy_mode:
+            self.args.append("--" + copy_mode)
 
         # Manage additional args
         if args:
@@ -1272,6 +1288,117 @@ class BarmanSubProcess(object):
             **additional_arguments
         )
         _logger.debug("BarmanSubProcess: subprocess started. pid: %s", proc.pid)
+
+
+class GPG(Command):
+    """
+    Wrapper class for the Gnu Privacy Guard (GPG) command-line tool.
+
+    This class provides an interface to encrypt and decrypt data using GPG.
+
+    .. note::
+        GPG is a complete and free implementation of the OpenPGP standard as
+        defined by RFC4880.
+
+        It supports encryption, signing, and key management, and is designed for
+        easy integration with other applications.
+
+        In this class, we are only interested in encryption/decryption.
+
+    .. important::
+        `--pinentry-mode loopback` requires GPG version >= 2.1.
+
+    .. important::
+        This class expects sensitive data such as a GPG passphrase to be passed
+        as a ``bytearray``, not as a ``str``. Python strings are immutable and may
+        linger in memory, potentially exposing sensitive data. Using a ``bytearray``
+        allows the caller to explicitly zero out the passphrase after use, similar
+        to ``memset`` in C.
+
+        Example:
+            passphrase = bytearray(b"your-secret-passphrase")
+            gpg(stdin=passphrase)
+            passphrase[:] = b"\x00" * len(passphrase)
+
+    Example for decryption:
+        .. code-block:: python
+
+                >>> gpg = GPG(
+                ...     action="decrypt",
+                ...     input_filepath="file.gpg",
+                ...     output_filepath="file.decrypted"
+                ... )
+                >>> passphrase = bytearray(b"secret")
+                >>> gpg(stdin=passphrase)
+                >>> passphrase[:] = b"\x00" * len(passphrase)
+
+    Example for decryption:
+        .. code-block:: python
+
+                >>> gpg = GPG(
+                ...     action="encrypt",
+                ...     input_filepath="file.txt",
+                ...     output_filepath="file.txt.gpg",
+                ...     recipient="user@example.com"
+                ... )
+                >>> gpg()
+    """
+
+    def __init__(
+        self,
+        gpg="gpg",
+        action=None,
+        recipient=None,
+        input_filepath=None,
+        output_filepath=None,
+        **kwargs
+    ):
+        """
+        Initialize the GPG command wrapper.
+
+        :param str gpg: Path or name of the GPG executable. Defaults to ``gpg``.
+        :param str action: Action to perform: ``encrypt`` or ``decrypt``.
+        :param str recipient: Key identifier for encryption (required if *action* is
+            ``encrypt``).
+        :param str input_filepath: File to encrypt or decrypt.
+        :param str output_filepath: Output file path for encrypted/decrypted data.
+        :param kwargs: Additional keyword arguments passed to the base class:`Command`
+            class.
+
+        :raises CommandException: If ``encrypt`` is specified without a recipient.
+        :raises ValueError: If *action* is invalid.
+        """
+        # Automatically answer "yes" to most prompts.
+        # Use batch mode to suppress interactive prompts.
+        # Set the pinentry mode to loopback for non-interactive passphrase entry.
+        options = ["--yes", "--batch", "--pinentry-mode", "loopback"]
+
+        if action == "decrypt":
+            # Provide the passphrase via standard input (file descriptor 0) for
+            # decryption.
+            options += ["--passphrase-fd", "0", "--decrypt"]
+        elif action == "encrypt":
+            if not recipient:
+                raise CommandException(
+                    "A recipient must be specified to encrypt the backup. Please "
+                    "provide a valid recipient."
+                )
+            # Set compression level to 0 (no compression) and specify recipient for
+            # encryption.
+            options += ["--compress-level", "0", "--recipient", recipient, "--encrypt"]
+        else:
+            raise ValueError(
+                "Invalid action: '%s'. Expected 'encrypt' or 'decrypt'." % action
+            )
+        if output_filepath:
+            # Specify output file path for the encrypted/decrypted file.
+            options += ["--output", output_filepath]
+        # Specify the file to encrypt/decrypt.
+        if input_filepath:
+            options += [input_filepath]
+        # Ensure that the "check" argument is set to True by default.
+        kwargs.setdefault("check", True)
+        Command.__init__(self, gpg, args=options, **kwargs)
 
 
 def shell_quote(arg):

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2014-2023
+# © Copyright EnterpriseDB UK Limited 2014-2025
 #
 # This file is part of Barman.
 #
@@ -38,6 +38,7 @@ from barman.cli import (
     OrderedHelpFormatter,
     argument,
     backup,
+    check,
     check_target_action,
     check_wal_archive,
     command,
@@ -48,6 +49,8 @@ from barman.cli import (
     get_server,
     get_server_list,
     keep,
+    list_files,
+    list_processes,
     manage_model_command,
     manage_server_command,
     parse_backup_id,
@@ -55,8 +58,9 @@ from barman.cli import (
     replication_status,
     restore,
     show_servers,
+    terminate_process,
 )
-from barman.exceptions import WalArchiveContentError
+from barman.exceptions import BadXlogSegmentName, WalArchiveContentError
 from barman.infofile import BackupInfo
 from barman.server import Server
 
@@ -557,6 +561,8 @@ class TestCli(object):
         args.target_lsn = None
         args.recovery_staging_path = None
         args.local_staging_path = None
+        args.staging_path = None
+        args.staging_location = None
         return args
 
     @patch("barman.cli.parse_backup_id")
@@ -719,6 +725,8 @@ class TestCli(object):
         # GIVEN a backup
         parse_backup_id_mock.return_value = mock_backup_info
         mock_backup_info.is_incremental = False
+        # AND the backup is not encrypted
+        mock_backup_info.encryption = None
         # AND a configuration with the specified recovery options
         config = build_config_from_dicts(
             global_conf={"recovery_options": recovery_options}
@@ -755,75 +763,57 @@ class TestCli(object):
 
     @pytest.mark.parametrize(
         (
-            "backup_is_compressed",
-            "recovery_staging_path_arg",
-            "recovery_staging_path_config",
-            "expected_recovery_staging_path",
-            "should_error",
-            "error_substring",
+            "recovery_options",
+            "delta_restore_arg",
+            "no_delta_restore_arg",
+            "expect_delta_restore",
         ),
         [
-            # If a backup is not compressed then recovery_staging_path is ignored
-            (False, None, None, None, False, None),
-            # If a backup is compressed and no recovery_staging_path is provided
-            # we expect an error
-            (
-                True,
-                None,
-                None,
-                None,
-                True,
-                "backup is compressed with gzip compression but no recovery staging "
-                "path is provided.",
-            ),
-            # If a backup is compressed and an argument is provided then it should
-            # be set in the config
-            (True, "/from/arg", None, "/from/arg", False, None),
-            # If a backup is compressed and a bad argument is provided then it should
-            # error
-            (
-                True,
-                "from/arg",
-                None,
-                None,
-                True,
-                "Cannot parse recovery staging path: Invalid value : 'from/arg' (must "
-                "be an absolute path)",
-            ),
-            # If a backup is compressed and a config value is set then it should
-            # be set in the config
-            (True, None, "/from/conf", "/from/conf", False, None),
-            # If a backup is compressed and both arg and config are set then arg
-            # takes precedence
-            (True, "/from/arg", "/from/conf", "/from/arg", False, None),
+            # WHEN there are no recovery options set
+            # AND neither --delta-restore nor --no-delta-restore are used
+            # THEN no get_wal option is expected
+            ("", False, False, False),
+            # OR --delta-restore is not used and --no-delta-restore is used
+            # THEN no get_wal option is expected
+            ("", False, True, False),
+            # OR --delta-restore is used and --no-delta-restore is not used
+            # THEN the get_wal option is expected
+            ("", True, False, True),
+            # WHEN --delta-restore is set in recovery options
+            # AND neither --delta-restore nor --no-delta-restore are used
+            # THEN the get_wal option is expected
+            ("delta-restore", False, False, True),
+            # OR --delta-restore is not used and --no-delta-restore is used
+            # THEN no get_wal option is expected
+            ("delta-restore", False, True, False),
+            # OR --delta-restore is used and --no-delta-restore is not used
+            # THEN the get_wal option is expected
+            ("delta-restore", True, False, True),
         ],
     )
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_restore_recovery_staging_path(
+    def test_restore_delta_restore(
         self,
         get_server_mock,
         parse_backup_id_mock,
         mock_backup_info,
         mock_restore_args,
-        backup_is_compressed,
-        recovery_staging_path_arg,
-        recovery_staging_path_config,
-        expected_recovery_staging_path,
-        should_error,
-        error_substring,
+        recovery_options,
+        delta_restore_arg,
+        no_delta_restore_arg,
+        expect_delta_restore,
         monkeypatch,
         capsys,
     ):
         # GIVEN a backup
         parse_backup_id_mock.return_value = mock_backup_info
-        # AND the backup is not incremental
         mock_backup_info.is_incremental = False
-        # AND the backup has the specified compression
-        mock_backup_info.compression = backup_is_compressed and "gzip" or None
-        # AND a configuration with the specified recovery_staging_path
+        # AND the backup is not encrypted
+        mock_backup_info.encryption = None
+        # AND a configuration with the specified recovery options
         config = build_config_from_dicts(
-            global_conf={"recovery_staging_path": recovery_staging_path_config},
+            global_conf={"recovery_options": recovery_options}
         )
         server = config.get_server("main")
         get_server_mock.return_value.config = server
@@ -832,120 +822,310 @@ class TestCli(object):
             "__config__",
             (config,),
         )
-        # WHEN recover is called with the specified --recovery-staging-path
-        mock_restore_args.recovery_staging_path = recovery_staging_path_arg
+
+        # WHEN the specified --delta-restore / --no-delta-restore combinations are used
+        if delta_restore_arg:
+            mock_restore_args.delta_restore = True
+        elif no_delta_restore_arg:
+            mock_restore_args.delta_restore = False
+        else:
+            del mock_restore_args.delta_restore
 
         # WITH a barman recover command
         with pytest.raises(SystemExit):
             restore(mock_restore_args)
 
-        # THEN if we expected an error the error was observed
-        _, err = capsys.readouterr()
-        errors = [msg for msg in err.split("\n") if msg.startswith("ERROR: ")]
-        if should_error:
-            assert len(err) > 0
-            assert any([error_substring in msg for msg in errors])
+        # THEN then the presence of the delta_restore recovery option matches expectations
+        if expect_delta_restore:
+            assert (
+                barman.config.RecoveryOptions.DELTA_RESTORE in server.recovery_options
+            )
         else:
-            assert len(errors) == 0
-            # AND if we expected success, the server config recovery staging
-            # path matches expectations
-            assert server.recovery_staging_path == expected_recovery_staging_path
+            assert (
+                barman.config.RecoveryOptions.DELTA_RESTORE
+                not in server.recovery_options
+            )
+
+        # AND there are no errors
+        _out, err = capsys.readouterr()
+        assert "" == err
+
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_restore_no_delta_restore_will_error_out(
+        self,
+        get_server_mock,
+        parse_backup_id_mock,
+        mock_backup_info,
+        mock_restore_args,
+        monkeypatch,
+        capsys,
+    ):
+        # GIVEN a backup
+        parse_backup_id_mock.return_value = mock_backup_info
+        # AND the backup is not encrypted
+        mock_backup_info.encryption = None
+        # AND a configuration with the specified recovery options
+        config = build_config_from_dicts(
+            global_conf={"recovery_options": "delta-restore"}
+        )
+        server = config.get_server("main")
+        get_server_mock.return_value.config = server
+        monkeypatch.setattr(
+            barman,
+            "__config__",
+            (config,),
+        )
+        # 1. Local restore with incremental backup
+        mock_backup_info.is_incremental = True
+        mock_restore_args.remote_ssh_command = False
+        # WITH a barman recover command
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+
+        # AND there are no errors
+        _out, err = capsys.readouterr()
+        assert (
+            "Cannot restore a backup locally with delta mode when the backup is not "
+            "plain." in err
+        )
+
+        # 2. Local restore with compressed backup
+        mock_backup_info.is_incremental = False
+        mock_backup_info.compression = "gzip"
+        # WITH a barman recover command
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+
+        # AND there are no errors
+        _out, err = capsys.readouterr()
+        assert (
+            "Cannot restore a backup locally with delta mode when the backup is not "
+            "plain." in err
+        )
+
+        # 3. Local restore with encrypted backup
+        mock_backup_info.is_incremental = False
+        mock_backup_info.compression = False
+        mock_backup_info.encryption = "gpg"
+        # WITH a barman recover command
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+
+        # AND there are no errors
+        _out, err = capsys.readouterr()
+        assert (
+            "Cannot restore a backup locally with delta mode when the backup is not "
+            "plain." in err
+        )
+
+        # 4. Remote restore with any backup and staging_location="remote"
+        mock_backup_info.is_incremental = False
+        mock_backup_info.compression = False
+        mock_backup_info.encryption = "gpg"
+        mock_restore_args.remote_ssh_command = "ssh pghost"
+        mock_restore_args.staging_location = "remote"
+        # WITH a barman recover command
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+
+        # AND there are no errors
+        _out, err = capsys.readouterr()
+        assert (
+            "Cannot restore a backup remotely with delta mode when "
+            "'staging_location=remote" in err
+        )
+
+    @patch("barman.cli.get_server")
+    @patch("barman.cli.parse_staging_path")
+    def test_restore_staging_path(
+        self, mock_parser, mock_get_server, mock_restore_args, monkeypatch, capsys
+    ):
+        """
+        Test the restore CLI function with a staging path.
+        """
+        # GIVEN a server with a configuration
+        config = build_config_from_dicts()
+        server = config.get_server("main")
+        mock_get_server.return_value.config = server
+        monkeypatch.setattr(
+            barman,
+            "__config__",
+            (config,),
+        )
+
+        mock_restore_args.staging_path = "/some/staging/path"
+
+        # Case 1: a parsing error occurs
+        mock_parser.side_effect = ValueError("Parse error")
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN an error is raised and logged
+        _, err = capsys.readouterr()
+        assert "ERROR: Cannot parse staging path: Parse error" in err
+
+        # Case 2: a valid staging path is provided
+        mock_parser.side_effect = None
+        mock_parser.return_value = "/some/staging/path"
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN the server's staging path is set correctly
+        assert server.staging_path == "/some/staging/path"
+
+    @patch("barman.cli.get_server")
+    def test_restore_staging_location(
+        self,
+        mock_get_server,
+        mock_restore_args,
+        monkeypatch,
+        capsys,
+    ):
+        """
+        Test the restore CLI function with a staging location.
+        """
+        # GIVEN a server with a configuration
+        config = build_config_from_dicts()
+        server = config.get_server("main")
+        mock_get_server.return_value.config = server
+        monkeypatch.setattr(
+            barman,
+            "__config__",
+            (config,),
+        )
+
+        # Case 1: When remote-ssh-command is not set
+        mock_restore_args.staging_location = "remote"
+        mock_restore_args.remote_ssh_command = None
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN an error is raised and logged
+        _, err = capsys.readouterr()
+        assert (
+            "ERROR: --staging-location as remote requires "
+            "--remote-ssh-command to be set"
+        ) in err
+
+        # Case 2: When remote-ssh-command is set
+        mock_restore_args.remote_ssh_command = "ssh postgres@pg"
+        with pytest.raises(SystemExit):
+            restore(mock_restore_args)
+        # THEN the server's staging path is set correctly
+        assert server.staging_location == mock_restore_args.staging_location
 
     @pytest.mark.parametrize(
         (
-            "backup_is_incremental",
-            "local_staging_path_arg",
-            "local_staging_path_config",
-            "expected_local_staging_path",
-            "should_error",
-            "error_substring",
+            "staging_path, recovery_staging_path, local_staging_path, is_incremental, compression, encryption, should_fail, should_warn"
         ),
         [
-            # If a backup is not incremental then local_staging_path is ignored
-            (False, None, None, None, False, None),
-            # If a backup is incremental and no local_staging_path is provided
-            # we expect an error
+            # Case 1: compressed backup, no staging_path, no recovery_staging_path -> should not fail
+            (None, None, None, False, "gzip", None, False, False),
+            # Case 2: compressed backup, no staging_path, recovery_staging_path set -> should warn, not fail
             (
+                None,
+                "/path/to/some/recovery/staging",
+                None,
+                False,
+                "gzip",
+                None,
+                False,
                 True,
-                None,
-                None,
-                None,
-                True,
-                "backup will be combined with pg_combinebackup in the barman host but "
-                "no local staging path is provided.",
             ),
-            # If a backup is incremental and an argument is provided then it should
-            # be set in the config
-            (True, "/from/arg", None, "/from/arg", False, None),
-            # If a backup is incremental and a bad argument is provided then it should
-            # error
+            # Case 3: incremental backup, no staging_path, no local_staging_path -> should not fail
+            (None, None, None, True, None, None, False, False),
+            # Case 4: incremental backup, no staging_path, local_staging_path set -> should warn, not fail
+            (None, None, "/path/to/some/local/staging", True, None, None, False, True),
+            # Case 5: encrypted backup, no staging_path, no local_staging_path -> should fail
+            (None, None, None, False, None, "gpg", False, False),
+            # Case 6: encrypted backup, no staging_path, local_staging_path set -> should warn, not fail
             (
-                True,
-                "from/arg",
                 None,
                 None,
+                "/path/to/some/local/staging",
+                False,
+                None,
+                "gpg",
+                False,
                 True,
-                "Cannot parse local staging path: Invalid value : 'from/arg' (must "
-                "be an absolute path)",
             ),
-            # If a backup is incremental and a config value is set then it should
-            # be set in the config
-            (True, None, "/from/conf", "/from/conf", False, None),
-            # If a backup is incremental and both arg and config are set then arg
-            # takes precedence
-            (True, "/from/arg", "/from/conf", "/from/arg", False, None),
+            # Case 7: compressed backup, staging_path set -> should not fail, no warning
+            ("some/staging/path", None, None, False, "gzip", None, False, False),
+            # Case 8: incremental backup, staging_path set -> should not fail, no warning
+            ("some/staging/path", None, None, True, None, None, False, False),
+            # Case 9: encrypted backup, staging_path set -> should not fail, no warning
+            ("some/staging/path", None, None, False, None, "gpg", False, False),
         ],
     )
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
-    def test_restore_local_staging_path(
+    def test_restore_staging_path_supports_deprecated_options(
         self,
-        get_server_mock,
+        mock_get_server,
         parse_backup_id_mock,
-        mock_backup_info,
         mock_restore_args,
-        backup_is_incremental,
-        local_staging_path_arg,
-        local_staging_path_config,
-        expected_local_staging_path,
-        should_error,
-        error_substring,
+        mock_backup_info,
         monkeypatch,
         capsys,
+        staging_path,
+        recovery_staging_path,
+        local_staging_path,
+        is_incremental,
+        compression,
+        encryption,
+        should_fail,
+        should_warn,
     ):
-        # GIVEN a backup
-        parse_backup_id_mock.return_value = mock_backup_info
-        # AND the backup is incremental
-        mock_backup_info.is_incremental = backup_is_incremental
-        # AND a configuration with the specified local_staging_path
-        config = build_config_from_dicts(
-            global_conf={"local_staging_path": local_staging_path_config},
-        )
+        """
+        Test the restore CLI function considers and supports the deprecated
+        staging options when validating.
+        """
+        # GIVEN a server with a configuration
+        config = build_config_from_dicts()
         server = config.get_server("main")
-        get_server_mock.return_value.config = server
+        mock_get_server.return_value.config = server
         monkeypatch.setattr(
             barman,
             "__config__",
             (config,),
         )
-        # WHEN recover is called with the specified --local-staging-path
-        mock_restore_args.local_staging_path = local_staging_path_arg
 
-        # WITH a barman recover command
+        # Set the staging path options
+        mock_restore_args.staging_path = staging_path
+        mock_restore_args.recovery_staging_path = recovery_staging_path
+        mock_restore_args.local_staging_path = local_staging_path
+
+        # Set relevant backup_info attributes
+        parse_backup_id_mock.return_value = mock_backup_info
+        mock_backup_info.is_incremental = is_incremental
+        mock_backup_info.compression = compression
+        mock_backup_info.encryption = encryption
+        mock_backup_info.server = server
+
+        # IF it should fail THEN an error is raised and logged
+        if should_fail:
+            with pytest.raises(SystemExit):
+                restore(mock_restore_args)
+            _, err = capsys.readouterr()
+            assert "ERROR: Cannot restore from backup" in err
+            return
+
+        # ELSE it runs successfully
         with pytest.raises(SystemExit):
             restore(mock_restore_args)
 
-        # THEN if we expected an error the error was observed
-        _, err = capsys.readouterr()
-        errors = [msg for msg in err.split("\n") if msg.startswith("ERROR: ")]
-        if should_error:
-            assert len(err) > 0
-            assert any([error_substring in msg for msg in errors])
+        # AND IF it should warn THEN a warning is logged about deprecated options
+        if should_warn:
+            _, err = capsys.readouterr()
+            assert (
+                "WARNING: recovery_staging_path and local_staging_path, and their equivalent CLI "
+                "options --recovery-staging-path and --local-staging-path, are "
+                "deprecated and will be removed in a future release. "
+                "Please use staging_path and staging_location, and their equivalent CLI "
+                "options --staging-path and --staging-location, instead." in err
+            )
+        # ELSE no warning is logged
         else:
-            assert len(errors) == 0
-            # AND if we expected success, the server config recovery staging
-            # path matches expectations
-            assert server.local_staging_path == expected_local_staging_path
+            _, err = capsys.readouterr()
+            assert "WARNING" not in err
 
     @pytest.mark.parametrize(
         ("status", "should_error"),
@@ -1191,6 +1371,146 @@ class TestCli(object):
             # THEN the config value is updated
             assert getattr(config, arg) == final_value
 
+    @pytest.mark.parametrize(
+        ("target_option", "target", "should_error"),
+        (  # Test allowed target_options
+            ("target_time", "2025-01-07 12:01:00", False),
+            ("target_lsn", "3/5F000000", False),
+            (None, None, False),
+            ("target_immediate", True, True),
+            ("target_xid", "12345", True),
+            ("target_name", "whatever_name", True),
+        ),
+    )
+    @patch("barman.cli.get_server")
+    def test_restore_with_backup_id_auto(
+        self,
+        mock_get_server,
+        target_option,
+        target,
+        should_error,
+        mock_restore_args,
+        capsys,
+    ):
+        """
+        Test the function restore will have the correct behaviour when restoring with
+        "auto" as the backup_id. The sequence of calls are tested and possible errors
+        and messages.
+        """
+        server = build_mocked_server(name="test_server")
+        mock_get_server.return_value = server
+        # Testing mutual exclusiveness of target options
+        args = mock_restore_args
+        setattr(args, "backup_id", "auto")
+        setattr(args, target_option, target) if target_option else None
+        with pytest.raises(SystemExit):
+            restore(args)
+
+        if should_error:
+            _, err = capsys.readouterr()
+            error_msg = (
+                "For PITR without a backup_id, the only possible recovery targets "
+                "are target_time and target_lsn. '%s' recovery target is not "
+                "allowed without a backup_id." % target_option
+            )
+            assert error_msg in err
+        else:
+            if target_option is None:
+                mock = mock_get_server.return_value.get_last_backup_id
+                options = []
+            elif target_option == "target_time":
+                mock = (
+                    mock_get_server.return_value.get_closest_backup_id_from_target_time
+                )
+                options = [target, None]
+            elif target_option == "target_lsn":
+                mock = (
+                    mock_get_server.return_value.get_closest_backup_id_from_target_lsn
+                )
+                options = [target, None]
+            mock.assert_called_once_with(*options)
+            backup_id = mock.return_value
+            mock_get_server.return_value.get_backup.assert_called_once_with(backup_id)
+
+    @pytest.mark.parametrize(
+        ("target_option", "target", "target_tli"),
+        (  # Test allowed target_options
+            ("target_time", "2025-01-07 12:01:00", 1),
+            ("target_time", "2025-01-07 12:01:00", None),
+            ("target_lsn", "3/5F000000", 1),
+            ("target_lsn", "3/5F000000", None),
+            (None, None, 1),
+            (None, None, None),
+        ),
+    )
+    @patch("barman.cli.parse_target_tli")
+    @patch("barman.cli.get_server")
+    def test_restore_with_backup_id_auto_with_target_tli(
+        self,
+        mock_get_server,
+        mock_parse_target_tli,
+        target_option,
+        target,
+        target_tli,
+        mock_restore_args,
+    ):
+        """
+        Test the function restore will have the correct behaviour when restoring with
+        "auto" as the backup_id. The sequence of calls are tested and possible errors
+        and messages.
+        """
+        server = build_mocked_server(name="test_server")
+        mock_get_server.return_value = server
+        # Testing mutual exclusiveness of target options
+        args = mock_restore_args
+        setattr(args, "backup_id", "auto")
+        setattr(args, "target_tli", target_tli)
+        setattr(args, target_option, target) if target_option else None
+        mock_parse_target_tli.return_value = target_tli
+        with pytest.raises(SystemExit):
+            restore(args)
+
+        if target_option is None:
+            if target_tli is None:
+                mock = mock_get_server.return_value.get_last_backup_id
+                options = []
+            else:
+                mock = mock_get_server.return_value.get_last_backup_id_from_target_tli
+                options = [target_tli]
+        elif target_option == "target_time":
+            mock = mock_get_server.return_value.get_closest_backup_id_from_target_time
+            options = [target, target_tli]
+        elif target_option == "target_lsn":
+            mock = mock_get_server.return_value.get_closest_backup_id_from_target_lsn
+            options = [target, target_tli]
+        mock.assert_called_once_with(*options)
+        backup_id = mock.return_value
+        mock_get_server.return_value.get_backup.assert_called_once_with(backup_id)
+
+    @patch("barman.cli.get_server")
+    def test_restore_with_backup_id_auto_no_candidate_backup_found(
+        self, mock_get_server, mock_restore_args, capsys
+    ):
+        """
+        Test the function restore will have the correct behaviour when restoring with
+        "auto" as the backup_id and no suitable backup_id is found.
+        """
+        server = build_mocked_server(name="test_server")
+        mock_get_server.return_value = server
+        args = mock_restore_args
+        target_option = "target_lsn"
+        target = "3/5F000000"
+        setattr(args, "backup_id", "auto")
+        setattr(args, target_option, target) if target_option else None
+        mock_get_server.return_value.get_closest_backup_id_from_target_lsn.return_value = (
+            None
+        )
+        with pytest.raises(SystemExit):
+            restore(args)
+        _, err = capsys.readouterr()
+        error_msg = "Cannot find any candidate backup for recovery."
+        assert error_msg in err
+
     def test_check_target_action(self):
         # The following ones must work
         assert None is check_target_action(None)
@@ -1362,15 +1682,24 @@ class TestCli(object):
         # GIVEN a server with a list of backups
         server = build_real_server()
         backup_infos = {
-            "20221110T120000": Mock(backup_id="20221110T120000", status="DONE"),
-            "20221109T120000": Mock(backup_id="20221109T120000", status="DONE"),
-            "20221108T120000": Mock(backup_id="20221108T120000", status="FAILED"),
+            "20221110T120000": Mock(
+                backup_id="20221110T120000", status="DONE", backup_type="full"
+            ),
+            "20221109T120000": Mock(
+                backup_id="20221109T120000", status="DONE", backup_type="full"
+            ),
+            "20221108T120000": Mock(
+                backup_id="20221108T120000", status="FAILED", backup_type="full"
+            ),
             "20221107T120000": Mock(
                 backup_id="20221107T120000",
                 backup_name="named backup",
                 status="DONE",
+                backup_type="full",
             ),
-            "20221106T120000": Mock(backup_id="20221106T120000", status="DONE"),
+            "20221106T120000": Mock(
+                backup_id="20221106T120000", status="DONE", backup_type="full"
+            ),
         }
         server.backup_manager._backup_cache = backup_infos
 
@@ -1413,6 +1742,8 @@ class TestCli(object):
             ({}, "oldest"),
             ({}, "first"),
             ({}, "last-failed"),
+            ({}, "last-full"),
+            ({}, "latest-full"),
         ),
     )
     @patch("barman.backup.BackupManager._load_backup_cache")
@@ -1433,6 +1764,35 @@ class TestCli(object):
         # AND the expected error is returned
         _out, err = capsys.readouterr()
         assert "Unknown backup '%s' for server 'main'" % backup_id in err
+
+    @pytest.mark.parametrize(
+        ("backup_id", "expected_backup_id"),
+        (
+            ("latest-full", "20221110T120000"),
+            ("last-full", "20221110T120000"),
+        ),
+    )
+    def test_parse_backup_id_shortcut_full(
+        self,
+        backup_id,
+        expected_backup_id,
+    ):
+        server = build_mocked_server()
+        backup_infos = {
+            "20221110T120000": Mock(backup_id="20221110T120000", status="DONE"),
+            "20221109T120000": Mock(backup_id="20221109T120000", status="DONE"),
+            "20221106T120000": Mock(backup_id="20221106T120000", status="DONE"),
+        }
+        server.backup_manager._backup_cache = backup_infos
+
+        args = Mock(backup_id=backup_id)
+        server.get_backup.return_value = backup_infos[expected_backup_id]
+        backup_info = parse_backup_id(server, args)
+        server.get_last_full_backup_id.assert_called_once_with()
+        server.get_backup.assert_called_once_with(
+            server.get_last_full_backup_id.return_value
+        )
+        assert backup_info is backup_infos[expected_backup_id]
 
     @patch("barman.server.Server.replication_status")
     def test_replication_status(self, replication_status_mock, monkeypatch, capsys):
@@ -1496,6 +1856,220 @@ class TestCli(object):
             skip_passive=True,
             wal_streaming=wal_streaming_arg,
         )
+
+    @patch("barman.cli.get_server")
+    @patch("barman.cli.ProcessManager")
+    @patch("barman.cli.output")
+    def test_list_processes_empty(
+        self, mock_output, mock_process_manager, mock_get_server
+    ):
+        """
+        Verify that the `list-processes` command correctly handles the case
+        where there are no active subprocesses.
+        """
+        # Prepare a dummy server with a config that has a name attribute.
+        dummy_server = Mock()
+        dummy_server.config.name = "test_server"
+        mock_get_server.return_value = dummy_server
+
+        # Simulate an empty processes list
+        instance_proc_mgr = mock_process_manager.return_value
+        instance_proc_mgr.list.return_value = []
+
+        # Call the command with args
+        args = Mock()
+        args.server_name = "test_server"
+        list_processes(args)
+
+        # Verify that the output.result was called correctly and closed
+        mock_output.result.assert_called_once_with("list_processes", [], "test_server")
+        mock_output.close_and_exit.assert_called_once()
+
+    @patch("barman.cli.get_server")
+    @patch("barman.cli.ProcessManager")
+    @patch("barman.cli.output")
+    def test_list_processes_non_empty(
+        self, mock_output, mock_process_manager, mock_get_server
+    ):
+        """
+        Verify that the `list-processes` command correctly handles a non-empty
+        list of active subprocesses.
+        """
+        # Prepare a dummy server with name attribute in config
+        dummy_server = Mock()
+        dummy_server.config.name = "test_server"
+        mock_get_server.return_value = dummy_server
+
+        # Simulate a non-empty processes list
+        processes_list = [
+            {"PID": "1234", "Process": "backup"},
+            {"PID": "5678", "Process": "restore"},
+        ]
+        instance_proc_mgr = mock_process_manager.return_value
+        instance_proc_mgr.list.return_value = processes_list
+
+        # Call the command with args
+        args = Mock()
+        args.server_name = "test_server"
+        list_processes(args)
+
+        # Verify that the output.result was called correctly and closed
+        mock_output.result.assert_called_once_with(
+            "list_processes", processes_list, "test_server"
+        )
+        mock_output.close_and_exit.assert_called_once()
+
+    @patch("barman.cli.get_server")
+    @patch("barman.cli.output")
+    def test_terminate_process(self, mock_output, mock_get_server):
+        """
+        Test that the terminate_process command performs the expected
+        actions.
+        """
+        args = Mock()
+        args.server_name = "test_server"
+        args.task = "backup"
+
+        dummy_server = Mock()
+        dummy_server.config.name = "test_server"
+        dummy_server.kill = MagicMock(return_value=True)
+        mock_get_server.return_value = dummy_server
+
+        terminate_process(args)
+
+        dummy_server.kill.assert_called_once_with(args.task)
+        mock_output.close_and_exit.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "arg_timeout, config_timeout, expected_timeout",
+        [(None, None, 30), (None, 300, 300), (600, 300, 600)],
+    )
+    @patch("barman.output.close_and_exit")
+    @patch("barman.cli.get_server_list")
+    def test_backup_check_timeout_cli_arg_overrides_config_option(
+        self,
+        mock_get_server_list,
+        mock_close_and_exit,
+        arg_timeout,
+        config_timeout,
+        expected_timeout,
+    ):
+        """
+        Verify the check_timeout from args overrides check_timeout from configuration
+        option when running a backup command.
+        """
+        config = {"main_conf": {"check_timeout": config_timeout}}
+        server = build_real_server(**config if config_timeout is not None else {})
+
+        mock_server_list = {"main": server}
+        mock_get_server_list.return_value = mock_server_list
+        mock_close_and_exit.return_value = None
+
+        args = Mock()
+        args.sever_name = "main"
+        args.check_timeout = arg_timeout
+        args.backup_id = "test_backup"
+        backup(args)
+        assert server.config.check_timeout == expected_timeout
+
+    @pytest.mark.parametrize(
+        "arg_timeout, config_timeout, expected_timeout",
+        [(None, None, 30), (None, 300, 300), (600, 300, 600)],
+    )
+    @patch("barman.cli.output")
+    @patch("barman.cli.get_server_list")
+    def test_check_check_timeout_cli_arg_overrides_config_option(
+        self,
+        mock_get_server_list,
+        mock_output,
+        arg_timeout,
+        config_timeout,
+        expected_timeout,
+    ):
+        """
+        Verify the check_timeout from args overrides check_timeout from configuration
+        option when running a backup command.
+        """
+        config = {"main_conf": {"check_timeout": config_timeout}}
+        server = build_mocked_server(**config if config_timeout is not None else {})
+        server.config.active = True
+        server.config.active = False
+        mock_server_list = {"main": server}
+        mock_get_server_list.return_value = mock_server_list
+
+        args = Mock()
+        args.sever_name = "main"
+        args.check_timeout = arg_timeout
+        args.backup_id = "test_backup"
+        args.nagios = False  # This has to be assigned to `False`, otherwise this is a
+        # leaky tests. the `output.set_output_writer` uses a global
+        # variable that will impact other tests.
+        check(args)
+        assert server.config.check_timeout == expected_timeout
+        server.check.assert_called_once_with()
+        mock_output.init.assert_called_once_with("check", "main", False, False)
+        mock_output.close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    @patch("barman.cli.output")
+    def test_list_files(
+        self,
+        mock_output,
+        mock_get_server,
+        mock_parse_backup,
+    ):
+        """
+        Test that `list_files` yields files under the backup directory for
+        each target and empty dirs when requested.
+        """
+        args = Mock()
+        args.sever_name = "test_server"
+        args.backup_id = "test_backup_id"
+        args.target = "data"
+        args.list_empty_directories = False
+        dummy_server = Mock()
+        dummy_server.config.name = "test_server"
+        mock_get_server.return_value = dummy_server
+
+        mock_parse_backup.return_value.backup_id = "test_backup_id"
+
+        mock_parse_backup.return_value.get_directory_entries.return_value = [
+            "non-empty_dir/file.txt"
+        ]
+
+        list_files(args)
+        mock_output.info.assert_called_once_with("non-empty_dir/file.txt", log=False)
+        mock_parse_backup.return_value.get_directory_entries.assert_called_once_with(
+            "data", empty_dirs=False
+        )
+
+    @patch("barman.cli.parse_backup_id")
+    @patch("barman.cli.get_server")
+    def test_list_files_bad_xlog_segment_name(
+        self, mock_get_server, mock_parse_backup_id, capsys
+    ):
+        """
+        Test list_files handles BadXlogSegmentName exception.
+        """
+        mock_server = Mock()
+        mock_server.config.name = "main"
+        mock_backup_info = Mock()
+        mock_backup_info.get_directory_entries.side_effect = BadXlogSegmentName(
+            "badseg"
+        )
+        mock_parse_backup_id.return_value = mock_backup_info
+        mock_get_server.return_value = mock_server
+        args = Mock()
+        args.server_name = "main"
+        args.backup_id = "20190101T000000"
+        args.target = "standalone"
+        args.list_empty_directories = False
+        with pytest.raises(SystemExit):
+            list_files(args)
+        out, err = capsys.readouterr()
+        assert "invalid xlog segment name" in err
+        assert 'Please run "barman rebuild-xlogdb main"' in err
 
 
 class TestKeepCli(object):

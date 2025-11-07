@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # Client Utilities for Barman, Backup and Recovery Manager for PostgreSQL
 #
@@ -22,9 +22,11 @@ import mock
 import pytest
 
 from barman.clients import cloud_backup
+from barman.exceptions import ConfigurationException
 
 EXAMPLE_BACKUP_DIR = "/path/to/backup"
 EXAMPLE_BACKUP_ID = "20210707T132804"
+EXAMPLE_BACKUP_INFO_PATH = "/path/to/backup_info"
 
 
 @mock.patch("barman.clients.cloud_backup.tempfile")
@@ -439,6 +441,75 @@ class TestCloudBackup(object):
             **expected_cloud_interface_kwargs
         )
 
+    def test__validate_config(
+        self,
+        _rmtree_mock,
+        _tempfile_mock,
+    ):
+        from types import SimpleNamespace
+
+        config_dict = {
+            "snapshot_disks": "any",
+            "snapshot_instance": "any",
+            "compression": "any",
+        }
+        config = SimpleNamespace(**config_dict)
+        # Test snapshot_backup + compression
+        with pytest.raises(ConfigurationException) as excinfo:
+            cloud_backup._validate_config(config)
+        assert "Compression options cannot be used with snapshot backups" in str(
+            excinfo.value
+        )
+        # Test aws_snapshot_lock_mode + aws_snapshot_lock_cool_off_period
+        config_dict = {
+            "aws_snapshot_lock_mode": "governance",
+            "aws_snapshot_lock_cool_off_period": "any",
+        }
+
+        config = SimpleNamespace(**config_dict)
+        with pytest.raises(ConfigurationException) as excinfo:
+            cloud_backup._validate_config(config)
+        assert (
+            "'aws_snapshot_lock_mode' = 'governance' cannot be used with "
+            "'aws_snapshot_lock_cool_off_period'" in str(excinfo.value)
+        )
+        # Max number of tags
+        config_dict = {
+            "tags": [("a", "b")] * 11,
+        }
+        config = SimpleNamespace(**config_dict)
+        with pytest.raises(ValueError) as excinfo:
+            cloud_backup._validate_config(config)
+        assert (
+            "Maximum number of tags per object exceeded. S3 allows no more than 10 "
+            "tags per object." in str(excinfo.value)
+        )
+        # Duplicate tag keys
+        config_dict = {
+            "tags": [("a", "b")] * 2,
+        }
+
+        with pytest.raises(ValueError) as excinfo:
+            cloud_backup._validate_config(config)
+        assert (
+            "Maximum number of tags per object exceeded. S3 allows no more than 10 "
+            "tags per object." in str(excinfo.value)
+        )
+
+    def test_tag_and_tags_are_mutually_exclusive(
+        self, _rmtree_mock, _tempfile_mock, capsys
+    ):
+        # WHEN barman-cloud-backup is run with a subset of snapshot arguments
+        # THEN a SystemExit occurs
+        with pytest.raises(SystemExit):
+            cloud_backup.main(
+                ["cloud_storage_url", "test_server"]
+                + ["--tag", "k1,v1", "--tags", "k1,v1", "k2,v2"]
+            )
+
+        captured = capsys.readouterr()
+        assert "argument --tags: not allowed with argument --tag" in captured.err
+
 
 @mock.patch("barman.clients.cloud_backup.tempfile")
 @mock.patch("barman.clients.cloud_backup.rmtree")
@@ -485,6 +556,7 @@ class TestCloudBackupHookScript(object):
             "BARMAN_PHASE": "post",
             "BARMAN_BACKUP_DIR": EXAMPLE_BACKUP_DIR,
             "BARMAN_BACKUP_ID": EXAMPLE_BACKUP_ID,
+            "BARMAN_BACKUP_INFO_PATH": EXAMPLE_BACKUP_INFO_PATH,
             "BARMAN_STATUS": "DONE",
         },
     )
@@ -513,6 +585,7 @@ class TestCloudBackupHookScript(object):
             cloud_interface=cloud_interface_mock.return_value,
             backup_dir=EXAMPLE_BACKUP_DIR,
             backup_id=EXAMPLE_BACKUP_ID,
+            backup_info_path=EXAMPLE_BACKUP_INFO_PATH,
         )
         uploader.backup.assert_called_once()
 
@@ -524,6 +597,7 @@ class TestCloudBackupHookScript(object):
             "BARMAN_PHASE": "post",
             "BARMAN_BACKUP_DIR": EXAMPLE_BACKUP_DIR,
             "BARMAN_BACKUP_ID": EXAMPLE_BACKUP_ID,
+            "BARMAN_BACKUP_INFO_PATH": EXAMPLE_BACKUP_INFO_PATH,
             "BARMAN_STATUS": "DONE",
         },
     )
@@ -548,6 +622,7 @@ class TestCloudBackupHookScript(object):
             cloud_interface=cloud_interface_mock.return_value,
             backup_dir=EXAMPLE_BACKUP_DIR,
             backup_id=EXAMPLE_BACKUP_ID,
+            backup_info_path=EXAMPLE_BACKUP_INFO_PATH,
         )
         uploader.backup.assert_called_once()
 

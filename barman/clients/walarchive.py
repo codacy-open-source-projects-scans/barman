@@ -6,7 +6,7 @@
 #
 # See the help page for usage information.
 #
-# © Copyright EnterpriseDB UK Limited 2019-2023
+# © Copyright EnterpriseDB UK Limited 2019-2025
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,8 +33,11 @@ import tarfile
 import time
 from contextlib import closing
 from io import BytesIO
+from tempfile import TemporaryDirectory
 
 import barman
+from barman.compression import get_internal_compressor
+from barman.config import parse_compression_level
 
 DEFAULT_USER = "barman"
 BUFSIZE = 16 * 1024
@@ -188,6 +191,60 @@ def parse_arguments(args=None):
         "mismatched client and server versions.",
     )
     parser.add_argument(
+        "-z",
+        "--gzip",
+        help="gzip-compress the WAL file before sending it",
+        action="store_const",
+        const="gzip",
+        dest="compression",
+    )
+    parser.add_argument(
+        "-j",
+        "--bzip2",
+        help="bzip2-compress the WAL file before sending it",
+        action="store_const",
+        const="bzip2",
+        dest="compression",
+    )
+    parser.add_argument(
+        "--xz",
+        help="xz-compress the WAL file before sending it",
+        action="store_const",
+        const="xz",
+        dest="compression",
+    )
+    parser.add_argument(
+        "--snappy",
+        help="snappy-compress the WAL file before sending it "
+        "(requires optional python-snappy library)",
+        action="store_const",
+        const="snappy",
+        dest="compression",
+    )
+    parser.add_argument(
+        "--zstd",
+        help="zstd-compress the WAL file before sending it "
+        "(requires optional zstandard library)",
+        action="store_const",
+        const="zstd",
+        dest="compression",
+    )
+    parser.add_argument(
+        "--lz4",
+        help="lz4-compress the WAL file before sending it "
+        "(requires optional lz4 library)",
+        action="store_const",
+        const="lz4",
+        dest="compression",
+    )
+    parser.add_argument(
+        "--compression-level",
+        help="A compression level for the specified compression algorithm",
+        dest="compression_level",
+        type=parse_compression_level,
+        default=None,
+    )
+    parser.add_argument(
         "barman_host",
         metavar="BARMAN_HOST",
         help="The host of the Barman server.",
@@ -260,6 +317,14 @@ class ChecksumTarFile(tarfile.TarFile):
     """
 
     def __init__(self, *args, **kwargs):
+        """
+        Initialize a ``ChecksumTarFile`` instance.
+
+        This constructor behaves like ``tarfile.TarFile``, but adds two attributes.
+        ``hash_algorithm`` is the hashing algorithm used for checksums (default is
+        ``sha256``).``HASHSUMS_FILE`` is the name of the file where checksums will be stored
+        (default is ``SHA256SUMS``).
+        """
         super(ChecksumTarFile, self).__init__(*args, **kwargs)
         self.hash_algorithm = "sha256"
         self.HASHSUMS_FILE = "SHA256SUMS"
@@ -352,9 +417,19 @@ class RemotePutWal(object):
         # Send the data as a tar file (containing checksums)
         with self.ssh_process.stdin as dest_file:
             with closing(ChecksumTarFile.open(mode="w|", fileobj=dest_file)) as tar:
+                filename = os.path.basename(wal_path)
                 tar.hash_algorithm = hash_algorithm
                 tar.HASHSUMS_FILE = HASHSUMS_FILE
-                tar.add(wal_path, os.path.basename(wal_path))
+                if config.compression is not None:
+                    with TemporaryDirectory(prefix="barman-wal-archive-") as tmpdir:
+                        compressor = get_internal_compressor(
+                            config.compression, config.compression_level
+                        )
+                        compressed_file_path = os.path.join(tmpdir, filename)
+                        compressor.compress(wal_path, compressed_file_path)
+                        tar.add(compressed_file_path, filename)
+                else:
+                    tar.add(wal_path, filename)
 
     @classmethod
     def wait_for_all(cls):

@@ -9,7 +9,9 @@ Synopsis
 .. code-block:: text
     
     list-files
+        [ { -h | --help } ]
         [ --target { data | full | standalone | wal } ]
+        [ --list-empty-directories ]
         SERVER_NAME BACKUP_ID
 
 Description
@@ -26,6 +28,9 @@ Parameters
 ``BACKUP_ID``
     Id of the backup in barman catalog.
 
+``-h`` / ``--help``
+    Show a help message and exit. Provides information about command usage.
+
 ``--target``
     Define specific files to be listed. The possible values are:
 
@@ -35,6 +40,9 @@ Parameters
       the log or the start of the following base backup (depending on whether the
       specified base backup is the most recent one available).
     * ``full``: same as ``data`` + ``wal``.
+
+``--list-empty-directories``
+    Add empty directories to the listing.
 
 .. only:: man
 
@@ -54,7 +62,6 @@ Parameters
         * - **last/latest**
           - Most recent available backup for the server, in chronological order.
         * - **last-full/latest-full**
-          - Most recent full backup eligible for a block-level incremental backup using the
-            ``--incremental`` option.
+          - Most recent full backup taken with methods ``rsync`` or ``postgres``.
         * - **last-failed**
           - Most recent backup that failed, in chronological order.

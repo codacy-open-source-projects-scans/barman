@@ -40,6 +40,26 @@ the streaming connection.
   method for taking backups is through ``concurrent`` backup. If ``backup_options`` is
   unset, Barman will automatically set it to ``concurrent_backup``.
 
+.. _backup-requirements:
+
+Requirements for backups
+------------------------
+
+The most critical requirement for a Barman server is the amount of disk space available.
+You are recommended to plan the required disk space based on the size of the clusters
+to backup, number of WAL files generated per day, frequency of backups, and retention
+policies.
+
+Barman developers regularly test Barman with XFS and ext4 filesystems. Like PostgreSQL,
+Barman does nothing special for NFS mountpoints used for storing backups and WALs.
+The following points are required for safely using Barman with NFS:
+
+  * The ``barman_lock_directory`` should be on a local filesystem.
+  * Use at least NFS protocol version 4.
+  * The file system must be mounted using the hard and synchronous options
+    (``hard``,``sync``).
+
+
 .. _backup-incremental-backups:
 
 Incremental Backups
@@ -147,8 +167,8 @@ RedHat, CentOS, and SLES systems.
 * ``lz4`` and ``zstd`` are supported with Postgres 15 or higher.
 
 .. important::
-    If using ``backup_compression``, you must also set ``recovery_staging_path`` to
-    enable recovery of compressed backups. Refer to the
+    If using ``backup_compression``, you must also set ``staging_path`` and
+    ``staging_location`` to enable recovery of compressed backups. Refer to the
     :ref:`Recovering Compressed backups <recovery-recovering-compressed-backups>`
     section for details.
 
@@ -196,8 +216,7 @@ or the ``client``. Set the ``backup_compression_location`` option:
   but increasing server workload.
 * ``client``: Compression is handled by ``pg_basebackup`` on the client side.
 
-When ``backup_compression_location`` is set to ``server``, you can also configure
-``backup_compression_format``:
+You can also specify the backup format using ``backup_compression_format``:
 
 .. code-block:: text
 
@@ -205,6 +224,13 @@ When ``backup_compression_location`` is set to ``server``, you can also configur
 
 * ``plain``: ``pg_basebackup`` decompresses data before writing to disk.
 * ``tar``: Backups are written as compressed tarballs (default).
+
+.. note::
+  If setting ``backup_compression_location = server`` and
+  ``backup_compression_format = plain``, you can reduce network usage given the files
+  are compressed on the server side and decompressed on the client side. This can be
+  useful when the network bandwidth is limited but CPU is not, and backups need to be
+  stored uncompressed.
 
 Depending on the chosen ``backup_compression`` and ``backup_compression_format``, you
 may need to install additional tools on both the Postgres and Barman servers.
@@ -247,6 +273,52 @@ Refer to the table below to select the appropriate tools for your configuration.
       - tar
       - tar
       - tar
+
+
+.. _backup-encryption:
+
+Backup Encryption
+-----------------
+
+Barman supports encryption of both backups and WAL files. This feature can be enabled
+with the ``encryption`` option (global or per server).
+
+Requirements
+""""""""""""
+
+The current encryption implementation for backups relies on the ``pg_basebackup``
+ability to take backups in tar format. To achieve that, you need to set your
+configuration as follows:
+
+* ``backup_method = postgres``
+* ``backup_compression = <compression_method>`` (``none`` for no compression)
+* ``backup_compression_format = tar``
+
+The backed up tar files are encrypted immediately after ``pg_basebackup`` finishes
+writing them on the Barman server disk.
+
+Encryption Methods
+""""""""""""""""""
+
+Setting the ``encryption`` option dictates the encryption method used for base backups
+and WALs. Currently, only ``gpg`` and ``none`` (no encryption) are accepted values.
+
+.. note::
+  For details about WAL encryption, refer to :ref:`wal_archiving-WAL-encryption`.
+
+.. note::
+  For details about decryption, refer to :ref:`recovery-recovering-encrypted-backups`.
+
+GPG
+^^^
+
+This method is enabled by setting ``encryption = gpg`` in the configuration file.
+
+To use :term:`GPG` for encryption, you need ``gpg`` version 2.1 or higher installed on
+the server. You must also generate a GPG key pair in advance and configure the
+``encryption_key_id`` option with the ID or recipient's email of the generated public
+key. The corresponding private key must be present in GPG's keyring and secured with a
+strong passphrase.
 
 .. _backup-immediate-checkpoint:
 
@@ -392,9 +464,9 @@ the Barman backup command. For example, to run a one-off incremental backup, use
     affected. Deduplication in rsync backups uses hard links, meaning that when a reused
     backup is deleted, you don't need to create a new full backup; shared files will
     remain on disk until the last backup that used those files is also deleted.
-    Additionally, using ``reuse_backup = on`` for the initial backup has no effect, as
-    it will still be treated as a full backup due to the absence of existing files to
-    link.
+    Additionally, using ``reuse_backup = link`` or ``reuse_backup = copy`` for the
+    initial backup has no effect, as it will still be treated as a full backup due to
+    the absence of existing files to link or copy.
 
 .. _backup-concurrent-backup-of-a-standby:
 
@@ -450,6 +522,113 @@ or
     Postgres 10 and earlier may differ at the binary level, leading to false-positive 
     detection issues in Barman.
 
+.. _backup-managing-external-configuration-files:
+
+Managing external configuration files
+-------------------------------------
+
+Barman handles :term:`external configuration files <External Configuration Files>`
+differently depending on the backup method used. With the ``rsync`` method, external
+files are copied into the PGDATA directory. However, with the ``postgres`` method,
+external files are not copied, and a warning is issued to notify the user about those
+files.
+
+Refer to the :ref:`Managing external configuration files <recovery-managing-external-configuration-files>`
+section in the recovery chapter to understand how external files are handled when
+restoring a backup.
+
+.. hint::
+    Since Barman does not establish SSH connections to the PostgreSQL host when
+    ``backup_method = postgres``, you may want to configure a post-backup hook
+    and use the output of ``barman show-server`` command to back up the external
+    configuration files on your own right after the backup is finished.
+
+
+.. _backup-backups-on-immutable-storage:
+
+Using an immutable storage for backups
+--------------------------------------
+
+Barman can be configured to store backups on immutable storage to protect against
+malicious actors or accidental deletions. Such storage may also be referred to as
+:term:`WORM` (Write Once, Read Many) storage.
+
+The main use case for this type of storage is to protect the backups from ransomware
+attacks. By using immutable storage, the backups cannot be deleted or modified for a
+specific period of time.
+
+In order for Barman to provide immutable backups, only the backups and WAL files
+should be located in the immutable storage, leaving non-restorable data in regular
+storage. This way Barman will be able to maintain transient information about metadata
+of backups and WAL files as that information needs regular updates.
+
+Given the above, to configure Barman to store backups on an immutable storage, you need
+to follow these suggestions:
+
+* Only the following two directories should be configured to be stored on the immutable
+  storage path:
+  
+  * :ref:`basebackups_directory <configuration-options-backups-basebackups-directory>`:
+    The directory where backups are stored.
+  * :ref:`wal_directory <configuration-options-wals-wals-directory>`: The directory
+    where WAL files are stored.
+* All other directories should be stored on a regular storage path because they are used
+  by Barman's internal process and don't hold data crucial for restoring the cluster.
+  This can be accomplished by configuring the :ref:`barman_home <configuration-options-general-barman-home>`
+  option to point to a regular storage in the global configuration, or the
+  :ref:`backup_directory <configuration-options-backups-backup-directory>`
+  option in the server section. This still requires that the options from the previous
+  bullet points are set accordingly.
+* The WAL file catalog should be stored on a regular storage path. This can be
+  accomplished by configuring the :ref:`xlogdb_directory <configuration-options-wals-xlogdb-directory>`
+  option to point to a regular storage.
+* Paths used for restoring incremental or compressed or encrypted backups, defined by
+  the ``staging_path`` and ``staging_location`` options (see :ref:`restore configuration <configuration-options-restore>`
+  for details), should also live in regular storage.
+* Retention policies should cover at least the full period in which the backed up files
+  are immutable. This can be accomplished by setting the ``retention_policy`` option in
+  the server section to a value that is greater than the immutable storage's period of
+  immutability. This is to ensure that the backups are not deleted before the
+  immutability period expires.
+
+To configure immutability of backups there's a :ref:`worm_mode <configuration-options-backups-worm-mode>`
+option that needs to be enabled. This will let Barman skip processes which are
+problematic when backups and WAL files are stored in a :term:`WORM` environment.
+
+.. note::
+    The option for relocating the ``xlogdb`` file was included in Barman 3.12. Refer
+    to its :ref:`configuration section <configuration-options-wals-xlogdb-directory>`
+    for more information.
+
+Current limitations
+"""""""""""""""""""
+
+The current implementation of immutable backup support in Barman has the following 
+limitation:
+
+* The WORM environment must have a grace period. A grace period provides a predefined
+  window during which data can be modified or deleted before WORM restrictions take
+  effect. This requirement exists because Barman makes use of renaming to safely copy
+  WALs to external partitions, which would fail if the file has already entered a WORM
+  state.
+
+In general, a grace period of at least 15 minutes is recommended, as this provides
+enough time for Barman to complete any necessary operations.
+
+.. note::
+  If backup encryption is also enabled, then the grace period must be long enough
+  to cover the time required to perform the encryption (especially when the backup
+  also includes tablespaces, which results in multiple tarballs).
+
+
+  This is because encryption only happens at the end of the backup process, i.e.
+  after ``pg_basebackup`` is finished.  As encryption can not be performed in-place,
+  each tar file is encrypted individually, having its unencrypted version deleted once
+  it is complete.
+
+Given these constraints, users should evaluate whether the current implementation meets
+their requirements before enabling immutable backup support.
+
 .. _backup-cloud-snapshot-backups:
 
 Cloud Snapshot Backups
@@ -465,8 +644,8 @@ ones created with ``rsync`` or ``postgres`` backup methods.
 .. note::
     Additionally, snapshot backups can be created without a Barman server by using the
     ``barman-cloud-backup`` command directly on the Postgres server. Refer to the
-    :ref:`barman-cli-cloud <barman-cloud-barman-cli-cloud>` section for more information
-    on how to properly work with this option.
+    :ref:`barman cloud client package <barman-cloud-barman-client-package>` section for
+    more information on how to properly work with this option.
 
 .. important::
     The following configuration options and equivalent command arguments (if applicable)
@@ -599,8 +778,8 @@ login.
 
 The following environment variables are supported: ``AZURE_STORAGE_CONNECTION_STRING``,
 ``AZURE_STORAGE_KEY`` and ``AZURE_STORAGE_SAS_TOKEN``. You can also use the
-``--credential`` option to specify either ``azure-cli`` or ``managed-identity``
-credentials in order to authenticate via Azure Active Directory.
+``--credential`` option to specify either ``default``, ``azure-cli`` or
+``managed-identity`` credentials in order to authenticate via Azure Active Directory.
 
 .. important::
     Ensure the credential has the permissions listed below:
@@ -612,8 +791,9 @@ credentials in order to authenticate via Azure Active Directory.
     * ``Microsoft.Compute/snapshots/delete``
 
 For provider specific credential configurations, refer to the
-`Azure environment variables configurations <https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-data-operations-cli#set-environment-variables-for-authorization-parameters>`_
-and `Identity Package <https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity?view=azure-python>`_.
+`Azure environment variables configurations <https://learn.microsoft.com/en-us/azure/storage/blobs/authorize-data-operations-cli#set-environment-variables-for-authorization-parameters>`_,
+`Identity Package <https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity?view=azure-python>`_ and 
+`DefaultAzureCredential documentation <https://learn.microsoft.com/en-us/python/api/azure-identity/azure.identity.defaultazurecredential?view=azure-python>`_.
 
 4. **Specific Configuration**
 
@@ -644,7 +824,7 @@ Install it using pip:
 2. **Disk Requirements**
 
 All disks involved in the snapshot backup must be non-root EBS volumes attached to the
-same VM instance and NVMe volumes are not supported.
+same VM instance.
 
 3. **Access Control**
 
@@ -690,7 +870,7 @@ Barman will return an error.
     aws_profile = AWS_PROFILE_NAME
     aws_await_snapshots_timeout = TIMEOUT_IN_SECONDS
 
-4. **Ransomware Protection**
+5. **Ransomware Protection**
 
 Ransomware protection is essential to secure data and maintain operational stability.
 With Amazon EBS Snapshot Lock, snapshots are protected from deletion, providing an
@@ -791,7 +971,7 @@ For example:
         Timeline             : 1
         Begin WAL            : 00000001000000000000001A
         End WAL              : 00000001000000000000001A
-        WAL number           : 1
+        Number of WALs       : 1
         Begin time           : 2024-08-14 16:21:50.820618+00:00
         End time             : 2024-08-14 16:22:38.264726+00:00
         Copy time            : 47 seconds
@@ -802,7 +982,7 @@ For example:
         End LSN              : 0/1A000138
 
       WAL information:
-        No of files          : 1
+        Number of files      : 1
         Disk usage           : 16.0 MiB
         WAL rate             : 5048.32/hour
         Last available       : 00000001000000000000001B

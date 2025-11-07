@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -26,7 +26,6 @@ from barman.backup import BackupManager
 from barman.clients.cloud_cli import (
     CLIErrorExit,
     GeneralErrorExit,
-    NetworkErrorExit,
     OperationErrorExit,
     create_argument_parser,
 )
@@ -38,6 +37,8 @@ from barman.cloud_providers import (
 from barman.exceptions import BadXlogPrefix, InvalidRetentionPolicy
 from barman.retention_policies import RetentionPolicyFactory
 from barman.utils import check_non_negative, force_str
+
+_logger = logging.getLogger(__name__)
 
 
 def _get_files_for_backup(catalog, backup_info):
@@ -56,7 +57,7 @@ def _get_files_for_backup(catalog, backup_info):
             # Silently skip files which could not be found - if they don't exist
             # then not being able to delete them is not an error condition here
             if file_info.path is not None:
-                logging.debug(
+                _logger.debug(
                     "Will delete archive for %s at %s" % (key, file_info.path)
                 )
                 backup_files.append(file_info.path)
@@ -122,7 +123,7 @@ def _remove_wals_for_backup(
             except (BadXlogPrefix, IndexError):
                 # If the prefix does not appear to be a tli and log we output a warning
                 # and move on to the next prefix rather than error out.
-                logging.warning(
+                _logger.warning(
                     "Ignoring malformed WAL object prefix: {}".format(wal_prefix)
                 )
                 continue
@@ -167,7 +168,7 @@ def _remove_wals_for_backup(
         try:
             wal_paths = catalog.get_wal_paths()
         except Exception as exc:
-            logging.error(
+            _logger.error(
                 "Cannot clean up WALs for backup %s because an error occurred listing WALs: %s",
                 deleted_backup.backup_id,
                 force_str(exc),
@@ -207,7 +208,7 @@ def _remove_wals_for_backup(
             try:
                 cloud_interface.delete_objects(wal_paths_to_delete)
             except Exception as exc:
-                logging.error(
+                _logger.error(
                     "Could not delete the following WALs for backup %s: %s, Reason: %s",
                     deleted_backup.backup_id,
                     wal_paths_to_delete,
@@ -234,11 +235,11 @@ def _delete_backup(
 ):
     backup_info = catalog.get_backup_info(backup_id)
     if not backup_info:
-        logging.warning("Backup %s does not exist", backup_id)
+        _logger.warning("Backup %s does not exist", backup_id)
         return
 
     if backup_info.snapshots_info:
-        logging.debug(
+        _logger.debug(
             "Will delete the following snapshots: %s",
             ", ".join(
                 snapshot.identifier for snapshot in backup_info.snapshots_info.snapshots
@@ -265,7 +266,7 @@ def _delete_backup(
     backup_info_path = os.path.join(
         catalog.prefix, backup_info.backup_id, "backup.info"
     )
-    logging.debug("Will delete backup.info file at %s" % backup_info_path)
+    _logger.debug("Will delete backup.info file at %s" % backup_info_path)
     if not config.dry_run:
         try:
             cloud_interface.delete_objects(objects_to_delete)
@@ -274,7 +275,7 @@ def _delete_backup(
             # we fail to delete any backup file
             cloud_interface.delete_objects([backup_info_path])
         except Exception as exc:
-            logging.error("Could not delete backup %s: %s", backup_id, force_str(exc))
+            _logger.error("Could not delete backup %s: %s", backup_id, force_str(exc))
             raise OperationErrorExit()
     else:
         print(
@@ -309,15 +310,10 @@ def main(args=None):
         cloud_interface = get_cloud_interface(config)
 
         with closing(cloud_interface):
-            if not cloud_interface.test_connectivity():
-                raise NetworkErrorExit()
-            # If test is requested, just exit after connectivity test
-            elif config.test:
+            # Do connectivity test if requested
+            if config.test:
+                cloud_interface.verify_cloud_connectivity_and_bucket_existence()
                 raise SystemExit(0)
-
-            if not cloud_interface.bucket_exists:
-                logging.error("Bucket %s does not exist", cloud_interface.bucket_name)
-                raise OperationErrorExit()
 
             catalog = CloudBackupCatalog(
                 cloud_interface=cloud_interface, server_name=config.server_name
@@ -327,7 +323,7 @@ def main(args=None):
             # storage)
             catalog.get_backup_list()
             if len(catalog.unreadable_backups) > 0:
-                logging.error(
+                _logger.error(
                     "Cannot read the following backups: %s\n"
                     "Unsafe to proceed with deletion due to failure reading backup catalog"
                     % catalog.unreadable_backups
@@ -338,7 +334,7 @@ def main(args=None):
                 # Because we only care about one backup, skip the annotation cache
                 # because it is only helpful when dealing with multiple backups
                 if catalog.should_keep_backup(backup_id, use_cache=False):
-                    logging.error(
+                    _logger.error(
                         "Skipping delete of backup %s for server %s "
                         "as it has a current keep request. If you really "
                         "want to delete this backup please remove the keep "
@@ -349,7 +345,7 @@ def main(args=None):
                     raise OperationErrorExit()
                 if config.minimum_redundancy > 0:
                     if config.minimum_redundancy >= len(catalog.get_backup_list()):
-                        logging.error(
+                        _logger.error(
                             "Skipping delete of backup %s for server %s "
                             "due to minimum redundancy requirements "
                             "(minimum redundancy = %s, "
@@ -371,7 +367,7 @@ def main(args=None):
                         minimum_redundancy=config.minimum_redundancy,
                     )
                 except InvalidRetentionPolicy as exc:
-                    logging.error(
+                    _logger.error(
                         "Could not create retention policy %s: %s",
                         config.retention_policy,
                         force_str(exc),
@@ -396,8 +392,8 @@ def main(args=None):
                         skip_wal_cleanup_if_standalone=False,
                     )
     except Exception as exc:
-        logging.error("Barman cloud backup delete exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud backup delete exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise GeneralErrorExit()
 
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -36,6 +36,7 @@ from barman.cloud_providers.google_cloud_storage import (
     GcpSnapshotsInfo,
 )
 from barman.infofile import BackupInfo
+from barman.process import ProcessInfo
 from barman.utils import BarmanEncoder, human_readable_timedelta, pretty_size
 
 # Color output constants
@@ -1273,7 +1274,7 @@ class TestConsoleWriter(object):
             ("Timeline", str(ext_info["timeline"])),
             ("Begin WAL", ext_info["begin_wal"]),
             ("End WAL", ext_info["end_wal"]),
-            ("WAL number", ext_info["wal_num"]),
+            ("Number of WALs", ext_info["wal_num"]),
             ("WAL compression ratio", wal_compression_output),
             ("Begin time", str(ext_info["begin_time"])),
             ("End time", str(ext_info["end_time"])),
@@ -1281,7 +1282,7 @@ class TestConsoleWriter(object):
             ("End Offset", str(ext_info["end_offset"])),
             ("Begin LSN", str(ext_info["begin_xlog"])),
             ("End LSN", str(ext_info["end_xlog"])),
-            ("No of files", ext_info["wal_until_next_num"]),
+            ("Number of files", ext_info["wal_until_next_num"]),
             ("Disk usage", pretty_size(ext_info["wal_until_next_size"])),
             ("WAL rate", "%0.2f/hour" % (wal_per_second * 3600)),
             ("Compression ratio", compression_rate_output),
@@ -1473,6 +1474,50 @@ class TestConsoleWriter(object):
         out, _err = capsys.readouterr()
         assert "  Backup Name            : %s" % ext_info["backup_name"] in out
 
+    def test_result_show_backup_with_encryption(self, capsys):
+        """
+        Test that encryption is displayed in the output of the show-backup command whe
+        the backup is encrypted.
+        """
+        ext_info = mock_backup_ext_info(
+            status=BackupInfo.DONE,
+            wals_per_second=0.1,
+            est_dedup_size=1024,
+            deduplication_ratio=0.5,
+            encryption="gpg",
+        )
+
+        console_writer = output.ConsoleOutputWriter()
+
+        console_writer.init_list_backup(ext_info["server_name"], False)
+        console_writer.result_show_backup(ext_info)
+        console_writer.close()
+
+        out, _err = capsys.readouterr()
+        assert "    Encryption           : %s" % ext_info["encryption"] in out
+
+    def test_result_show_backup_with_compression(self, capsys):
+        """
+        Test that compression is displayed in the output of the show-backup command whe
+        the backup is compressed.
+        """
+        ext_info = mock_backup_ext_info(
+            status=BackupInfo.DONE,
+            wals_per_second=0.1,
+            est_dedup_size=1024,
+            deduplication_ratio=0.5,
+            compression="gzip",
+        )
+
+        console_writer = output.ConsoleOutputWriter()
+
+        console_writer.init_list_backup(ext_info["server_name"], False)
+        console_writer.result_show_backup(ext_info)
+        console_writer.close()
+
+        out, _err = capsys.readouterr()
+        assert "    Backup Compression   : %s" % ext_info["compression"] in out
+
     def test_result_show_backup_with_snapshots_info_gcp(self, capsys):
         # GIVEN a backup info with snapshots_info
         snapshots_info = GcpSnapshotsInfo(
@@ -1608,6 +1653,43 @@ class TestConsoleWriter(object):
         (out, err) = capsys.readouterr()
         json_out = '{"conninfo": "dbname=t password=*REDACTED*", "a": "b"}\n'
         assert out == json_out
+        assert err == ""
+
+    def test_result_list_processes_console_empty(self, capsys):
+        """
+        Verify that when no subprocesses are provided, the
+        console correctly displays a message on the standard output.
+
+        :param capsys: mock fixture for stdout/stderr
+        """
+        writer = output.ConsoleOutputWriter()
+        writer.result_list_processes([], "test_server")
+        writer.close()
+        out, err = capsys.readouterr()
+        expected = "No active subprocesses found for server test_server.\n"
+        assert out == expected
+        assert err == ""
+
+    def test_result_list_processes_console_non_empty(self, capsys):
+        """
+        Verify that when a non-empty list of subprocesses is provided, the
+        console correctly lists each subprocess with its PID and
+        the corresponding process name on the standard output.
+
+        :param capsys: mock fixture for stdout/stderr
+        """
+        writer = output.ConsoleOutputWriter()
+        proc1 = ProcessInfo("1111", "test_server", "backup")
+        proc2 = ProcessInfo("2222", "test_server", "restore")
+        writer.result_list_processes([proc1, proc2], "test_server")
+        writer.close()
+        out, err = capsys.readouterr()
+        expected = (
+            "Active subprocesses for server test_server:\n"
+            "1111 backup\n"
+            "2222 restore\n"
+        )
+        assert out == expected
         assert err == ""
 
 
@@ -2296,6 +2378,8 @@ class TestJsonWriter(object):
         assert ext_info["end_offset"] == base_information["end_offset"]
         assert ext_info["begin_xlog"] == base_information["begin_lsn"]
         assert ext_info["end_xlog"] == base_information["end_lsn"]
+        assert ext_info["encryption"] == base_information["encryption"]
+        assert ext_info["compression"] == base_information["compression"]
 
         for name, _, location in ext_info["tablespaces"]:
             tablespace = find_by_attr(
@@ -2446,7 +2530,6 @@ class TestJsonWriter(object):
             "changes": [],
             "warnings": [],
             "missing_files": [],
-            "delete_barman_wal": False,
             "get_wal": False,
             "recovery_start_time": self.begin_time,
         }
@@ -2512,6 +2595,44 @@ class TestJsonWriter(object):
             dict(description=description, message=str(message))
             == json_output[server][name]
         )
+        assert err == ""
+
+    def test_result_list_processes_json_empty(self, capsys):
+        """
+        Verify that when no subprocesses are provided,
+        the JSON output for the server returns an empty list.
+
+        :param capsys: mock fixture for stdout/stderr
+        """
+        writer = output.JsonOutputWriter()
+        writer.result_list_processes([], "test_server")
+        writer.close()
+        out, err = capsys.readouterr()
+        json_output = json.loads(out)
+        expected = []
+        assert json_output["test_server"] == expected
+        assert err == ""
+
+    def test_result_list_processes_json_non_empty(self, capsys):
+        """
+        Verify that when a list of subprocesses is provided,
+        the JSON output for the server is a list of dictionaries containing
+        the keys "pid" and "name" with the respective values.
+
+        :param capsys: mock fixture for stdout/stderr
+        """
+        writer = output.JsonOutputWriter()
+        proc1 = ProcessInfo("1111", "test_server", "backup")
+        proc2 = ProcessInfo("2222", "test_server", "restore")
+        writer.result_list_processes([proc1, proc2], "test_server")
+        writer.close()
+        out, err = capsys.readouterr()
+        json_output = json.loads(out)
+        expected = [
+            {"pid": "1111", "name": "backup"},
+            {"pid": "2222", "name": "restore"},
+        ]
+        assert json_output["test_server"] == expected
         assert err == ""
 
 

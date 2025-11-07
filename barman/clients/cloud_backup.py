@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -25,7 +25,6 @@ from shutil import rmtree
 
 from barman.clients.cloud_cli import (
     GeneralErrorExit,
-    NetworkErrorExit,
     OperationErrorExit,
     UrlArgumentType,
     add_tag_argument,
@@ -52,8 +51,12 @@ from barman.utils import (
     check_backup_name,
     check_positive,
     check_size,
+    check_tag,
     force_str,
 )
+
+_logger = logging.getLogger(__name__)
+
 
 _find_space = re.compile(r"[\s]").search
 
@@ -125,13 +128,12 @@ def _validate_config(config):
         "snapshot_instance",
     )
     is_snapshot_backup = any(
-        [getattr(config, var) for var in required_snapshot_variables]
+        [getattr(config, var, None) for var in required_snapshot_variables]
     )
-    if is_snapshot_backup:
-        if getattr(config, "compression"):
-            raise ConfigurationException(
-                "Compression options cannot be used with snapshot backups"
-            )
+    if is_snapshot_backup and getattr(config, "compression", None):
+        raise ConfigurationException(
+            "Compression options cannot be used with snapshot backups"
+        )
     if getattr(config, "aws_snapshot_lock_mode", None) == "governance" and getattr(
         config, "aws_snapshot_lock_cool_off_period", None
     ):
@@ -139,6 +141,21 @@ def _validate_config(config):
             "'aws_snapshot_lock_mode' = 'governance' cannot be used with "
             "'aws_snapshot_lock_cool_off_period'"
         )
+
+    tags = getattr(config, "tags", None)
+    if tags:
+        if len(tags) > 10:
+            raise ValueError(
+                "Maximum number of tags per object exceeded. S3 allows no more "
+                "than 10 tags per object."
+            )
+        seen = set()
+        for key, _ in tags:
+            if key in seen:
+                raise ValueError(
+                    "Duplicate tag keys found: %s. Tag keys must be unique." % key
+                )
+            seen.add(key)
 
 
 def main(args=None):
@@ -158,15 +175,11 @@ def main(args=None):
 
         cloud_interface = get_cloud_interface(config)
 
-        if not cloud_interface.test_connectivity():
-            raise NetworkErrorExit()
-        # If test is requested, just exit after connectivity test
-        elif config.test:
-            raise SystemExit(0)
-
         with closing(cloud_interface):
-            # TODO: Should the setup be optional?
-            cloud_interface.setup_bucket()
+            # Do connectivity test if requested
+            if config.test:
+                cloud_interface.verify_cloud_connectivity_and_bucket_existence()
+                raise SystemExit(0)
 
             # Perform the backup
             uploader_kwargs = {
@@ -198,7 +211,8 @@ def main(args=None):
                 uploader = CloudBackupUploaderBarman(
                     backup_dir=os.getenv("BARMAN_BACKUP_DIR"),
                     backup_id=os.getenv("BARMAN_BACKUP_ID"),
-                    **uploader_kwargs
+                    backup_info_path=os.getenv("BARMAN_BACKUP_INFO_PATH"),
+                    **uploader_kwargs,
                 )
                 uploader.backup()
             else:
@@ -211,8 +225,8 @@ def main(args=None):
                 try:
                     postgres.connect()
                 except PostgresConnectionError as exc:
-                    logging.error("Cannot connect to postgres: %s", force_str(exc))
-                    logging.debug("Exception details:", exc_info=exc)
+                    _logger.error("Cannot connect to postgres: %s", force_str(exc))
+                    _logger.debug("Exception details:", exc_info=exc)
                     raise OperationErrorExit()
 
                 with closing(postgres):
@@ -235,21 +249,21 @@ def main(args=None):
                         uploader = CloudBackupUploader(
                             postgres=postgres,
                             backup_name=config.backup_name,
-                            **uploader_kwargs
+                            **uploader_kwargs,
                         )
                         uploader.backup()
 
     except KeyboardInterrupt as exc:
-        logging.error("Barman cloud backup was interrupted by the user")
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud backup was interrupted by the user")
+        _logger.debug("Exception details:", exc_info=exc)
         raise OperationErrorExit()
     except UnrecoverableHookScriptError as exc:
-        logging.error("Barman cloud backup exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud backup exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise SystemExit(63)
     except Exception as exc:
-        logging.error("Barman cloud backup exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud backup exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise GeneralErrorExit()
     finally:
         # Remove the temporary directory and all the contained files
@@ -404,10 +418,20 @@ def parse_arguments(args=None):
         "--gcp-zone",
         help="Zone of the disks from which snapshots should be taken",
     )
+    tag_arguments = parser.add_mutually_exclusive_group()
     add_tag_argument(
-        parser,
+        tag_arguments,
         name="tags",
+        dest="tags_list",
         help="Tags to be added to all uploaded files in cloud storage",
+    )
+    tag_arguments.add_argument(
+        "--tag",
+        help="Tag to be added to all uploaded files in cloud storage",
+        action="append",
+        type=check_tag,
+        default=[],
+        dest="tags_append",
     )
     s3_arguments.add_argument(
         "-e",
@@ -480,6 +504,7 @@ def parse_arguments(args=None):
     )
 
     parsed_args = parser.parse_args(args=args)
+    parsed_args.tags = parsed_args.tags_append or parsed_args.tags_list
     return parsed_args
 
 

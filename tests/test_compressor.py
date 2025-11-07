@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -17,22 +17,27 @@
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
 import base64
+import bz2
+import gzip
 import io
+import logging
+import lzma
 import os
 import tarfile
 
+import cramjam
+import lz4.frame
 import mock
 import pytest
+import zstandard
 from testing_helpers import build_mocked_server, get_compression_config
 
 from barman.compression import (
-    BZip2Compressor,
     CommandCompressor,
     CompressionManager,
     Compressor,
     CustomCompressor,
     GZipCompression,
-    GZipCompressor,
     GZipPgBaseBackupCompressionOption,
     LZ4Compression,
     LZ4Compressor,
@@ -43,6 +48,7 @@ from barman.compression import (
     PgBaseBackupCompressionOption,
     PyBZip2Compressor,
     PyGZipCompressor,
+    SnappyCompressor,
     XZCompressor,
     ZSTDCompression,
     ZSTDCompressor,
@@ -136,7 +142,7 @@ class TestCompressionManager(object):
         assert comp_manager.unidentified_compression is None
 
         # AND the value of MAGIC_MAX_LENGTH equals the length of the magic bytes
-        assert comp_manager.MAGIC_MAX_LENGTH == 6
+        assert comp_manager.MAGIC_MAX_LENGTH == 10
 
     def test_get_compressor_custom_nomagic(self, _reset_custom_compressor):
         # GIVEN a Barman config which specifies custom compression
@@ -163,7 +169,7 @@ class TestCompressionManager(object):
 
         # AND the value of MAGIC_MAX_LENGTH equals the max length of the default
         # compressions
-        assert comp_manager.MAGIC_MAX_LENGTH == 6
+        assert comp_manager.MAGIC_MAX_LENGTH == 10
 
     def test_get_compressor_gzip(self):
         # prepare mock obj
@@ -269,6 +275,50 @@ class TestCompressor(object):
         # THEN validate returns True
         assert Compressor.validate(bytes_to_validate) is is_valid
 
+    @pytest.mark.parametrize(
+        "compression_level, expected, issue_log",
+        [
+            # Case 1: a level greater than LEVEL_MAX defaults to LEVEL_MAX
+            (10, PyGZipCompressor.LEVEL_MAX, True),
+            # Case 2: a level lower than LEVEL_MIN defaults to LEVEL_MIN
+            (0, PyGZipCompressor.LEVEL_MIN, True),
+            # Case 3: a level in the range is correctly set
+            (7, 7, False),
+            # Case 4: literal value of `low` is set as defined in LEVEL_LOW
+            ("low", PyGZipCompressor.LEVEL_LOW, False),
+            # Case 5: literal value of `high` is set as defined in LEVEL_HIGH
+            ("high", PyGZipCompressor.LEVEL_HIGH, False),
+            # Case 6: literal value of `medium` is set as defined in LEVEL_MEDIUM
+            ("medium", PyGZipCompressor.LEVEL_MEDIUM, False),
+            # Case 7: any value that is not recognized also defaults to LEVEL_MEDIUM
+            ("nonsense", PyGZipCompressor.LEVEL_MEDIUM, False),
+        ],
+    )
+    def test_compression_level_is_set_correctly(
+        self, compression_level, expected, issue_log, caplog
+    ):
+        """
+        Asserts that the compression level is set correctly when instantiating a
+        compressor.
+
+        .. note::
+            ``PyGZipCompressor`` is used in this test because we cannot instantiate
+            the abstract ``Compressor`` class. However, the tested logic resides in
+            the ``Compressor`` class and applies to all its subclasses.
+        """
+        caplog.set_level(logging.DEBUG)
+        mock_config = mock.Mock(compression="gzip", compression_level=compression_level)
+        compressor = PyGZipCompressor(mock_config, "gzip")
+        assert compressor is not None
+        assert compressor.level == expected
+        if issue_log:
+            msg = "Compression level %s out of range for %s, using %s instead" % (
+                compression_level,
+                "gzip",
+                expected,
+            )
+            assert msg in caplog.text
+
 
 # noinspection PyMethodMayBeStatic
 class TestCommandCompressors(object):
@@ -298,56 +348,6 @@ class TestCommandCompressors(object):
             command.cmd == "barman_command()"
             '{ dummy_command > "$2" < "$1";}; barman_command'
         )
-
-    def test_gzip(self, tmpdir):
-        config_mock = mock.Mock()
-
-        compression_manager = CompressionManager(config_mock, tmpdir.strpath)
-
-        compressor = GZipCompressor(config=config_mock, compression="gzip")
-
-        src = tmpdir.join("sourcefile")
-        src.write("content")
-
-        compressor.compress(src.strpath, ZIP_FILE % tmpdir.strpath)
-        assert os.path.exists(ZIP_FILE % tmpdir.strpath)
-        compression_zip = compression_manager.identify_compression(
-            ZIP_FILE % tmpdir.strpath
-        )
-        assert compression_zip == "gzip"
-
-        compressor.decompress(
-            ZIP_FILE % tmpdir.strpath,
-            ZIP_FILE_UNCOMPRESSED % tmpdir.strpath,
-        )
-
-        f = open(ZIP_FILE_UNCOMPRESSED % tmpdir.strpath).read()
-        assert f == "content"
-
-    def test_bzip2(self, tmpdir):
-        config_mock = mock.Mock()
-
-        compression_manager = CompressionManager(config_mock, tmpdir.strpath)
-
-        compressor = BZip2Compressor(config=config_mock, compression="bzip2")
-
-        src = tmpdir.join("sourcefile")
-        src.write("content")
-
-        compressor.compress(src.strpath, BZIP2_FILE % tmpdir.strpath)
-        assert os.path.exists(BZIP2_FILE % tmpdir.strpath)
-        compression_zip = compression_manager.identify_compression(
-            BZIP2_FILE % tmpdir.strpath
-        )
-        assert compression_zip == "bzip2"
-
-        compressor.decompress(
-            BZIP2_FILE % tmpdir.strpath,
-            BZIP2_FILE_UNCOMPRESSED % tmpdir.strpath,
-        )
-
-        f = open(BZIP2_FILE_UNCOMPRESSED % tmpdir.strpath).read()
-        assert f == "content"
 
 
 # noinspection PyMethodMayBeStatic
@@ -476,6 +476,93 @@ class TestInternalCompressors(object):
 
         f = open(LZ4_FILE_UNCOMPRESSED % tmpdir.strpath).read()
         assert f == "content"
+
+    @pytest.mark.parametrize(
+        "compression, compression_class",
+        [
+            ("pygzip", PyGZipCompressor),
+            ("pybzip2", PyBZip2Compressor),
+            ("xz", XZCompressor),
+            ("zstd", ZSTDCompressor),
+            ("lz4", LZ4Compressor),
+            ("snappy", SnappyCompressor),
+        ],
+    )
+    def test_compress_in_mem(self, compression, compression_class):
+        """
+        Test the ``compress_in_mem`` method of the compression classes
+        """
+        # GIVEN a compressor instance
+        config_mock = mock.Mock(compression=compression)
+        compressor = compression_class(config=config_mock, compression=compression)
+        # AND some data to compress
+        uncompressed = io.BytesIO(b"I'm a big file. Compress me!")
+        # WHEN compress_in_mem is called
+        compressed = compressor.compress_in_mem(uncompressed)
+        # THEN the compressed data starts with the expected magic bytes, meaning it was
+        # compressed successfully
+        assert compressed.read().startswith(compression_class.MAGIC)
+
+    @pytest.mark.parametrize(
+        "compression, compression_class, compressed_fileobj",
+        [
+            ("pygzip", PyGZipCompressor, io.BytesIO(gzip.compress(b"data"))),
+            ("pybzip2", PyBZip2Compressor, io.BytesIO(bz2.compress(b"data"))),
+            ("xz", XZCompressor, io.BytesIO(lzma.compress(b"data"))),
+            ("lz4", LZ4Compressor, io.BytesIO(lz4.frame.compress(b"data"))),
+            ("snappy", SnappyCompressor, io.BytesIO(cramjam.snappy.compress(b"data"))),
+            (
+                "zstd",
+                ZSTDCompressor,
+                io.BytesIO(zstandard.ZstdCompressor().compress(b"data")),
+            ),
+        ],
+    )
+    def test_decompress_in_mem(
+        self, compression, compression_class, compressed_fileobj
+    ):
+        """
+        Test the ``decompress_in_mem`` method of the compression classes
+        """
+        # GIVEN a compressor instance
+        config_mock = mock.Mock(compression=compression)
+        compressor = compression_class(config=config_mock, compression=compression)
+        # WHEN decompress_in_mem is called
+        compressed_fileobj.seek(0)
+        decompressed_data = compressor.decompress_in_mem(compressed_fileobj)
+        # THEN the decompressed data matches the original data
+        assert decompressed_data.read() == b"data"
+
+    @pytest.mark.parametrize(
+        "compression, compression_class",
+        [
+            ("pygzip", PyGZipCompressor),
+            ("pybzip2", PyBZip2Compressor),
+            ("xz", XZCompressor),
+            ("zstd", ZSTDCompressor),
+            ("lz4", LZ4Compressor),
+        ],
+    )
+    @mock.patch("barman.compression.shutil")
+    def test_decompress_to_fileobj(self, mock_shutil, compression, compression_class):
+        """
+        Test the ``decompress_to_fileobj`` method of the compression classes.
+        """
+        # GIVEN a compressor instance
+        config_mock = mock.Mock(compression=compression)
+        compressor = compression_class(config=config_mock, compression=compression)
+        # AND mock the decompress_in_mem object of the compressor class
+        with mock.patch.object(compressor, "decompress_in_mem") as mock_decompress:
+            mock_decompress.return_value = io.BytesIO(b"decompressed")
+            compressed_fileobj = io.BytesIO(b"compressed")
+            dest_fileobj = io.BytesIO()
+            # THEN calling decompress_to_fileobj is just a matter of calling
+            # decompress_in_mem and then copying its result to the dest file-object
+            compressor.decompress_to_fileobj(compressed_fileobj, dest_fileobj)
+            mock_decompress.assert_called_once_with(compressed_fileobj)
+            mock_shutil.copyfileobj.assert_called_once_with(
+                mock_decompress.return_value, dest_fileobj
+            )
 
 
 # noinspection PyMethodMayBeStatic
@@ -1066,26 +1153,26 @@ COMMON_UNCOMPRESS_ARGS = (
 
 class TestGZipCompression(object):
     @pytest.mark.parametrize(*COMMON_UNCOMPRESS_ARGS)
-    def test_uncompress(self, src, dst, exclude, include, expected_error):
+    def test_decompress(self, src, dst, exclude, include, expected_error):
         # GIVEN a GZipCompression object
         command = mock.Mock()
         command.cmd.return_value = 0
         command.get_last_output.return_value = ("all good", "")
         gzip_compression = GZipCompression(command)
 
-        # WHEN uncompress is called with the source and destination
+        # WHEN decompress is called with the source and destination
         # THEN the command is called once
         # AND if we expect an error, that error is raised
         if expected_error is not None:
             with pytest.raises(ValueError):
-                gzip_compression.uncompress(
+                gzip_compression.decompress(
                     src, dst, exclude=exclude, include_args=include
                 )
             # THEN command.cmd was not called
             command.cmd.assert_not_called()
         # OR if we don't expect an error
         else:
-            gzip_compression.uncompress(src, dst, exclude=exclude, include_args=include)
+            gzip_compression.decompress(src, dst, exclude=exclude, include_args=include)
             # THEN command.cmd was called
             command.cmd.assert_called_once()
             # AND the first argument was "tar"
@@ -1116,10 +1203,10 @@ class TestGZipCompression(object):
         command.get_last_output.return_value = ("", "some error")
         gzip_compression = GZipCompression(command)
 
-        # WHEN uncompress is called
+        # WHEN decompress is called
         # THEN a CommandFailedException is raised
         with pytest.raises(CommandFailedException) as exc:
-            gzip_compression.uncompress("/path/to/src", "/path/to/dst")
+            gzip_compression.decompress("/path/to/src", "/path/to/dst")
 
         # AND the exception message contains the command stderr
         assert "some error" in str(exc.value)
@@ -1197,26 +1284,26 @@ class TestGZipCompression(object):
 
 class TestLZ4Compression(object):
     @pytest.mark.parametrize(*COMMON_UNCOMPRESS_ARGS)
-    def test_uncompress(self, src, dst, exclude, include, expected_error):
+    def test_decompress(self, src, dst, exclude, include, expected_error):
         # GIVEN a LZ4Compression object
         command = mock.Mock()
         command.cmd.return_value = 0
         command.get_last_output.return_value = ("all good", "")
         lz4_compression = LZ4Compression(command)
 
-        # WHEN uncompress is called with the source and destination
+        # WHEN decompress is called with the source and destination
         # THEN the command is called once
         # AND if we expect an error, that error is raised
         if expected_error is not None:
             with pytest.raises(ValueError):
-                lz4_compression.uncompress(
+                lz4_compression.decompress(
                     src, dst, exclude=exclude, include_args=include
                 )
             # THEN command.cmd was not called
             command.cmd.assert_not_called()
         # OR if we don't expect an error
         else:
-            lz4_compression.uncompress(src, dst, exclude=exclude, include_args=include)
+            lz4_compression.decompress(src, dst, exclude=exclude, include_args=include)
             # THEN command.cmd was called
             command.cmd.assert_called_once()
             # AND the first argument was "tar"
@@ -1251,10 +1338,10 @@ class TestLZ4Compression(object):
         command.get_last_output.return_value = ("", "some error")
         lz4_compression = LZ4Compression(command)
 
-        # WHEN uncompress is called
+        # WHEN decompress is called
         # THEN a CommandFailedException is raised
         with pytest.raises(CommandFailedException) as exc:
-            lz4_compression.uncompress("/path/to/src", "/path/to/dst")
+            lz4_compression.decompress("/path/to/src", "/path/to/dst")
 
         # AND the exception message contains the command stderr
         assert "some error" in str(exc.value)
@@ -1338,26 +1425,26 @@ class TestLZ4Compression(object):
 
 class TestZSTDCompression(object):
     @pytest.mark.parametrize(*COMMON_UNCOMPRESS_ARGS)
-    def test_uncompress(self, src, dst, exclude, include, expected_error):
+    def test_decompress(self, src, dst, exclude, include, expected_error):
         # GIVEN a ZSTDCompression object
         command = mock.Mock()
         command.cmd.return_value = 0
         command.get_last_output.return_value = ("all good", "")
         zstd_compression = ZSTDCompression(command)
 
-        # WHEN uncompress is called with the source and destination
+        # WHEN decompress is called with the source and destination
         # THEN the command is called once
         # AND if we expect an error, that error is raised
         if expected_error is not None:
             with pytest.raises(ValueError):
-                zstd_compression.uncompress(
+                zstd_compression.decompress(
                     src, dst, exclude=exclude, include_args=include
                 )
             # THEN command.cmd was not called
             command.cmd.assert_not_called()
         # OR if we don't expect an error
         else:
-            zstd_compression.uncompress(src, dst, exclude=exclude, include_args=include)
+            zstd_compression.decompress(src, dst, exclude=exclude, include_args=include)
             # THEN command.cmd was called
             command.cmd.assert_called_once()
             # AND the first argument was "tar"
@@ -1392,10 +1479,10 @@ class TestZSTDCompression(object):
         command.get_last_output.return_value = ("", "some error")
         zstd_compression = ZSTDCompression(command)
 
-        # WHEN uncompress is called
+        # WHEN decompress is called
         # THEN a CommandFailedException is raised
         with pytest.raises(CommandFailedException) as exc:
-            zstd_compression.uncompress("/path/to/src", "/path/to/dst")
+            zstd_compression.decompress("/path/to/src", "/path/to/dst")
 
         # AND the exception message contains the command stderr
         assert "some error" in str(exc.value)
@@ -1479,26 +1566,26 @@ class TestZSTDCompression(object):
 
 class TestNoneCompression:
     @pytest.mark.parametrize(*COMMON_UNCOMPRESS_ARGS)
-    def test_uncompress(self, src, dst, exclude, include, expected_error):
+    def test_decompress(self, src, dst, exclude, include, expected_error):
         # GIVEN a NoneCompression object
         command = mock.Mock()
         command.cmd.return_value = 0
         command.get_last_output.return_value = ("all good", "")
         none_compression = NoneCompression(command)
 
-        # WHEN uncompress is called with the source and destination
+        # WHEN decompress is called with the source and destination
         # THEN the command is called once
         # AND if we expect an error, that error is raised
         if expected_error is not None:
             with pytest.raises(ValueError):
-                none_compression.uncompress(
+                none_compression.decompress(
                     src, dst, exclude=exclude, include_args=include
                 )
             # THEN command.cmd was not called
             command.cmd.assert_not_called()
         # OR if we don't expect an error
         else:
-            none_compression.uncompress(src, dst, exclude=exclude, include_args=include)
+            none_compression.decompress(src, dst, exclude=exclude, include_args=include)
             # THEN command.cmd was called
             command.cmd.assert_called_once()
             # AND the first argument was "tar"
@@ -1529,10 +1616,10 @@ class TestNoneCompression:
         command.get_last_output.return_value = ("", "some error")
         none_compression = NoneCompression(command)
 
-        # WHEN uncompress is called
+        # WHEN decompress is called
         # THEN a CommandFailedException is raised
         with pytest.raises(CommandFailedException) as exc:
-            none_compression.uncompress("/path/to/src", "/path/to/dst")
+            none_compression.decompress("/path/to/src", "/path/to/dst")
 
         # AND the exception message contains the command stderr
         assert "some error" in str(exc.value)

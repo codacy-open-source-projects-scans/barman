@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -68,6 +68,22 @@ class UnixLocalCommand(object):
             return True
         else:
             raise FsOperationFailed("mv execution failed")
+
+    def copy(self, source_path, dest_path):
+        """
+        Copy a file from *source_path* to *dest_path*.
+
+        :param str source_path: full path to the source file
+        :param str dest_path: full path to the destination file
+        :returns bool: ``True`` if the copy completed successfully
+        :raises FsOperationFailed: if the copy operation fails
+        """
+        _logger.debug("Copying %s to %s" % (source_path, dest_path))
+        cp_ret = self.cmd("cp", args=["-a", source_path, dest_path])
+        if cp_ret == 0:
+            return True
+        else:
+            raise FsOperationFailed("cp execution failed")
 
     def create_dir_if_not_exists(self, dir_path, mode=None):
         """
@@ -372,6 +388,62 @@ class UnixLocalCommand(object):
         else:
             return output_fields
 
+    def find_command(self, command_alternatives):
+        """
+        Find the first available command from a list of alternatives.
+
+        :param list[str] command_alternatives: A list of command names to check
+        :return str|None: The first available command from the list, or ``None`` if none
+            of the commands are found.
+        """
+        _logger.debug("Finding command from alternatives: %s", command_alternatives)
+        for cmd in command_alternatives:
+            ret = self.cmd("which", args=[cmd])
+            if ret == 0:
+                return self.internal_cmd.out.strip()
+        return None
+
+    def get_command_version(self, command):
+        """
+        Get the version of a command by executing it with the `--version` option.
+
+        :param str command: The command to check
+        :return str|None: The version output of the command or ``None`` if the command
+            could not be executed or does not support the `--version` option.
+        """
+        _logger.debug("Getting version for command: %s", command)
+        ret = self.cmd(command, args=["--version"])
+        if ret == 0:
+            return self.internal_cmd.out.strip()
+        return None
+
+    def get_path_device_number(self, path):
+        """
+        Get the device number of the filesystem containing the given path.
+
+        This method checks if the specified path exists and retrieves the device number
+        using the `stat` command. It handles platform-specific differences between
+        macOS (darwin) and other Unix-like systems.
+
+        :param str path: The filesystem path for which to retrieve the device number.
+        :raises `FsOperationFailed`: If the path does not exist or the stat command
+            fails.
+        :returns: The device number of the filesystem containing the given path as a
+            string.
+        :rtype: str
+        """
+        if not self.exists(path):
+            raise FsOperationFailed("Following path does not exist: %s" % path)
+        args = ["-c", "%d", path]
+        if self.is_osx():
+            args = ["-f", "%d", path]
+        cmd_ret = self.cmd("stat", args=args)
+        if cmd_ret != 0:
+            raise FsOperationFailed(
+                "Failed to get file mode for %s: %s" % (path, self.internal_cmd.err)
+            )
+        return self.internal_cmd.out.strip()
+
 
 class UnixRemoteCommand(UnixLocalCommand):
     """
@@ -421,7 +493,7 @@ def unix_command_factory(remote_command=None, path=None):
     if remote_command:
         try:
             cmd = UnixRemoteCommand(remote_command, path=path)
-            logging.debug("Created a UnixRemoteCommand")
+            _logger.debug("Created a UnixRemoteCommand")
             return cmd
         except FsOperationFailed:
             output.error(
@@ -431,7 +503,7 @@ def unix_command_factory(remote_command=None, path=None):
             output.close_and_exit()
     else:
         cmd = UnixLocalCommand()
-        logging.debug("Created a UnixLocalCommand")
+        _logger.debug("Created a UnixLocalCommand")
         return cmd
 
 

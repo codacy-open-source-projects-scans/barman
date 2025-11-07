@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -36,6 +36,7 @@ from barman.config import (
     CsvOption,
     ModelConfig,
     RecoveryOptions,
+    ServerConfig,
     parse_backup_compression,
     parse_backup_compression_format,
     parse_backup_compression_location,
@@ -72,6 +73,7 @@ TEST_CONFIG_BARMAN = """
 barman_home = /some/barman/home
 barman_user = {USER}
 compression = gzip
+compression_level = medium
 log_file = /some/barman/home/log/barman.log
 log_level = INFO
 retention_policy = redundancy 2
@@ -203,6 +205,7 @@ class TestConfigMapping(object):
                 "barman_home": "/etc/barman.conf",
                 "barman_user": "/etc/barman.conf",
                 "compression": "/etc/barman.conf",
+                "compression_level": "/etc/barman.conf",
                 "log_file": "/etc/barman.conf",
                 "log_level": "/etc/barman.conf",
                 "retention_policy": "/etc/barman.conf",
@@ -342,6 +345,7 @@ class TestConfig(object):
         expected = testing_helpers.build_config_dictionary(
             {
                 "config": main.config,
+                "worm_mode": False,
                 "autogenerate_manifest": False,
                 "backup_compression": "none",
                 "backup_compression_format": None,
@@ -349,6 +353,7 @@ class TestConfig(object):
                 "backup_compression_location": None,
                 "backup_compression_workers": None,
                 "compression": "gzip",
+                "compression_level": "medium",
                 "last_backup_maximum_age": timedelta(1),
                 "last_backup_minimum_size": 1048576,
                 "last_wal_maximum_age": timedelta(hours=1),
@@ -361,6 +366,7 @@ class TestConfig(object):
                 "custom_compression_filter": "bzip2 -c -9",
                 "custom_compression_magic": "0x425a68",
                 "wals_directory": "wals",
+                "xlogdb_directory": "wals",
                 "custom_decompression_filter": "bzip2 -c -d",
                 "backup_method": "rsync",
                 "max_incoming_wals_queue": None,
@@ -376,6 +382,7 @@ class TestConfig(object):
             {
                 "_active_model_file": "/some/barman/home/web/.active-model.auto",
                 "config": web.config,
+                "worm_mode": False,
                 "autogenerate_manifest": False,
                 "backup_directory": "/some/barman/home/web",
                 "basebackups_directory": "/some/barman/home/web/base",
@@ -386,6 +393,7 @@ class TestConfig(object):
                 "backup_compression_workers": None,
                 "cluster": "web",
                 "compression": None,
+                "compression_level": "medium",
                 "conninfo": "host=web01 user=postgres port=5432",
                 "description": "Web applications database",
                 "incoming_wals_directory": "/some/barman/home/web/incoming",
@@ -394,6 +402,7 @@ class TestConfig(object):
                 "retention_policy": "redundancy 2",
                 "custom_compression_magic": None,
                 "wals_directory": "/some/barman/home/web/wals",
+                "xlogdb_directory": "/some/barman/home/web/wals",
                 "wal_retention_policy": "base",
                 "last_backup_maximum_age": timedelta(1),
                 "last_backup_minimum_size": 1048576,
@@ -772,10 +781,14 @@ class TestConfig(object):
             "barman_home": "/some/barman/home",
             "barman_user": "barman",
             "compression": "gzip",
+            "compression_level": "medium",
             "log_file": "/some/barman/home/log/barman.log",
             "log_level": "INFO",
             "retention_policy": "redundancy 2",
             "wal_retention_policy": "base",
+            "barman_lock_directory": "/some/barman/home",
+            "config_changes_queue": "/some/barman/home/cfg_changes.queue",
+            "lock_directory_cleanup": "true",
         }
         c = testing_helpers.build_config_from_dicts(global_conf=global_conf)
 
@@ -786,9 +799,13 @@ class TestConfig(object):
             "wal_retention_policy": "base",
             "retention_policy": "redundancy 2",
             "compression": "gzip",
+            "compression_level": "medium",
             "barman_user": "barman",
             "log_file": "/some/barman/home/log/barman.log",
             "archiver": "True",
+            "barman_lock_directory": "/some/barman/home",
+            "config_changes_queue": "/some/barman/home/cfg_changes.queue",
+            "lock_directory_cleanup": True,
         }
         assert c.global_config_to_json(False) == expected
 
@@ -1036,10 +1053,14 @@ class TestServerConfig(object):
             "barman_home": "/some/barman/home",
             "barman_user": "barman",
             "compression": "gzip",
+            "compression_level": "medium",
             "log_file": "/some/barman/home/log/barman.log",
             "log_level": "INFO",
             "retention_policy": "redundancy 2",
             "wal_retention_policy": "base",
+            "barman_lock_directory": "some",
+            "config_changes_queue": "some",
+            "lock_directory_cleanup": "true",
         }
         main_conf = {
             "active": "true",
@@ -1050,6 +1071,7 @@ class TestServerConfig(object):
             "backup_directory": "/some/barman/home/main",
             "basebackups_directory": "/some/barman/home/main/base",
             "wals_directory": "wals",
+            "xlogdb_directory": "wals",
             "incoming_wals_directory": "/some/barman/home/main/incoming",
             "backup_compression": '"none"',
             "custom_compression_filter": "bzip2 -c -9",
@@ -1081,13 +1103,26 @@ class TestServerConfig(object):
             "wal_retention_policy": "base",
             "retention_policy": "redundancy 3",
             "compression": "gzip",
+            "compression_level": "medium",
             "backup_compression": "none",
             "wals_directory": "wals",
+            "xlogdb_directory": "wals",
             "last_backup_minimum_size": 1048576,
         }
         expected = testing_helpers.build_config_dictionary(expected_override)
         for key in ["config", "_active_model_file", "active_model"]:
             del expected[key]
+        # Remove field that is not needed or is not part of a server specific config.
+        for key in [
+            "barman_home",
+            "barman_lock_directory",
+            "config_changes_queue",
+            "lock_directory_cleanup",
+            "msg_list",
+            "name",
+        ]:
+            del expected[key]
+
         assert main.to_json(False) == expected
 
         # Check `to_json(with_source=True)` works as expected
@@ -1333,6 +1368,7 @@ class TestModelConfig:
         expected = {
             "active": None,
             "archiver": None,
+            "worm_mode": None,
             "archiver_batch_size": None,
             "autogenerate_manifest": None,
             "aws_await_snapshots_timeout": None,
@@ -1358,6 +1394,7 @@ class TestModelConfig:
             "check_timeout": None,
             "cluster": "SOME_CLUSTER",
             "compression": None,
+            "compression_level": None,
             "conninfo": "SOME_CONNINFO",
             "create_slot": None,
             "custom_compression_filter": None,
@@ -1365,6 +1402,9 @@ class TestModelConfig:
             "custom_decompression_filter": None,
             "description": None,
             "disabled": None,
+            "encryption": None,
+            "encryption_key_id": None,
+            "encryption_passphrase_command": None,
             "forward_config_path": None,
             "gcp_project": None,
             "gcp_zone": None,
@@ -1373,6 +1413,7 @@ class TestModelConfig:
             "last_backup_maximum_age": None,
             "last_backup_minimum_size": None,
             "last_wal_maximum_age": None,
+            "combine_mode": None,
             "local_staging_path": None,
             "max_incoming_wals_queue": None,
             "minimum_redundancy": None,
@@ -1397,6 +1438,8 @@ class TestModelConfig:
             "snapshot_provider": None,
             "snapshot_zone": None,
             "ssh_command": None,
+            "staging_path": None,
+            "staging_location": None,
             "streaming_archiver": None,
             "streaming_archiver_batch_size": None,
             "streaming_archiver_name": None,
@@ -1426,6 +1469,7 @@ class TestModelConfig:
         expected = {
             "active": {"source": "SOME_SOURCE", "value": None},
             "archiver": {"source": "SOME_SOURCE", "value": None},
+            "worm_mode": {"source": "SOME_SOURCE", "value": None},
             "archiver_batch_size": {"source": "SOME_SOURCE", "value": None},
             "autogenerate_manifest": {"source": "SOME_SOURCE", "value": None},
             "aws_await_snapshots_timeout": {"source": "SOME_SOURCE", "value": None},
@@ -1457,6 +1501,7 @@ class TestModelConfig:
             "check_timeout": {"source": "SOME_SOURCE", "value": None},
             "cluster": {"source": "SOME_SOURCE", "value": "SOME_CLUSTER"},
             "compression": {"source": "SOME_SOURCE", "value": None},
+            "compression_level": {"source": "SOME_SOURCE", "value": None},
             "conninfo": {"source": "SOME_SOURCE", "value": "SOME_CONNINFO"},
             "create_slot": {"source": "SOME_SOURCE", "value": None},
             "custom_compression_filter": {"source": "SOME_SOURCE", "value": None},
@@ -1464,6 +1509,9 @@ class TestModelConfig:
             "custom_decompression_filter": {"source": "SOME_SOURCE", "value": None},
             "description": {"source": "SOME_SOURCE", "value": None},
             "disabled": {"source": "SOME_SOURCE", "value": None},
+            "encryption": {"source": "SOME_SOURCE", "value": None},
+            "encryption_key_id": {"source": "SOME_SOURCE", "value": None},
+            "encryption_passphrase_command": {"source": "SOME_SOURCE", "value": None},
             "forward_config_path": {"source": "SOME_SOURCE", "value": None},
             "gcp_project": {"source": "SOME_SOURCE", "value": None},
             "gcp_zone": {"source": "SOME_SOURCE", "value": None},
@@ -1472,6 +1520,7 @@ class TestModelConfig:
             "last_backup_maximum_age": {"source": "SOME_SOURCE", "value": None},
             "last_backup_minimum_size": {"source": "SOME_SOURCE", "value": None},
             "last_wal_maximum_age": {"source": "SOME_SOURCE", "value": None},
+            "combine_mode": {"source": "SOME_SOURCE", "value": None},
             "local_staging_path": {"source": "SOME_SOURCE", "value": None},
             "max_incoming_wals_queue": {"source": "SOME_SOURCE", "value": None},
             "minimum_redundancy": {"source": "SOME_SOURCE", "value": None},
@@ -1502,6 +1551,8 @@ class TestModelConfig:
             "snapshot_provider": {"source": "SOME_SOURCE", "value": None},
             "snapshot_zone": {"source": "SOME_SOURCE", "value": None},
             "ssh_command": {"source": "SOME_SOURCE", "value": None},
+            "staging_path": {"source": "SOME_SOURCE", "value": None},
+            "staging_location": {"source": "SOME_SOURCE", "value": None},
             "streaming_archiver": {"source": "SOME_SOURCE", "value": None},
             "streaming_archiver_batch_size": {"source": "SOME_SOURCE", "value": None},
             "streaming_archiver_name": {"source": "SOME_SOURCE", "value": None},
@@ -1787,6 +1838,14 @@ class TestCsvParsing(object):
         test case
         global value: recovery_options = 'get-wal'
         expected: recovery_options = empty RecoveryOptions obj
+
+        test case
+        global value: recovery_options = 'delta-restore'
+        expected: recovery_options = empty RecoveryOptions obj
+
+        test case
+        global value: recovery_options = 'delta-restore,get-wal'
+        expected: recovery_options = empty RecoveryOptions obj
         """
         # Build configuration with empty recovery_options
         c = testing_helpers.build_config_from_dicts(
@@ -1817,18 +1876,51 @@ class TestCsvParsing(object):
         )
         assert main.__dict__ == expected
 
+        # Build configuration with recovery_options set to get-wal
+        c = testing_helpers.build_config_from_dicts(
+            global_conf={"archiver": "on", "recovery_options": "delta-restore"},
+            main_conf=None,
+        )
+        main = c.get_server("main")
+
+        expected = testing_helpers.build_config_dictionary(
+            {
+                "config": c,
+                "recovery_options": RecoveryOptions("delta-restore", "", ""),
+            }
+        )
+        assert main.__dict__ == expected
+
+        # Build configuration with recovery_options set to get-wal
+        c = testing_helpers.build_config_from_dicts(
+            global_conf={"archiver": "on", "recovery_options": "delta-restore,get-wal"},
+            main_conf=None,
+        )
+        main = c.get_server("main")
+
+        expected = testing_helpers.build_config_dictionary(
+            {
+                "config": c,
+                "recovery_options": RecoveryOptions("delta-restore,get-wal", "", ""),
+            }
+        )
+        assert main.__dict__ == expected
+
     def test_recovery_option_parser(self):
         """
         Test of the RecoveryOptions class.
 
         Builds the class using '', then using
-        'get-wal' as values.
+        'get-wal' and 'delta-restore' as values.
         Tests for ValueError conditions
         """
         # Builds using the two allowed values
         assert set([]) == RecoveryOptions("", "", "")
         assert set([RecoveryOptions.GET_WAL]) == RecoveryOptions(
             RecoveryOptions.GET_WAL, "", ""
+        )
+        assert set([RecoveryOptions.DELTA_RESTORE]) == RecoveryOptions(
+            RecoveryOptions.DELTA_RESTORE, "", ""
         )
         # build using a not allowed value
         with pytest.raises(ValueError):
@@ -1970,6 +2062,17 @@ class TestBaseConfig:
 
 
 class TestConfigChangesProcessor:
+    @pytest.fixture(autouse=True)
+    def _allow_test_keys(self, monkeypatch):
+        """
+        In these unit tests we treat 'key1','key2','key3','key4'
+        as valid server options and 'key5','key6' as valid model options.
+        """
+        monkeypatch.setattr(ServerConfig, "KEYS", {"key1", "key2", "key3", "key4"})
+        monkeypatch.setattr(ServerConfig, "PARSERS", {})  # no special parsing
+        monkeypatch.setattr(ModelConfig, "KEYS", {"key5", "key6", "model", "cluster"})
+        monkeypatch.setattr(ModelConfig, "PARSERS", {})
+
     def test_receive_config_changes_existing_config(self, tmpdir):
         # test it is okay when updating existing servers and models config
         config = Mock()
@@ -1978,9 +2081,11 @@ class TestConfigChangesProcessor:
         queue_file.ensure(file=True)
         config.barman_home = tmpdir.strpath
         config.config_changes_queue = queue_file.strpath
+        # always override default
         config._config.get_config_source.return_value = "default"
-        config.get_server.side_effect = [Mock()] * 2 + [None]
-        config.get_model.side_effect = [None] * 2 + [Mock()]
+        # pretend the first two calls to get_server succeed, third yields None
+        config.get_server.side_effect = [Mock(), Mock(), None]
+        config.get_model.side_effect = [None, None, Mock()]
         processor = ConfigChangesProcessor(config)
 
         changes = [
@@ -1992,12 +2097,12 @@ class TestConfigChangesProcessor:
             },
             {
                 "server_name": "web",
-                "key3": "value3",
-                "key4": "value4",
+                "key1": "value3",
+                "key2": "value4",
                 "scope": "server",
             },
             {
-                "model_name": "my-model",
+                "model_name": "mymodel",
                 "key5": "value5",
                 "key6": "value6",
                 "scope": "model",
@@ -2006,146 +2111,113 @@ class TestConfigChangesProcessor:
 
         processor.receive_config_changes(changes)
 
-        with ConfigChangesQueue(config.config_changes_queue) as chgs_queue:
-            assert len(chgs_queue.queue) == 3
-            assert isinstance(chgs_queue.queue[0], ConfigChangeSet)
-            assert isinstance(chgs_queue.queue[1], ConfigChangeSet)
+        with ConfigChangesQueue(config.config_changes_queue) as q:
+            # we should have enqueued all three valid sections
+            assert len(q.queue) == 3
+            assert [cs.section for cs in q.queue] == ["main", "web", "mymodel"]
 
-            assert len(chgs_queue.queue[0].changes_set) == 2
-            assert isinstance(chgs_queue.queue[0].changes_set[0], ConfigChange)
-            assert isinstance(chgs_queue.queue[0].changes_set[1], ConfigChange)
-            assert chgs_queue.queue[0].section == "main"
-            assert chgs_queue.queue[0].changes_set[0].key == "key1"
-            assert chgs_queue.queue[0].changes_set[0].value == "value1"
-            assert chgs_queue.queue[0].changes_set[1].key == "key2"
-            assert chgs_queue.queue[0].changes_set[1].value == "value2"
+            # expected key/value pairs per section
+            expected = {
+                "main": [("key1", "value1"), ("key2", "value2")],
+                "web": [("key1", "value3"), ("key2", "value4")],
+                "mymodel": [("key5", "value5"), ("key6", "value6")],
+            }
+            for cs in q.queue:
+                # each has exactly 2 ConfigChange entries
+                assert len(cs.changes_set) == 2
+                for change in cs.changes_set:
+                    # correct key/value
+                    assert (change.key, change.value) in expected[cs.section]
+                    # config_file should be the auto.conf under barman_home
+                    assert change.config_file.endswith("/.barman.auto.conf")
 
-            assert len(chgs_queue.queue[1].changes_set) == 2
-            assert isinstance(chgs_queue.queue[1].changes_set[0], ConfigChange)
-            assert isinstance(chgs_queue.queue[1].changes_set[1], ConfigChange)
-            assert chgs_queue.queue[1].section == "web"
-            assert chgs_queue.queue[1].changes_set[0].key == "key3"
-            assert chgs_queue.queue[1].changes_set[0].value == "value3"
-            assert chgs_queue.queue[1].changes_set[1].key == "key4"
-            assert chgs_queue.queue[1].changes_set[1].value == "value4"
-
-            assert len(chgs_queue.queue[2].changes_set) == 2
-            assert isinstance(chgs_queue.queue[2].changes_set[0], ConfigChange)
-            assert isinstance(chgs_queue.queue[2].changes_set[1], ConfigChange)
-            assert chgs_queue.queue[2].section == "my-model"
-            assert chgs_queue.queue[2].changes_set[0].key == "key5"
-            assert chgs_queue.queue[2].changes_set[0].value == "value5"
-            assert chgs_queue.queue[2].changes_set[1].key == "key6"
-            assert chgs_queue.queue[2].changes_set[1].value == "value6"
-
-    @patch("barman.config.output.warning")
-    def test_receive_config_changes_warnings(self, mock_warning, tmpdir):
-        # test it throws the expected warnings when invalid requests are issued
-        # and that it ignores the changes instead of applying them
-        config = Mock()
+    @patch("barman.config.output.close_and_exit", side_effect=SystemExit)
+    @patch("barman.config.output.error")
+    def test_receive_config_changes_aborts_on_invalid(
+        self, mock_err, mock_exit, tmpdir
+    ):
+        cfg = Mock()
         queue_file = tmpdir.join("cfg_changes.queue")
         queue_file.write("[]")
         queue_file.ensure(file=True)
-        config.barman_home = tmpdir.strpath
-        config.config_changes_queue = queue_file.strpath
-        config._config.get_config_source.return_value = "default"
-        config.get_server.side_effect = [None, Mock(), None]
-        config.get_model.side_effect = [Mock(), None, None]
-        processor = ConfigChangesProcessor(config)
+        cfg.barman_home = tmpdir.strpath
+        cfg.config_changes_queue = queue_file.strpath
+        cfg.get_server.return_value = None
+        cfg.get_model.return_value = None
 
+        processor = ConfigChangesProcessor(cfg)
         changes = [
-            {"scope": "random"},  # invalid scope
-            {"scope": "server"},  # missing server_name
-            {"scope": "model"},  # missing model_name
-            {"scope": "server", "server_name": "my-model"},  # server is a model
-            {"scope": "model", "model_name": "my-server"},  # model is a server
-            {"scope": "model", "model_name": "my-model"},  # new model missing cluster
+            {"scope": "not-a-scope"},
+            {"server_name": "s1", "key1": "v1", "scope": "server"},
         ]
 
-        processor.receive_config_changes(changes)
+        with pytest.raises(SystemExit):
+            processor.receive_config_changes(changes)
 
-        with ConfigChangesQueue(config.config_changes_queue) as chgs_queue:
-            assert len(chgs_queue.queue) == 0
-
-        mock_warning.assert_has_calls(
-            [
-                call(
-                    "%r has been ignored because 'scope' is invalid: '%s'. It should be either 'server' or 'model'.",
-                    {"scope": "random"},
-                    "random",
-                ),
-                call(
-                    "%r has been ignored because 'server_name' is missing.",
-                    {"scope": "server"},
-                ),
-                call(
-                    "%r has been ignored because 'model_name' is missing.",
-                    {"scope": "model"},
-                ),
-                call(
-                    "%r has been ignored because '%s' is a model, not a server.",
-                    {"scope": "server", "server_name": "my-model"},
-                    "my-model",
-                ),
-                call(
-                    "%r has been ignored because '%s' is a server, not a model.",
-                    {"scope": "model", "model_name": "my-server"},
-                    "my-server",
-                ),
-                call(
-                    "%r has been ignored because it is a new model but 'cluster' is missing.",
-                    {"scope": "model", "model_name": "my-model"},
-                ),
-            ]
+        # expected message when aborting
+        mock_err.assert_called_with(
+            "Aborting config‐update: invalid section %r", {"scope": "not-a-scope"}
         )
+        # expected to call error both on exit and validation
+        assert mock_err.call_count == 2
+        mock_exit.assert_called_once()
+
+        # queue still empty
+        with ConfigChangesQueue(str(queue_file)) as q:
+            assert q.queue == []
+
+    @patch("barman.config.output.close_and_exit", side_effect=SystemExit)
+    @patch("barman.config.output.error")
+    def test_receive_config_changes_all_invalid(self, mock_err, mock_exit, tmpdir):
+        cfg = Mock()
+        queue_file = tmpdir.join("cfg_changes.queue")
+        queue_file.write("[]")
+        queue_file.ensure(file=True)
+        cfg.barman_home = tmpdir.strpath
+        cfg.config_changes_queue = queue_file.strpath
+
+        processor = ConfigChangesProcessor(cfg)
+        changes = [{"scope": "foo"}, {"scope": "bar"}]
+
+        with pytest.raises(SystemExit):
+            processor.receive_config_changes(changes)
+
+        # only the first invalid section should trigger error + exit
+        mock_err.assert_called_with(
+            "Aborting config‐update: invalid section %r", {"scope": "foo"}
+        )
+        assert mock_err.call_count == 2
+        mock_exit.assert_called_once()
+
+        with ConfigChangesQueue(str(queue_file)) as q:
+            assert q.queue == []
 
     @patch("barman.config.output.warning")
     def test_receive_config_changes_with_empty_or_malformed_queue_file(
         self, mock_warning, tmpdir
     ):
         # test it throws the expected warnings when invalid requests are issued
-        # and that it ignores the changes instead of applying them
+        # and that it aborts on invalid payload
         config = Mock()
         queue_file = tmpdir.join("cfg_changes.queue")
-        queue_file.ensure(file=True)
+        queue_file.ensure(file=True)  # empty file
         config.barman_home = tmpdir.strpath
         config.config_changes_queue = queue_file.strpath
         config._config.get_config_source.return_value = "default"
-        config.get_server.side_effect = [Mock()] * 2 + [None]
-        config.get_model.side_effect = [None] * 2 + [Mock()]
+        config.get_server.side_effect = [Mock(), None, None]
+        config.get_model.side_effect = [None, Mock(), None]
         processor = ConfigChangesProcessor(config)
 
-        changes = [
-            {
-                "server_name": "main",
-                "key1": "value1",
-                "key2": "value2",
-                "scope": "server",
-            }
-        ]
-
+        # single *valid* section → should enqueue
+        changes = [{"server_name": "main", "key1": "value1", "scope": "server"}]
         processor.receive_config_changes(changes)
 
-        with ConfigChangesQueue(config.config_changes_queue) as chgs_queue:
-            assert len(chgs_queue.queue) == 1
-            assert isinstance(chgs_queue.queue[0], ConfigChangeSet)
+        with ConfigChangesQueue(config.config_changes_queue) as q:
+            assert len(q.queue) == 1
 
-            assert len(chgs_queue.queue[0].changes_set) == 2
-            assert isinstance(chgs_queue.queue[0].changes_set[0], ConfigChange)
-            assert isinstance(chgs_queue.queue[0].changes_set[1], ConfigChange)
-            assert chgs_queue.queue[0].section == "main"
-            assert chgs_queue.queue[0].changes_set[0].key == "key1"
-            assert chgs_queue.queue[0].changes_set[0].value == "value1"
-            assert chgs_queue.queue[0].changes_set[1].key == "key2"
-            assert chgs_queue.queue[0].changes_set[1].value == "value2"
-
-        mock_warning.assert_has_calls(
-            [
-                call(
-                    "Malformed or empty configuration change queue: %s"
-                    % str(queue_file)
-                )
-            ]
+        # but because the queue-file was empty at start, we warned about that
+        mock_warning.assert_called_once_with(
+            "Malformed or empty configuration change queue: %s" % str(queue_file)
         )
 
     @patch("barman.config.output.info")
@@ -2202,7 +2274,6 @@ class TestConfigChangesProcessor:
         ]
 
         processor.receive_config_changes(changes)
-        # with patch("builtins.open", mock_open()) as mock_file:
         processor.process_conf_changes_queue()
 
         assert len(processor.applied_changes) == 2
@@ -2219,6 +2290,147 @@ class TestConfigChangesProcessor:
                 for i in range(1, 5)
             ]
         )
+
+
+class TestValidateSection:
+    @pytest.fixture(autouse=True)
+    def _setup_keys_parsers(self, monkeypatch):
+        # For these tests treat 'k1','k2' as valid server options
+        monkeypatch.setattr(ServerConfig, "KEYS", {"k1", "k2"})
+        monkeypatch.setattr(ServerConfig, "PARSERS", {})
+        # And 'm1','cluster','model' as valid model options
+        monkeypatch.setattr(ModelConfig, "KEYS", {"m1", "cluster", "model"})
+        monkeypatch.setattr(ModelConfig, "PARSERS", {})
+
+    @pytest.fixture
+    def processor(self):
+        cfg = Mock()
+        cfg.get_server.return_value = None
+        cfg.get_model.return_value = None
+        return ConfigChangesProcessor(cfg)
+
+    @patch("barman.config.output.error")
+    def test_scope_invalid(self, mock_err, processor):
+        raw = {"scope": "bad"}
+        ok, name, opts = processor._validate_section(raw.copy())
+        assert not ok and name is None and opts is None
+        mock_err.assert_called_once_with(
+            "Invalid section %r: 'scope' is invalid: '%s'. It should be either 'server' or 'model'.",
+            raw,
+            "bad",
+        )
+
+    @patch("barman.config.output.error")
+    def test_missing_server_name(self, mock_err, processor):
+        raw = {"scope": "server", "foo": "bar"}
+        ok, name, opts = processor._validate_section(raw.copy())
+        assert not ok and name is None and opts is None
+        mock_err.assert_called_once_with(
+            "Invalid section %r: '%s' is missing.",
+            raw,
+            "server_name",
+        )
+
+    @patch("barman.config.output.error")
+    def test_missing_model_name(self, mock_err, processor):
+        raw = {"scope": "model", "foo": "bar"}
+        ok, name, opts = processor._validate_section(raw.copy())
+        assert not ok and name is None and opts is None
+        mock_err.assert_called_once_with(
+            "Invalid section %r: '%s' is missing.",
+            raw,
+            "model_name",
+        )
+
+    @patch("barman.config.output.error")
+    def test_server_conflicts_with_model(self, mock_err, processor):
+        processor.config.get_model.return_value = object()
+        raw = {"scope": "server", "server_name": "s1"}
+        ok, _, _ = processor._validate_section(raw.copy())
+        assert not ok
+        mock_err.assert_called_once_with(
+            "Invalid section %r: '%s' is a model, not a server.",
+            raw,
+            "s1",
+        )
+
+    @patch("barman.config.output.error")
+    def test_model_conflicts_with_server(self, mock_err, processor):
+        processor.config.get_server.return_value = object()
+        raw = {"scope": "model", "model_name": "m1", "cluster": "c1"}
+        ok, _, _ = processor._validate_section(raw.copy())
+        assert not ok
+        mock_err.assert_called_once_with(
+            "Invalid section %r: '%s' is a server, not a model.",
+            raw,
+            "m1",
+        )
+
+    @patch("barman.config.output.error")
+    def test_new_model_missing_cluster(self, mock_err, processor):
+        raw = {"scope": "model", "model_name": "m1"}
+        ok, _, _ = processor._validate_section(raw.copy())
+        assert not ok
+        mock_err.assert_called_once_with(
+            "Invalid section %r: new model but 'cluster' is missing.",
+            raw,
+        )
+
+    @patch("barman.config.output.error")
+    def test_new_model_with_cluster(self, mock_err, processor):
+        raw = {"scope": "model", "model_name": "m1", "cluster": "c1"}
+        ok, name, opts = processor._validate_section(raw.copy())
+        assert ok and name == "m1"
+        # use model=on plus existing cluster
+        assert opts == {"cluster": "c1", "model": "on"}
+        mock_err.assert_not_called()
+
+    @patch("barman.config.output.error")
+    def test_invalid_option_key(self, mock_err, processor):
+        raw = {"scope": "server", "server_name": "s", "bad": "x"}
+        ok, _, _ = processor._validate_section(raw.copy())
+        assert not ok
+        mock_err.assert_called_once_with(
+            "Invalid option '%s' for %s '%s'",
+            "bad",
+            "server",
+            "s",
+        )
+
+    @patch("barman.config.output.error")
+    def test_value_parsing_invalid(self, mock_err, processor, monkeypatch):
+        # parser for k1 raises
+        def fail(v):
+            raise ValueError("oops")
+
+        monkeypatch.setattr(ServerConfig, "PARSERS", {"k1": fail})
+        raw = {"scope": "server", "server_name": "s", "k1": "v1"}
+        ok, _, _ = processor._validate_section(raw.copy())
+        assert not ok
+        fmt, scope_arg, name_arg, key_arg, err = mock_err.call_args[0]
+        assert fmt == "Validation failed for %s '%s': key '%s' -> %s"
+        assert (scope_arg, name_arg, key_arg) == ("server", "s", "k1")
+        assert isinstance(err, ValueError)
+
+    @patch("barman.config.output.error")
+    def test_value_parsing_valid(self, mock_err, processor, monkeypatch):
+        # parser for k1 succeeds
+        def good(v):
+            return v
+
+        monkeypatch.setattr(ServerConfig, "PARSERS", {"k1": good})
+        raw = {"scope": "server", "server_name": "s", "k1": "v1"}
+        ok, name, opts = processor._validate_section(raw.copy())
+        assert ok and name == "s"
+        assert opts == {"k1": "v1"}
+        mock_err.assert_not_called()
+
+    def test_unknown_key_accepted(self, processor):
+        # k2 in KEYS but with no parser is accepted
+        raw = {"scope": "server", "server_name": "s", "k2": "v2"}
+        ok, name, opts = processor._validate_section(raw.copy())
+        assert ok and name == "s"
+        assert opts == {"k2": "v2"}
 
 
 class TestConfigChangeQueue:

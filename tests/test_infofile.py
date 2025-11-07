@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -17,6 +17,7 @@
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
 import copy
+import io
 import json
 import os
 import warnings
@@ -33,6 +34,7 @@ from testing_helpers import (
     build_test_backup_info,
 )
 
+from barman import xlog
 from barman.cloud_providers.aws_s3 import AwsSnapshotMetadata, AwsSnapshotsInfo
 from barman.cloud_providers.azure_blob_storage import (
     AzureSnapshotMetadata,
@@ -47,7 +49,7 @@ from barman.infofile import (
     Field,
     FieldListFile,
     LocalBackupInfo,
-    SyntheticBackupInfo,
+    VolatileBackupInfo,
     WalFileInfo,
     dump_backup_ids,
     load_backup_ids,
@@ -270,107 +272,192 @@ class TestFieldListFile(object):
 
 # noinspection PyMethodMayBeStatic
 class TestWalFileInfo(object):
+    @mock.patch("barman.encryption.EncryptionManager")
     @mock.patch("barman.compression.CompressionManager")
-    def test_from_file_no_compression(self, mock_compression_manager, tmpdir):
+    def test_from_file_no_compression(
+        self, mock_compression_manager, mock_encryption_manager, tmpdir
+    ):
         tmp_file = tmpdir.join("000000000000000000000001")
         tmp_file.write("dummy_content\n")
         stat = os.stat(tmp_file.strpath)
-        wfile_info = WalFileInfo.from_file(tmp_file.strpath, mock_compression_manager)
+        wfile_info = WalFileInfo.from_file(
+            filename=tmp_file.strpath,
+            compression_manager=mock_compression_manager,
+            encryption_manager=mock_encryption_manager,
+        )
         assert wfile_info.name == tmp_file.basename
         assert wfile_info.size == stat.st_size
         assert wfile_info.time == stat.st_mtime
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
 
+    @mock.patch("barman.encryption.EncryptionManager")
     @mock.patch("barman.compression.CompressionManager")
-    def test_from_file_compression(self, mock_compression_manager, tmpdir):
+    def test_from_file_compression(
+        self, mock_compression_manager, mock_encryption_manager, tmpdir
+    ):
         # prepare
         mock_compression_manager.identify_compression.return_value = "test_compression"
 
         tmp_file = tmpdir.join("000000000000000000000001")
         tmp_file.write("dummy_content\n")
-        wfile_info = WalFileInfo.from_file(tmp_file.strpath, mock_compression_manager)
+        wfile_info = WalFileInfo.from_file(
+            filename=tmp_file.strpath,
+            compression_manager=mock_compression_manager,
+            encryption_manager=mock_encryption_manager,
+            encryption=None,
+        )
         assert wfile_info.name == tmp_file.basename
         assert wfile_info.size == tmp_file.size()
         assert wfile_info.time == tmp_file.mtime()
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
+        assert wfile_info.encryption is None
         assert wfile_info.compression == "test_compression"
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
 
+    @mock.patch("barman.encryption.EncryptionManager")
     @mock.patch("barman.compression.CompressionManager")
-    def test_from_file_unidentified_compression(self, mock_compression_manager, tmpdir):
+    def test_from_file_unidentified_compression(
+        self, mock_compression_manager, mock_encryption_manager, tmpdir
+    ):
         # prepare
         mock_compression_manager.identify_compression.return_value = None
         tmp_file = tmpdir.join("00000001000000E500000064")
         tmp_file.write("dummy_content\n")
         wfile_info = WalFileInfo.from_file(
-            tmp_file.strpath,
-            mock_compression_manager,
+            filename=tmp_file.strpath,
+            compression_manager=mock_compression_manager,
             unidentified_compression="test_unidentified_compression",
+            encryption_manager=mock_encryption_manager,
+            encryption=None,
         )
         assert wfile_info.name == tmp_file.basename
         assert wfile_info.size == tmp_file.size()
         assert wfile_info.time == tmp_file.mtime()
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
+        assert wfile_info.encryption is None
         assert wfile_info.compression == "test_unidentified_compression"
         assert wfile_info.relpath() == ("00000001000000E5/00000001000000E500000064")
 
+    @mock.patch("barman.encryption.EncryptionManager")
     @mock.patch("barman.compression.CompressionManager")
-    def test_from_file_override_compression(self, mock_compression_manager, tmpdir):
+    def test_from_file_override_compression(
+        self, mock_compression_manager, mock_encryption_manager, tmpdir
+    ):
         # prepare
         mock_compression_manager.identify_compression.return_value = None
 
         tmp_file = tmpdir.join("000000000000000000000001")
         tmp_file.write("dummy_content\n")
         wfile_info = WalFileInfo.from_file(
-            tmp_file.strpath,
-            mock_compression_manager,
+            filename=tmp_file.strpath,
+            compression_manager=mock_compression_manager,
             compression="test_override_compression",
+            encryption_manager=mock_encryption_manager,
+            encryption=None,
         )
         assert wfile_info.name == tmp_file.basename
         assert wfile_info.size == tmp_file.size()
         assert wfile_info.time == tmp_file.mtime()
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
+        assert wfile_info.encryption is None
         assert wfile_info.compression == "test_override_compression"
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
 
+    @mock.patch("barman.encryption.EncryptionManager")
     @mock.patch("barman.compression.CompressionManager")
-    def test_from_file_override(self, compression_manager, tmpdir):
+    def test_from_file_override(
+        self, compression_manager, mock_encryption_manager, tmpdir
+    ):
         # prepare
         compression_manager.identify_compression.return_value = None
         compression_manager.unidentified_compression = None
-
+        mock_encryption_manager.identify_encryption.return_vale = None
         tmp_file = tmpdir.join("000000000000000000000001")
         tmp_file.write("dummy_content\n")
 
         wfile_info = WalFileInfo.from_file(
-            tmp_file.strpath, compression_manager, name="000000000000000000000002"
+            filename=tmp_file.strpath,
+            compression_manager=compression_manager,
+            name="000000000000000000000002",
+            encryption_manager=mock_encryption_manager,
+            encryption=None,
         )
         assert wfile_info.name == "000000000000000000000002"
         assert wfile_info.size == tmp_file.size()
         assert wfile_info.time == tmp_file.mtime()
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
         assert wfile_info.compression is None
+        assert wfile_info.encryption is None
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000002")
 
         wfile_info = WalFileInfo.from_file(
-            tmp_file.strpath, compression_manager, size=42
+            filename=tmp_file.strpath,
+            compression_manager=compression_manager,
+            size=42,
+            encryption_manager=mock_encryption_manager,
+            encryption=None,
         )
         assert wfile_info.name == tmp_file.basename
         assert wfile_info.size == 42
         assert wfile_info.time == tmp_file.mtime()
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
         assert wfile_info.compression is None
+        assert wfile_info.encryption is None
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
 
         wfile_info = WalFileInfo.from_file(
-            tmp_file.strpath, compression_manager, time=43
+            filename=tmp_file.strpath,
+            compression_manager=compression_manager,
+            time=43,
+            encryption_manager=mock_encryption_manager,
+            encryption=None,
         )
         assert wfile_info.name == tmp_file.basename
         assert wfile_info.size == tmp_file.size()
         assert wfile_info.time == 43
         assert wfile_info.filename == "%s.meta" % tmp_file.strpath
         assert wfile_info.compression is None
+        assert wfile_info.encryption is None
+        assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
+
+    @mock.patch("barman.encryption.EncryptionManager")
+    def test_from_file_encryption(self, mock_encryption_manager, tmpdir):
+        # prepare
+        mock_encryption_manager.identify_encryption.return_value = "test_encryption"
+
+        tmp_file = tmpdir.join("000000000000000000000001")
+        tmp_file.write("dummy_content\n")
+        wfile_info = WalFileInfo.from_file(
+            tmp_file.strpath,
+            encryption_manager=mock_encryption_manager,
+        )
+        assert wfile_info.name == tmp_file.basename
+        assert wfile_info.size == tmp_file.size()
+        assert wfile_info.time == tmp_file.mtime()
+        assert wfile_info.filename == "%s.meta" % tmp_file.strpath
+        assert wfile_info.compression is None
+        assert wfile_info.encryption == "test_encryption"
+        assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
+
+    @mock.patch("barman.encryption.EncryptionManager")
+    def test_from_file_override_encryption(self, encryption_manager, tmpdir):
+        # prepare
+        encryption_manager.identify_encryption.return_value = None
+
+        tmp_file = tmpdir.join("000000000000000000000001")
+        tmp_file.write("dummy_content\n")
+        wfile_info = WalFileInfo.from_file(
+            tmp_file.strpath,
+            encryption_manager=encryption_manager,
+            encryption="test_override_encryption",
+        )
+        assert wfile_info.name == tmp_file.basename
+        assert wfile_info.size == tmp_file.size()
+        assert wfile_info.time == tmp_file.mtime()
+        assert wfile_info.filename == "%s.meta" % tmp_file.strpath
+        assert wfile_info.compression is None
+        assert wfile_info.encryption == "test_override_encryption"
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
 
     def test_to_xlogdb_line(self):
@@ -379,10 +466,11 @@ class TestWalFileInfo(object):
         wfile_info.size = 42
         wfile_info.time = 43
         wfile_info.compression = None
+        wfile_info.encryption = None
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000002")
 
         assert wfile_info.to_xlogdb_line() == (
-            "000000000000000000000002\t42\t43\tNone\n"
+            "000000000000000000000002\t42\t43\tNone\tNone\n"
         )
 
     def test_from_xlogdb_line(self):
@@ -395,6 +483,7 @@ class TestWalFileInfo(object):
         wfile_info.size = 42
         wfile_info.time = 43
         wfile_info.compression = None
+        wfile_info.encryption = None
         assert wfile_info.relpath() == ("0000000000000000/000000000000000000000001")
 
         # mock a server object
@@ -403,7 +492,7 @@ class TestWalFileInfo(object):
 
         # parse the string
         info_file = wfile_info.from_xlogdb_line(
-            "000000000000000000000001\t42\t43\tNone\n"
+            "000000000000000000000001\t42\t43\tNone\tNone\n"
         )
 
         assert list(wfile_info.items()) == list(info_file.items())
@@ -473,7 +562,7 @@ class TestBackupInfo(object):
         # we want to test the loading of BackupInfo data from local file.
         # So we create a file into the tmpdir containing a
         # valid BackupInfo dump
-        infofile = tmpdir.join("backup.info")
+        infofile = tmpdir.join("fake_name-backup.info")
         infofile.write("")
         # Mock the server, we don't need it at the moment
         server = build_mocked_server(name="test_server")
@@ -505,9 +594,14 @@ class TestBackupInfo(object):
         # we instruct the configuration on the position of the
         # testing backup.info file
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        infofile = tmpdir.mkdir("fake_name").join("backup.info")
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         infofile.write(BASE_BACKUP_INFO)
         # Load the backup.info file using the backup_id
         b_info = LocalBackupInfo(server, backup_id="fake_name")
@@ -543,13 +637,24 @@ class TestBackupInfo(object):
         Ensure :meth:`LocalBackupInfo.is_orphan` returns the correct value.
         """
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
 
         # Case 1: Orphan backup (only backup.info file, status not empty)
         backup_dir = tmpdir.mkdir("orphan_backup")
         backup_info_path = backup_dir.join("backup.info")
         backup_info_path.write("status = DONE\n")
+        b_info = LocalBackupInfo(server, backup_id="orphan_backup")
+        b_info.status = BackupInfo.DONE
+        assert b_info.is_orphan is True
+
+        # Case 1-B: Same case but for the new location of backup.info introduced in 3.13.2
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        backup_info_path = meta_dir.join("fake_backup_id-backup.info")
         b_info = LocalBackupInfo(server, backup_id="orphan_backup")
         b_info.status = BackupInfo.DONE
         assert b_info.is_orphan is True
@@ -563,11 +668,32 @@ class TestBackupInfo(object):
         b_info.status = BackupInfo.DONE
         assert b_info.is_orphan is False
 
+        # Case 2-B: Same case but for the new location of backup.info introduced in 3.13.2
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        backup_info_path = meta_dir.join("not_orphan_backup2-backup.info")
+        backup_info_path.write("status = DONE\n")
+        backup_dir = tmpdir.mkdir("not_orphan_backup2")
+        backup_dir.join("other_file").write("some content")
+        b_info = LocalBackupInfo(server, backup_id="not_orphan_backup2")
+        b_info.status = BackupInfo.DONE
+        assert b_info.is_orphan is False
+
         # Case 3: Not orphan (status is empty)
         backup_dir = tmpdir.mkdir("empty_status_backup")
         backup_info_path = backup_dir.join("backup.info")
         backup_info_path.write("status = EMPTY\n")
         b_info = LocalBackupInfo(server, backup_id="empty_status_backup")
+        b_info.status = BackupInfo.EMPTY
+        assert b_info.is_orphan is False
+
+        # Case 3-B: Same case but for the new location of backup.info introduced in 3.13.2
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        backup_info_path = meta_dir.join("empty_status_backup2-backup.info")
+        backup_info_path.write("status = EMPTY\n")
+        backup_dir = tmpdir.mkdir("empty_status_backup2")
+        b_info = LocalBackupInfo(server, backup_id="empty_status_backup2")
         b_info.status = BackupInfo.EMPTY
         assert b_info.is_orphan is False
 
@@ -584,10 +710,14 @@ class TestBackupInfo(object):
         # Load a backup.info file, modify the BackupInfo object
         # then save it.
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.FAILED
         b_info.save()
@@ -625,13 +755,18 @@ class TestBackupInfo(object):
         with backup_version
         """
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
 
         # Build a fake v2 backup
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        info_file = meta_dir.join("fake_backup_id-backup.info")
         backup_dir = tmpdir.mkdir("fake_backup_id")
         data_dir = backup_dir.mkdir("data")
-        info_file = backup_dir.join("backup.info")
         info_file.write(BASE_BACKUP_INFO)
         b_info = LocalBackupInfo(server, backup_id="fake_backup_id")
 
@@ -643,7 +778,7 @@ class TestBackupInfo(object):
         # Build a fake v1 backup
         backup_dir = tmpdir.mkdir("another_fake_backup_id")
         pgdata_dir = backup_dir.mkdir("pgdata")
-        info_file = backup_dir.join("backup.info")
+        info_file = meta_dir.join("another_fake_backup_id-backup.info")
         info_file.write(BASE_BACKUP_INFO)
         b_info = LocalBackupInfo(server, backup_id="another_fake_backup_id")
 
@@ -669,12 +804,16 @@ class TestBackupInfo(object):
 
     def test_to_json(self, tmpdir):
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
 
         # Build a fake backup
-        backup_dir = tmpdir.mkdir("fake_backup_id")
-        info_file = backup_dir.join("backup.info")
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        info_file = meta_dir.join("fake_backup_id-backup.info")
         info_file.write(BASE_BACKUP_INFO)
         b_info = LocalBackupInfo(server, backup_id="fake_backup_id")
 
@@ -683,12 +822,16 @@ class TestBackupInfo(object):
 
     def test_from_json(self, tmpdir):
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
 
         # Build a fake backup
-        backup_dir = tmpdir.mkdir("fake_backup_id")
-        info_file = backup_dir.join("backup.info")
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        info_file = meta_dir.join("fake_backup_id-backup.info")
         info_file.write(BASE_BACKUP_INFO)
         b_info = LocalBackupInfo(server, backup_id="fake_backup_id")
 
@@ -707,7 +850,7 @@ class TestBackupInfo(object):
         # also for retrocompatibility with backup info which
         # doesn't contain the xlog_segment_size field.
 
-        infofile = tmpdir.join("backup.info")
+        infofile = tmpdir.join("fake_backup_info-backup.info")
         infofile.write("")
 
         # Mock the server, we don't need it at the moment
@@ -721,13 +864,17 @@ class TestBackupInfo(object):
     @mock.patch("barman.postgres.PostgreSQLConnection.connect")
     def test_backupinfo_load(self, connect_mock, tmpdir):
         server = build_real_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
 
         # Build a fake backup info and try to load id, to ensure that we won't
         # need a PostgreSQL connection to do that
-        backup_dir = tmpdir.mkdir("fake_backup_id")
-        info_file = backup_dir.join("backup.info")
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        info_file = meta_dir.join("backup.info")
         info_file.write(BASE_BACKUP_INFO)
 
         # Monkey patch the PostgreSQL connection function to raise a
@@ -742,7 +889,7 @@ class TestBackupInfo(object):
         """
         Test handling of postgres version in BackupInfo object
         """
-        infofile = tmpdir.join("backup.info")
+        infofile = tmpdir.join("fake_name-backup.info")
         infofile.write(BASE_BACKUP_INFO)
         server = build_mocked_server()
         b_info = LocalBackupInfo(server, info_file=infofile.strpath)
@@ -760,10 +907,14 @@ class TestBackupInfo(object):
         """
         # GIVEN a backup.info file for a server
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.DONE
 
@@ -782,10 +933,14 @@ class TestBackupInfo(object):
         """
         # GIVEN a backup.info file for a server
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.DONE
 
@@ -803,10 +958,14 @@ class TestBackupInfo(object):
         """
         # GIVEN a backup.info file for a server
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.DONE
 
@@ -854,10 +1013,14 @@ class TestBackupInfo(object):
         """
         # GIVEN a backup.info file for a server
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.DONE
 
@@ -906,10 +1069,14 @@ class TestBackupInfo(object):
         """
         # GIVEN a backup.info file for a server
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.DONE
 
@@ -961,10 +1128,14 @@ class TestBackupInfo(object):
         """
         # GIVEN a backup.info file for a server
         server = build_mocked_server(
-            main_conf={"basebackups_directory": tmpdir.strpath},
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
         )
-        backup_dir = tmpdir.mkdir("fake_name")
-        infofile = backup_dir.join("backup.info")
+        server_dir = tmpdir.join("main")
+        meta_dir = server_dir.join("meta")
+        infofile = meta_dir.join("fake_name-backup.info")
         b_info = LocalBackupInfo(server, backup_id="fake_name")
         b_info.status = BackupInfo.DONE
 
@@ -1280,16 +1451,23 @@ class TestLocalBackupInfo:
             walk_mock.return_value = (incremental2, incremental1, root_backup)
             assert incremental3.is_checksum_consistent() is expected
 
+    @pytest.mark.parametrize(
+        ("backup_method", "is_incremental"),
+        [
+            ("postgres", False),
+            ("rsync", False),
+        ],
+    )
     @patch("barman.infofile.BackupInfo.is_incremental", new_callable=PropertyMock)
-    def test_true_is_full_and_eligible_for_incremental(self, mock_is_incremental):
+    def test_true_is_full(self, mock_is_incremental, backup_method, is_incremental):
         """
-        Test that the function applies the correct conditions for a full backup
-        that is eligible for incremental mode. The backup_method should be `postgres`,
-        the summarize_wal should be ``on`` and backup should be incremental.
+        Test that the function applies the correct conditions for a full backup. The
+        backup_method should not be ``snapshot`` and the backup should not be
+        incremental.
+
+        It tests if the backup is a full backup.
         """
-        mock_is_incremental.return_value = False
-        backup_method = "postgres"
-        summarize_wal = "on"
+        mock_is_incremental.return_value = is_incremental
 
         pg_backup_manager = build_backup_manager(
             main_conf={"backup_method": backup_method}
@@ -1298,31 +1476,25 @@ class TestLocalBackupInfo:
         backup_info = build_test_backup_info(
             server=pg_backup_manager.server,
             backup_id="12345",
-            summarize_wal=summarize_wal,
         )
 
-        assert backup_info.is_full_and_eligible_for_incremental()
+        assert backup_info.is_full
 
     @pytest.mark.parametrize(
-        ("backup_method", "summarize_wal", "is_incremental"),
+        ("backup_method", "is_incremental"),
         [
-            ("postgres", "on", True),
-            ("postgres", "off", True),
-            ("postgres", "off", False),
-            ("rsync", "on", True),
-            ("rsync", "on", False),
-            ("rsync", "off", True),
-            ("rsync", "off", False),
+            ("postgres", True),
+            ("snapshot", False),
         ],
     )
     @patch("barman.infofile.BackupInfo.is_incremental", new_callable=PropertyMock)
-    def test_false_is_full_and_eligible_for_incremental(
-        self, mock_is_incremental, backup_method, summarize_wal, is_incremental
-    ):
+    def test_false_is_full(self, mock_is_incremental, backup_method, is_incremental):
         """
-        Test that the function applies the correct conditions for a full backup
-        that is eligible for incremental mode. The backup_method should be `postgres`,
-        the summarize_wal should be `on` and backup should be incremental.
+        Test that the function applies the correct conditions for a full backup. The
+        ``backup_method`` should not be ``snapshot`` and the backup should not be
+        incremental.
+
+        It tests if the backup is not a full backup.
         """
         mock_is_incremental.return_value = is_incremental
 
@@ -1333,79 +1505,175 @@ class TestLocalBackupInfo:
         backup_info = build_test_backup_info(
             server=backup_manager.server,
             backup_id="12345",
-            summarize_wal=summarize_wal,
         )
 
-        assert not backup_info.is_full_and_eligible_for_incremental()
+        assert not backup_info.is_full
 
-
-class TestSyntheticBackupInfo:
-    """
-    this class tests the methods of the SyntheticBackupInfo object
-    """
-
-    def test_init_synthetic_backup_info_with_backup_id(self):
+    @pytest.mark.parametrize("target", ["data", "standalone", "full", "wal"])
+    @patch("barman.infofile.LocalBackupInfo.get_required_wal_segments")
+    @patch("barman.infofile.LocalBackupInfo.get_basebackup_directory")
+    def test_get_directory_entries(
+        self,
+        mock_base_backup_dir,
+        mock_required_wal_segments,
+        target,
+        tmpdir,
+    ):
         """
-        Unit test for the __init__ method using backup_id.
+        Test that `get_directory_entries` yields files under the backup directory for
+        each target and empty dirs when requested.
+        """
+        backup_id = "test_backup"
+        server = build_mocked_server(main_conf={"backup_directory": tmpdir.strpath})
+        base_dir = tmpdir.mkdir("base")
+        wals_dir = tmpdir.mkdir("wals")
+        backup_dir = base_dir.mkdir(backup_id)
+        data_dir = backup_dir.mkdir("data")
+        # Create empty subdirectories
+        empty1 = data_dir.mkdir("empty1")
+        empty2 = data_dir.mkdir("empty2")
+        # Create a non-empty directory
+        non_empty = data_dir.mkdir("not_empty")
+        file_path = non_empty.join("file.txt")
+        file_path.write("content")
+        b_info = LocalBackupInfo(server, backup_id=backup_id)
+        mock_base_backup_dir.return_value = backup_dir
+        segment_name = "%08X%08X%08X" % (1, 1, 0)
+        mock_required_wal_segments.return_value = [segment_name]
+        server.get_wal_full_path.side_effect = lambda x: os.path.join(
+            wals_dir,
+            xlog.hash_dir(x),
+            x,
+        )
+        wal1_file_path = os.path.join(
+            wals_dir,
+            xlog.hash_dir(segment_name),
+            segment_name,
+        )
 
-        Create mock server and a SyntheticBackupInfo object.
+        server.get_wal_until_next_backup.return_value = [
+            WalFileInfo.from_xlogdb_line("000000000000000000000002 42 43 none none ")
+        ]
 
-        This unit tests checks:
-            * base_directory parameter
-            * backup_id parameter
-            * instance type
+        wal2_file_path = os.path.join(
+            wals_dir,
+            "0000000000000000",
+            "000000000000000000000002",
+        )
+
+        # Collect all yielded
+        entries_list = list(b_info.get_directory_entries(target, empty_dirs=True))
+        # Should include all files and empty directories.
+        if target in ("full", "standalone", "data"):
+            assert str(file_path) in entries_list
+            assert str(empty1) in entries_list
+            assert str(empty2) in entries_list
+        # Should include only the WAL from `get_required_wal_segments`, not the one from
+        # `get_wal_until_next_backup`
+        if target == "standalone":
+            assert str(wal1_file_path) in entries_list
+            assert str(wal2_file_path) not in entries_list
+        # Should include only the WAL from `get_wal_until_next_backup`, not the one from
+        # `get_required_wal_segments`
+        if target in ("full", "wal"):
+            assert str(wal2_file_path) in entries_list
+            assert str(wal1_file_path) not in entries_list
+        # Should not include WALs
+        if target == "data":
+            assert str(wal2_file_path) not in entries_list
+            assert str(wal1_file_path) not in entries_list
+
+        # Collect only "files" yielded
+        entries_list = list(b_info.get_directory_entries(target))
+        # Should not include empty directories.
+        if target in ("full", "standalone", "data"):
+            assert str(file_path) in entries_list
+            assert str(empty1) not in entries_list
+            assert str(empty2) not in entries_list
+
+    def test_load_unknown_field(self, tmpdir, caplog):
+        server = build_mocked_server()
+        infofile = tmpdir.mkdir("backup_id").join("backup.info")
+        infofile.write(BASE_BACKUP_INFO)
+        infofile.write("dummy=15\n")
+        with pytest.raises(SystemExit):
+            dummy = LocalBackupInfo(server=server, info_file=infofile.strpath)
+            dummy.load(infofile.strpath)
+
+        assert "Unsupported field 'dummy' found in backup metadata" in caplog.text
+
+
+class TestVolatileBackupInfo:
+    """
+    Unit tests for the :class:`VolatileBackupInfo` class.
+    """
+
+    @mock.patch("barman.infofile.LocalBackupInfo.__init__", return_value=None)
+    def test_volatile_backup_info_init_calls_super(self, mock_local_backup_info_init):
+        """
+        Test that :class:`VolatileBackupInfo` correctly calls the superclass
+        :class:`LocalBackupInfo` during initialization.
         """
         server = build_mocked_server()
-        base_directory = "fake/path/"
-        backup_id = "fake_name"
-        obj = SyntheticBackupInfo(
+        base_directory = "/fake/path/"
+        backup_id = "fake_backup_id"
+
+        # Initialize VolatileBackupInfo
+        volatile_backup_info = VolatileBackupInfo(
             server=server,
             base_directory=base_directory,
             backup_id=backup_id,
-            info_file=None,
         )
-        assert obj.base_directory == base_directory
-        assert obj.backup_id == backup_id
-        assert isinstance(obj, SyntheticBackupInfo)
 
-    def test_init_synthetic_backup_info_with_info_file(self, tmpdir):
-        """
-        Unit test for the __init__ method using info_file.
-
-        Create mock server and a SyntheticBackupInfo object.
-
-        This unit tests checks:
-            * base_directory parameter
-            * filename parameter
-            * instance type
-        """
-        server = build_mocked_server()
-        base_directory = "fake/path/"
-        backup_id = "fake_name"
-        infofile = tmpdir.mkdir(backup_id).join("backup.info")
-        infofile.write(BASE_BACKUP_INFO)
-        obj = SyntheticBackupInfo(
-            server=server,
-            base_directory=base_directory,
-            backup_id=None,
-            info_file=infofile.strpath,
+        # Assert that the superclass __init__ was called with the correct arguments
+        mock_local_backup_info_init.assert_called_once_with(
+            server,
+            None,
+            backup_id,
         )
-        assert obj.base_directory == base_directory
-        assert obj.filename == infofile.strpath
-        assert isinstance(obj, SyntheticBackupInfo)
+
+        # Ensure the object is an instance of VolatileBackupInfo
+        assert isinstance(volatile_backup_info, VolatileBackupInfo)
 
     def test_get_basebackup_directory(self):
         """
-        Unit test for the get_basebackup_directory.
-
-        Create mock server and a SyntheticBackupInfo object.
-
-        This unit tests checks if the method returns the correct path based on
-        base_directory and backup_id.
+        Test the :meth:`get_basebackup_directory` method.
         """
         server = build_mocked_server()
-        backup_info = SyntheticBackupInfo(
-            server=server, base_directory="/fake/path/", backup_id="fake_name"
+        base_directory = "/fake/path/"
+        backup_id = "fake_backup_id"
+        volatile_backup_info = VolatileBackupInfo(
+            server=server,
+            base_directory=base_directory,
+            backup_id=backup_id,
         )
-        directory = backup_info.get_basebackup_directory()
-        assert directory == "/fake/path/fake_name"
+        expected_directory = os.path.join(base_directory, backup_id)
+        assert volatile_backup_info.get_basebackup_directory() == expected_directory
+
+    def test_volatile_backup_info_save_to_file_not_allowed(self):
+        """
+        Test that the :meth:`save` method of :class:`VolatileBackupInfo` raises a
+        :exc:`ValueError` if attempted to be saved to a file.
+        """
+        server = build_mocked_server()
+        base_directory = "/fake/path/"
+        backup_id = "fake_backup_id"
+        volatile_backup_info = VolatileBackupInfo(
+            server=server,
+            base_directory=base_directory,
+            backup_id=backup_id,
+        )
+        # Case 1: without passing any parameter (saves to file by default)
+        with pytest.raises(
+            ValueError, match="VolatileBackupInfo does not support saving to a file"
+        ):
+            volatile_backup_info.save()
+
+        # Case 2: explicitly passing filename
+        with pytest.raises(
+            ValueError, match="VolatileBackupInfo does not support saving to a file"
+        ):
+            volatile_backup_info.save(filename="/path/to/some/file")
+
+        # Case 3: passing to file-like object works
+        volatile_backup_info.save(file_object=io.BytesIO())

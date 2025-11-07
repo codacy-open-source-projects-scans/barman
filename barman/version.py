@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -20,4 +20,4 @@
 This module contains the current Barman version.
 """
 
-__version__ = "3.12.1"
+__version__ = "3.16.0"

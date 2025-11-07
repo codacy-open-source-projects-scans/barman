@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -16,8 +16,10 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
+import os
 import sys
 
+import mock
 import pytest
 from mock import call, patch
 
@@ -80,6 +82,22 @@ class TestUnixLocalCommand(object):
 
         # THEN the `mv` command is called with the expected arguments
         command.assert_called_once_with("mv '%s' '%s'" % (src_path, dst_path))
+
+    @patch("barman.fs.Command")
+    def test_copy(self, command_mock):
+        # GIVEN a command which always succeeds
+        command = command_mock.return_value
+        command.return_value = 0
+        ulc = UnixLocalCommand()
+        # AND mock source and destination paths
+        src_path = "/path/to/src"
+        dst_path = "/path/to/dst"
+
+        # WHEN copy is called
+        ulc.copy(src_path, dst_path)
+
+        # THEN the `mv` command is called with the expected arguments
+        command.assert_called_once_with("cp '-a' '%s' '%s'" % (src_path, dst_path))
 
     @patch("barman.fs.Command")
     def test_dir_if_not_exists(self, command_mock):
@@ -241,6 +259,13 @@ class TestUnixLocalCommand(object):
         cm = UnixLocalCommand()
         print(cm.get_file_mode(incoming_dir.strpath))
         assert "755" == cm.get_file_mode(incoming_dir.strpath)
+
+    def test_get_path_device_number(self, tmpdir):
+        incoming_dir = tmpdir.mkdir("some_dir")
+        cm = UnixLocalCommand()
+        expected = str(os.stat(incoming_dir.strpath).st_dev)
+        actual = cm.get_path_device_number(incoming_dir.strpath)
+        assert expected == actual
 
     @patch("barman.fs.Command")
     def test_check_write_permission(self, command_mock):
@@ -554,6 +579,56 @@ class TestUnixLocalCommand(object):
 
         # AND the exception has the expected message
         assert str(exc.value) == "Unexpected findmnt output: {}".format(command_output)
+
+    @pytest.mark.parametrize(
+        "command_ret_code, expected_return_value",
+        [(0, "/path/to/command"), (1, None)],
+    )
+    def test_find_command(self, command_ret_code, expected_return_value):
+        """
+        Test that it calls the ``which`` command correctly and
+        returns the expected output.
+        """
+        # GIVEN a mock UnixLocalCommand which returns a specific command output
+        ulc = UnixLocalCommand()
+        ulc.cmd = mock.Mock(return_value=command_ret_code)
+        ulc.internal_cmd = mock.Mock(
+            out="/path/to/command" if command_ret_code == 0 else "command not found"
+        )
+
+        # WHEN find_command is called
+        result = ulc.find_command(["test_command"])
+
+        # THEN the find command was executed with the expected arguments
+        ulc.cmd.assert_called_once_with("which", args=["test_command"])
+
+        # AND the expected return value was returned
+        assert result == expected_return_value
+
+    @pytest.mark.parametrize(
+        "command_ret_code, expected_return_value",
+        [(0, "17.0.1"), (1, None)],
+    )
+    def test_get_command_version(self, command_ret_code, expected_return_value):
+        """
+        Test that it calls <command> --version correctly and
+        returns the expected output.
+        """
+        # GIVEN a mock UnixLocalCommand which returns a specific command output
+        ulc = UnixLocalCommand()
+        ulc.cmd = mock.Mock(return_value=command_ret_code)
+        ulc.internal_cmd = mock.Mock(
+            out="17.0.1" if command_ret_code == 0 else "command does not have --version"
+        )
+
+        # WHEN get_command_version is called
+        result = ulc.get_command_version("/path/to/command")
+
+        # THEN <command> --version was executed
+        ulc.cmd.assert_called_once_with("/path/to/command", args=["--version"])
+
+        # AND the expected return value was returned
+        assert result == expected_return_value
 
     @patch("barman.fs.Command")
     @patch("barman.fs.UnixLocalCommand.cmd")

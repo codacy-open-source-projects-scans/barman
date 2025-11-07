@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # Client Utilities for Barman, Backup and Recovery Manager for PostgreSQL
 #
@@ -63,16 +63,25 @@ class TestCloudCheckWalArchive(object):
         )
 
     @mock.patch("barman.clients.cloud_check_wal_archive.check_archive_usable")
+    @mock.patch("barman.clients.cloud_check_wal_archive.CloudBackupCatalog")
     @mock.patch("barman.clients.cloud_check_wal_archive.get_cloud_interface")
     def test_check_wal_archive_missing_bucket(
         self,
         mock_cloud_interface,
         mock_cloud_backup_catalog,
+        mock_check_archive_usable,
+        cloud_backup_catalog,
     ):
         """Verify a missing bucket passes the check"""
-        mock_cloud_interface.return_value.bucket_exists = False
+        cloud_object_interface_mock = mock_cloud_interface.return_value
+        cloud_object_interface_mock.bucket_exists = False
+        mock_cloud_backup_catalog.return_value = cloud_backup_catalog
         cloud_check_wal_archive.main(["cloud_storage_url", "test_server"])
-        mock_cloud_backup_catalog.assert_not_called()
+        cloud_object_interface_mock.setup_bucket.assert_called_once_with()
+        mock_check_archive_usable.assert_called_once_with(
+            ["000000010000000000000001"],
+            timeline=None,
+        )
 
     @mock.patch("barman.clients.cloud_check_wal_archive.check_archive_usable")
     @mock.patch("barman.clients.cloud_check_wal_archive.CloudBackupCatalog")

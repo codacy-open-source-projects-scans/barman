@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -22,6 +22,8 @@ import logging
 
 import barman
 from barman.utils import force_str
+
+_logger = logging.getLogger(__name__)
 
 
 class OperationErrorExit(SystemExit):
@@ -81,14 +83,14 @@ def __parse_tag(tag):
     try:
         rows = list(csv.reader([tag], delimiter=","))
     except csv.Error as exc:
-        logging.error(
+        _logger.error(
             "Error parsing tag %s: %s",
             tag,
             force_str(exc),
         )
         raise CLIErrorExit()
     if len(rows) != 1 or len(rows[0]) != 2:
-        logging.error(
+        _logger.error(
             "Invalid tag format: %s",
             tag,
         )
@@ -97,11 +99,12 @@ def __parse_tag(tag):
     return tuple(rows[0])
 
 
-def add_tag_argument(parser, name, help):
+def add_tag_argument(parser, name, dest, help):
     parser.add_argument(
         "--%s" % name,
         type=__parse_tag,
         nargs="*",
+        dest=dest,
         help=help,
     )
 
@@ -199,7 +202,8 @@ def create_argument_parser(description, source_or_destination=UrlArgumentType.so
     azure_arguments.add_argument(
         "--azure-credential",
         "--credential",
-        choices=["azure-cli", "managed-identity"],
+        "--default",
+        choices=["azure-cli", "managed-identity", "default"],
         help="Optionally specify the type of credential to use when authenticating "
         "with Azure. If omitted then Azure Blob Storage credentials will be obtained "
         "from the environment and the default Azure authentication flow will be used "

@@ -10,8 +10,7 @@
   barman-cloud-backup-delete
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ --endpoint-url ENDPOINT_URL ]
@@ -20,8 +19,9 @@
                   [ { -b | --backup-id } BACKUP_ID]
                   [ --dry-run ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity | default } ]
                   [--batch-size DELETE_BATCH_SIZE]
                   SOURCE_URL SERVER_NAME
 
@@ -50,6 +50,19 @@ WALs are considered unused if:
   the backup files, one for the ``backup.info`` file, and one for the associated WALs.
   Deleting by retention policy may result in a high volume of delete requests if a
   large number of backups are accumulated in cloud storage.
+
+.. important::
+  Starting with AWS boto3 1.36, the behavior of **Data Integrity Protection checks**
+  has changed. Some methods used by Barman no longer require the ``Content-MD5``
+  header.
+
+  This means that **S3-compatible storage providers that have not updated their
+  server-side code may fail** when used with newer boto3 versions. For example, MinIO
+  addressed this change shortly after the boto3 1.36 announcement.
+
+  If you are using MinIO, you **must upgrade** to the latest release (or at least
+  ``RELEASE.2025-02-03T21-03-04Z`` or newer) to ensure compatibility and avoid
+  failures.
 
 **Parameters**
 
@@ -85,7 +98,7 @@ WALs are considered unused if:
   * ``google-cloud-storage``.
 
 ``-b`` / ``--backup-id``
-  ID of the backup to be deleted
+  ID of the backup to be deleted. You can use a shortcut instead of the backup ID.
 
 ``-m`` / ``--minimum-redundancy``
   The minimum number of backups that should always be available.
@@ -134,3 +147,4 @@ WALs are considered unused if:
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.

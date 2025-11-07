@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -19,9 +19,12 @@
 import json
 import logging
 import math
+import os
 import shutil
 from datetime import datetime
 from io import RawIOBase
+
+import botocore
 
 from barman.clients.cloud_compression import decompress_to_file
 from barman.cloud import (
@@ -39,6 +42,9 @@ from barman.exceptions import (
     SnapshotBackupException,
     SnapshotInstanceNotFoundException,
 )
+
+_logger = logging.getLogger(__name__)
+
 
 try:
     # Python 3.x
@@ -200,7 +206,7 @@ class S3CloudInterface(CloudInterface):
             self.bucket_exists = self._check_bucket_existence()
             return True
         except EndpointConnectionError as exc:
-            logging.error("Can't connect to cloud provider: %s", exc)
+            _logger.error("Can't connect to cloud provider: %s", exc)
             return False
 
     def _check_bucket_existence(self):
@@ -231,7 +237,7 @@ class S3CloudInterface(CloudInterface):
         # Get the current region from client.
         # Do not use session.region_name here because it may be None
         region = self.s3.meta.client.meta.region_name
-        logging.info(
+        _logger.info(
             "Bucket '%s' does not exist, creating it on region '%s'",
             self.bucket_name,
             region,
@@ -414,25 +420,102 @@ class S3CloudInterface(CloudInterface):
 
     def _delete_objects_batch(self, paths):
         """
-        Delete the objects at the specified paths
+        Deletes multiple objects from the S3 bucket at the specified paths.
 
-        :param List[str] paths:
+        Attempts to delete objects in batch using the `delete_objects()` API. If a
+        :exc:`ClientError` with the :exc:``MissingContentMD5` code is raised (common with older or
+        non-compliant object storage systems), falls back to deleting each object
+        individually using `delete_object()`.
+
+        Logs errors for any objects that fail to be deleted in bulk. Raises
+        :exc:`CloudProviderError` if any bulk deletion errors occur.
+
+        :param paths: List of object paths (keys) to delete from the S3 bucket.
+        :raises CloudProviderError:
+            If bulk deletion fails for any object.
+        :raises botocore.exceptions.ClientError:
+            If an AWS client error occurs that is not handled by the fallback logic.
         """
         super(S3CloudInterface, self)._delete_objects_batch(paths)
 
-        resp = self.s3.meta.client.delete_objects(
-            Bucket=self.bucket_name,
-            Delete={
-                "Objects": [{"Key": path} for path in paths],
-                "Quiet": True,
-            },
-        )
-        if "Errors" in resp:
-            for error_dict in resp["Errors"]:
-                logging.error(
-                    'Deletion of object %s failed with error code: "%s", message: "%s"'
-                    % (error_dict["Key"], error_dict["Code"], error_dict["Message"])
+        try:
+            resp = self.s3.meta.client.delete_objects(
+                Bucket=self.bucket_name,
+                Delete={
+                    "Objects": [{"Key": path} for path in paths],
+                    "Quiet": True,
+                },
+            )
+            if "Errors" in resp:
+                for error_dict in resp["Errors"]:
+                    _logger.error(
+                        'Bulk deletion of object %s failed with error code: "%s", '
+                        'message: "%s"'
+                        % (
+                            error_dict["Key"],
+                            error_dict["Code"],
+                            error_dict["Message"],
+                        )
+                    )
+                raise CloudProviderError()
+        except botocore.exceptions.ClientError as e:
+            # Fallback for MissingContentMD5 errors: `_delete_object` deletes a single
+            # object at a time using `.delete()` for the given key. This is necessary
+            # because bulk delete may fail when Content-MD5 headers are missing.
+            # Note: The S3 protocol returns a 'MissingContentMD5' error code in that
+            # situation. Some "S3-compatible" storage systems are not fully compatible,
+            # and return "InvalidRequest" instead, so we also check the message in that.
+            if (
+                e.response["Error"]["Code"] == "MissingContentMD5"
+                or "missing required header for this request: content-md5"
+                in e.response["Error"]["Message"].lower()
+            ):
+                for path in paths:
+                    self._delete_object(path)
+            else:
+                raise e
+
+    def _delete_object(self, path):
+        """
+        Delete an object from AWS S3 and use it as a fallback method.
+
+        Attempts to delete an object individually. If a deletion fails due to a client
+        error, logs the error details and raises a :exc:`CloudProviderError`.
+        Any other exceptions are also logged and re-raised as :exc:`CloudProviderError`.
+
+        .. note::
+            This method should not be called as the "primary deletion" method. Its use
+            is strictly for fallback purposes, when users are using older or
+            non-compliant S3-like object storage systems.
+
+        :param str path: S3 object key (path) to delete.
+        :type path: str
+        :raises CloudProviderError: If deletion of any object fails.
+        """
+        try:
+            _logger.warning(
+                "Bulk delete failed with 'MissingContentMD5'. Falling back "
+                "to deleting this file individually: %s." % path
+            )
+            self.s3.meta.client.delete_object(
+                Bucket=self.bucket_name,
+                Key=path,
+            )
+        except botocore.exceptions.ClientError as e:
+            error_code = e.response["Error"]["Code"]
+            error_message = e.response["Error"]["Message"]
+            _logger.error(
+                "Deletion of object %s failed with error code: "
+                '"%s", message: "%s"'
+                % (
+                    path,
+                    error_code,
+                    error_message,
                 )
+            )
+            raise CloudProviderError()
+        except Exception as e:
+            _logger.error("Deletion of object %s failed with error: %s" % (path, e))
             raise CloudProviderError()
 
     def get_prefixes(self, prefix):
@@ -459,15 +542,37 @@ class S3CloudInterface(CloudInterface):
             raise ValueError(
                 "Deleting all objects under prefix %s is not allowed" % prefix
             )
+
         bucket = self.s3.Bucket(self.bucket_name)
-        for resp in bucket.objects.filter(Prefix=prefix).delete():
-            response_metadata = resp["ResponseMetadata"]
-            if response_metadata["HTTPStatusCode"] != 200:
-                logging.error(
-                    'Deletion of objects under %s failed with error code: "%s"'
-                    % (prefix, response_metadata["HTTPStatusCode"])
-                )
-                raise CloudProviderError()
+        try:
+            # Although this is written as a `for` loop, the `.delete()` call on the
+            # filtered objects performs a **bulk delete** in AWS S3 in a single API
+            # request. Each `resp` is the metadata for a deleted object returned by the
+            # bulk delete operation.
+            for resp in bucket.objects.filter(Prefix=prefix).delete():
+                response_metadata = resp["ResponseMetadata"]
+                if response_metadata["HTTPStatusCode"] != 200:
+                    _logger.error(
+                        'Deletion of objects under %s failed with error code: "%s"'
+                        % (prefix, response_metadata["HTTPStatusCode"])
+                    )
+                    raise CloudProviderError()
+        except botocore.exceptions.ClientError as e:
+            # Fallback for MissingContentMD5 errors: `_delete_object` deletes a single
+            # object at a time using `.delete()` for the given key. This is necessary
+            # because bulk delete may fail when Content-MD5 headers are missing.
+            # Note: The S3 protocol returns a 'MissingContentMD5' error code in that
+            # situation. Some "S3-compatible" storage systems are not fully compatible,
+            # and return "InvalidRequest" instead, so we also check the message in that.
+            if (
+                e.response["Error"]["Code"] == "MissingContentMD5"
+                or "missing required header for this request: content-md5"
+                in e.response["Error"]["Message"].lower()
+            ):
+                for obj in bucket.objects.filter(Prefix=prefix):
+                    self._delete_object(obj.key)
+            else:
+                raise e
 
 
 class AwsCloudSnapshotInterface(CloudSnapshotInterface):
@@ -742,7 +847,7 @@ class AwsCloudSnapshotInterface(CloudSnapshotInterface):
             volume_name,
             backup_info.backup_id.lower(),
         )
-        logging.info(
+        _logger.info(
             "Taking snapshot '%s' of disk '%s' (%s)",
             snapshot_name,
             volume_name,
@@ -831,7 +936,7 @@ class AwsCloudSnapshotInterface(CloudSnapshotInterface):
         # successful state. If the successful state is not reached after the maximum
         # number of attempts (default: 40) then a WaiterError is raised.
         snapshot_ids = [snapshot.identifier for snapshot in snapshots]
-        logging.info("Waiting for completion of snapshots: %s", ", ".join(snapshot_ids))
+        _logger.info("Waiting for completion of snapshots: %s", ", ".join(snapshot_ids))
         waiter = self.ec2_client.get_waiter("snapshot_completed")
         waiter.wait(
             SnapshotIds=snapshot_ids,
@@ -873,7 +978,7 @@ class AwsCloudSnapshotInterface(CloudSnapshotInterface):
                     value = value.isoformat()
                 _output[key] = value
 
-        logging.info("Snapshot locked: \n%s" % json.dumps(_output, indent=4))
+        _logger.info("Snapshot locked: \n%s" % json.dumps(_output, indent=4))
 
     def _delete_snapshot(self, snapshot_id):
         """
@@ -888,7 +993,7 @@ class AwsCloudSnapshotInterface(CloudSnapshotInterface):
             # If the snapshot could not be found then deletion is considered successful
             # otherwise we raise a CloudProviderError
             if error_code == "InvalidSnapshot.NotFound":
-                logging.warning("Snapshot {} could not be found".format(snapshot_id))
+                _logger.warning("Snapshot {} could not be found".format(snapshot_id))
             elif error_code == "SnapshotLocked":
                 raise SystemExit(
                     "Locked snapshot: %s.\n"
@@ -900,7 +1005,7 @@ class AwsCloudSnapshotInterface(CloudSnapshotInterface):
                     "Deletion of snapshot %s failed with error code %s: %s"
                     % (snapshot_id, error_code, exc.response["Error"])
                 )
-        logging.info("Snapshot %s deleted", snapshot_id)
+        _logger.info("Snapshot %s deleted", snapshot_id)
 
     def delete_snapshot_backup(self, backup_info):
         """
@@ -909,7 +1014,7 @@ class AwsCloudSnapshotInterface(CloudSnapshotInterface):
         :param barman.infofile.LocalBackupInfo backup_info: Backup information.
         """
         for snapshot in backup_info.snapshots_info.snapshots:
-            logging.info(
+            _logger.info(
                 "Deleting snapshot '%s' for backup %s",
                 snapshot.identifier,
                 backup_info.backup_id,
@@ -1031,16 +1136,24 @@ class AwsVolumeMetadata(VolumeMetadata):
         """
         Resolve the mount point and mount options using shell commands.
 
-        Uses `findmnt` to find the mount point and options for this volume by building
-        a list of candidate device names and checking each one. Candidate device names
-        are:
+        Uses `findmnt` to locate the mount point and options for the volume.
 
-        - The device name reported by the AWS API.
-        - A subsitution of the device name depending on virtualization type, with the
-          same trailing letter.
+        Search for the system's available EBS volume device names and IDs from the
+        `/sys/block` directory in the sysfs virtual filesystem that provides
+        information and configuration options for block devices on the system.
 
-        This is based on information provided by AWS about device renaming in EC2:
-            https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+        For Nitro instances, the NVMe device name can change depending on the order
+        in which the devices respond during instance boot. AWS recommends using the
+        EBS volume ID and the mount point for consistent device identification.
+
+        Other instance types do not have a volume ID associated with them. Instead,
+        we identify the device from the device name or an alternative name obtained
+        by renaming the device name.
+
+        This is based on information provided by AWS about device identification and
+        renaming in EC2:
+        - https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/device_naming.html
+        - https://docs.aws.amazon.com/ebs/latest/userguide/identify-nvme-ebs-device.html
 
         :param UnixLocalCommand cmd: An object which can be used to run shell commands
             on a local (or remote, via the UnixRemoteCommand subclass) instance.
@@ -1049,31 +1162,70 @@ class AwsVolumeMetadata(VolumeMetadata):
             raise SnapshotBackupException(
                 "Cannot resolve mounted volume: device name unknown"
             )
-        # Determine a list of candidate device names
-        device_names = [self._device_name]
-        device_prefix = "/dev/sd"
-        if self._virtualization_type == "hvm":
-            if self._device_name.startswith(device_prefix):
-                device_names.append(
-                    self._device_name.replace(device_prefix, "/dev/xvd")
-                )
-        elif self._virtualization_type == "paravirtual":
-            if self._device_name.startswith(device_prefix):
-                device_names.append(self._device_name.replace(device_prefix, "/dev/hd"))
 
-        # Try to find the device name reported by the EC2 API
-        for candidate_device in device_names:
-            try:
-                mount_point, mount_options = cmd.findmnt(candidate_device)
+        name = self._device_name
+        # Check if it is a root volume.
+        if self._device_name in ("/dev/sda1", "/dev/xvda"):
+            raise SnapshotBackupException(
+                "'%s' is a root volume. EBS volumes envolved in the snapshot "
+                "backup must be non-root." % self._device_name
+            )
+
+        # Virtualization options: "paravirtual" / "hvm".
+        # HVM is more common in AWS EC2 environments so we use '/dev/xvd' as
+        # "default" new prefix.
+        new_prefix = "/dev/xvd"
+        if self._virtualization_type == "paravirtual":
+            new_prefix = "/dev/hd"
+
+        # OS sysfs virtual filesystem blocks path.
+        sys_block_path = "/sys/block"
+        # Get block names from the OS sysfs virtual filesystem.
+        blocks = os.listdir(sys_block_path)
+        device_prefix = "/dev/sd"
+        for block in blocks:
+            device = "/dev/%s" % block
+            # Check for non Nitro instances using the block name directly.
+            if name == device:
+                break
+            # Check for non Nitro instances using a renamed version of the device name.
+            # AWS renames the device names attached to an instance automatically, so we
+            # must check for this possibility as well.
+            if name.startswith(device_prefix):
+                renamed = name.replace(device_prefix, new_prefix)
+                if renamed == device:
+                    name = renamed
+                    break
+            # Check for Nitro instances. We need to retrieve the volume id from the file
+            # which can be found at the `/sys/block/{block}/device/serial` path and use
+            # itto find the correct device name.
+            serial_number_path = "%s/%s/device/serial" % (sys_block_path, block)
+            if "nvme" in device and os.path.isfile(serial_number_path):
+                with open(serial_number_path, "r") as file:
+                    serial_number = file.readline().strip()
+                # ``self.id`` format: `vol-{HASH}`.
+                vol_id = serial_number.replace("vol", "vol-")
+                # If the volumes match, device ``name`` is found.
+                if vol_id == self.id:
+                    name = device
+                    break
+        try:
+            # The NVMe device name format can vary depending on whether the EBS volume
+            # was attached during or after the instance launch. NVMe device names for
+            # volumes attached after instance launch include the `/dev/` prefix, while
+            # NVMe device names for volumes attached during instance launch do not
+            # include the `/dev/` prefix.
+            for dev_name in [name, name.lstrip("/dev/")]:
+                mount_point, mount_options = cmd.findmnt(dev_name)
                 if mount_point is not None:
                     self._mount_point = mount_point
                     self._mount_options = mount_options
                     return
-            except CommandException as e:
-                raise SnapshotBackupException(
-                    "Error finding mount point for device path %s: %s"
-                    % (self._device_name, e)
-                )
+        except CommandException as e:
+            raise SnapshotBackupException(
+                "Error finding mount point for device path %s: %s"
+                % (self._device_name, e)
+            )
         raise SnapshotBackupException(
             "Could not find device %s at any mount point" % self._device_name
         )

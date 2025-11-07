@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -206,9 +206,11 @@ class TestBackupManifest:
             x.end_offset = 100
             x.end_xlog = "000000010000000000000001"
             x.end_wal = "000000010000000000000001"
-            data = tmpdir.mkdir("main/base/%s/data" % x.backup_id)
-            folder1 = data.mkdir("folder1")
-            f1 = data.join("file1")
+            base_dir = tmpdir.mkdir("main/base")
+            backup_dir = base_dir.mkdir(x.backup_id)
+            data_dir = backup_dir.mkdir("data")
+            folder1 = data_dir.mkdir("folder1")
+            f1 = data_dir.join("file1")
             f1.write("file1")
             f2 = folder1.join("file2")
             f2.write("file2")

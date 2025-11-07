@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -72,12 +72,17 @@ def _get_azure_credential(credential_type):
         return None
 
     try:
-        from azure.identity import AzureCliCredential, ManagedIdentityCredential
+        from azure.identity import (
+            AzureCliCredential,
+            DefaultAzureCredential,
+            ManagedIdentityCredential,
+        )
     except ImportError:
         raise SystemExit("Missing required python module: azure-identity")
 
     supported_credentials = {
         "azure-cli": AzureCliCredential,
+        "default": DefaultAzureCredential,
         "managed-identity": ManagedIdentityCredential,
     }
     try:
@@ -330,16 +335,12 @@ def get_snapshot_interface_from_backup_info(backup_info, config=None):
         # from the backup_info, unless a region is set in the config in which case the
         # config region takes precedence.
         region = None
+        profile = None
         if config is not None:
             if hasattr(config, "aws_region"):
                 region = config.aws_region
-            try:
-                if getattr(config, "aws_profile"):
-                    profile = config.aws_profile
-            except AttributeError:
-                raise SystemExit(
-                    "Unable to locate credentials. You should configure an AWS profile."
-                )
+            if hasattr(config, "aws_profile"):
+                profile = config.aws_profile
         if region is None:
             region = backup_info.snapshots_info.region
         return AwsCloudSnapshotInterface(profile, region)

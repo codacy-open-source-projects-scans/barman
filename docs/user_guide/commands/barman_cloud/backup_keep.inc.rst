@@ -10,17 +10,15 @@
   barman-cloud-backup-keep
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
-                  [ { -r | --release } ]
-                  [ { -s | --status } ]
-                  [ --target { full | standalone } ]
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity | default } ]
+                  [ { { -r | --release } | { -s | --status } | --target { full | standalone } } ]
                   SOURCE_URL SERVER_NAME BACKUP_ID
 
 **Description**
@@ -35,6 +33,19 @@ and are not subject to standard retention policies.
 .. note::
   For GCP, only authentication with ``GOOGLE_APPLICATION_CREDENTIALS`` env is supported.
 
+.. important::
+  Starting with AWS boto3 1.36, the behavior of **Data Integrity Protection checks**
+  has changed. Some methods used by Barman no longer require the ``Content-MD5``
+  header.
+
+  This means that **S3-compatible storage providers that have not updated their
+  server-side code may fail** when used with newer boto3 versions. For example, MinIO
+  addressed this change shortly after the boto3 1.36 announcement.
+
+  If you are using MinIO, you **must upgrade** to the latest release (or at least
+  ``RELEASE.2025-02-03T21-03-04Z`` or newer) to ensure compatibility and avoid
+  failures when releasing a keep annotation.
+
 **Parameters**
 
 ``SERVER_NAME``
@@ -45,7 +56,7 @@ and are not subject to standard retention policies.
   ``s3://bucket/path/to/folder``.
 
 ``BACKUP_ID``
-  The ID of the backup to be kept.
+  The ID of the backup to be kept. You can use a shortcut instead of the backup ID.
 
 ``-V`` / ``--version``
   Show version and exit.
@@ -113,3 +124,4 @@ and are not subject to standard retention policies.
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.

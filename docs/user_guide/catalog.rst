@@ -120,7 +120,7 @@ backup:
         Timeline             : 1
         Begin WAL            : 0000000100000CFD000000AD
         End WAL              : 0000000100000D0D00000008
-        WAL number           : 3932
+        Number of WALs       : 3932
         WAL compression ratio: 79.51%
         Begin time           : 2024-09-02 13:00:01.633925+00:00
         End time             : 2024-09-03 10:27:06.522846+00:00
@@ -132,7 +132,7 @@ backup:
         End XLOG             : D0D/8D36158
 
       WAL information:
-        No of files          : 35039
+        Number of files      : 35039
         Disk usage           : 121.5 GiB
         WAL rate             : 275.50/hour
         Compression ratio    : 77.81%
@@ -161,6 +161,10 @@ backup:
       Postgres 17.
     * The field ``Resource Saved`` is available for rsync and incremental
       backups, and ``Snapshot Information`` is only available for snapshot backups.
+    * If the backup is compressed, the ``Backup Compression`` field is shown in the
+      output, containing the compression algorithm that was used.
+    * If the backup is encrypted, the ``Encryption`` field is shown in the output,
+      containing the encryption method that was used.
     * The possible values for the field ``Backup Type`` are:
 
       * ``rsync``: for a backup taken with rsync.

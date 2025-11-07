@@ -10,16 +10,16 @@
   barman-cloud-backup-show
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
-                  [ --format ]
-                  SOURCE_URL SERVER_NAME
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity | default } ]
+                  [ --format FORMAT ]
+                  SOURCE_URL SERVER_NAME BACKUP_ID
 
 **Description**
 
@@ -32,6 +32,9 @@ but it has fewer information.
   For GCP, only authentication with ``GOOGLE_APPLICATION_CREDENTIALS`` env is supported.
 
 **Parameters**
+
+``BACKUP_ID``
+  The ID of the backup. You can use a shortcut instead of the backup ID.
 
 ``SERVER_NAME``
   Name of the server that holds the backup to be displayed.
@@ -96,3 +99,4 @@ but it has fewer information.
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.

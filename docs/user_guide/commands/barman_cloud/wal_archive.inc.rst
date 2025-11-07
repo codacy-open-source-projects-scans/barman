@@ -10,19 +10,21 @@
   barman-cloud-wal-archive
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ { { -z | --gzip } | { -j | --bzip2 } | --xz | --snappy | --zstd | --lz4 } ]
-                  [ --tags [ TAGS ... ] ]
-                  [ --history-tags [ HISTORY_TAGS ... ] ]
+                  [ --compression-level COMPRESSION_LEVEL ]
+                  [ --tag KEY,VALUE [ --tag KEY,VALUE ... ] ]
+                  [ --history-tag KEY,VALUE [ --history-tag KEY,VALUE ... ] ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
                   [ { -e | --encryption } ENCRYPTION ]
                   [ --sse-kms-key-id SSE_KMS_KEY_ID ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity |
+                    default } ]
                   [ --encryption-scope ENCRYPTION_SCOPE ]
                   [ --max-block-size MAX_BLOCK_SIZE ]
                   [ --max-concurrency MAX_CONCURRENCY ]
@@ -83,33 +85,62 @@ Barman server. Additionally, it can be utilized as a hook script for WAL archivi
   * ``google-cloud-storage``.
 
 ``-z`` / ``--gzip``
-  gzip-compress the WAL while uploading to the cloud (should not be used with python <
-  3.2).
+  gzip-compress the WAL while uploading to the cloud.
 
 ``-j`` / ``--bzip2``
-  bzip2-compress the WAL while uploading to the cloud (should not be used with python <
-  3.3).
+  bzip2-compress the WAL while uploading to the cloud.
 
 ``--xz``
-  xz-compress the WAL while uploading to the cloud (should not be used with python <
-  3.3).
+  xz-compress the WAL while uploading to the cloud.
 
 ``--snappy``
-  snappy-compress the WAL while uploading to the cloud (requires optional
-  ``python-snappy`` library).
+  snappy-compress the WAL while uploading to the cloud (requires the ``python-snappy``
+  Python library to be installed).
 
 ``--zstd``
-  zstd-compress the WAL while uploading to the cloud (requires optional ``zstandard``
-  library).
+  zstd-compress the WAL while uploading to the cloud (requires the ``zstandard`` Python
+  library to be installed).
 
 ``--lz4``
-  lz4-compress the WAL while uploading to the cloud (requires optional ``lz4`` library).
+  lz4-compress the WAL while uploading to the cloud (requires the ``lz4`` Python
+  library to be installed).
+
+``--compression-level``
+  A compression level to be used by the selected compression algorithm. Valid
+  values are integers within the supported range of the chosen algorithm or one
+  of the predefined labels: ``low``, ``medium``, and ``high``. The range of each
+  algorithm as well as what level each predefined label maps to can be found in
+  :ref:`compression_level <configuration-options-compression-level>`.
+
+``--tag``
+  Tag to be added to archived WAL files in cloud storage.
 
 ``--tags``
-  Tags to be added to archived WAL files in cloud storage.
+  Tag to be added to archived WAL files in cloud storage.
+
+.. note::
+  If you are using ``--tags`` before positional arguments, you must insert ``--`` after
+  it to indicate the end of optional arguments. This tells the parser to treat
+  everything after ``--`` as positional arguments. Without the ``--``, Barman may
+  misinterpret positional arguments as values for the last option.
+
+.. deprecated:: 3.15
+    ``--tags`` is deprecated. Use ``--tag`` instead.
+
+``--history-tag``
+  Tag to be added to archived history files in cloud storage.
 
 ``--history-tags``
   Tags to be added to archived history files in cloud storage.
+
+.. note::
+  If you are using ``--history-tags`` before positional arguments, you must insert
+  ``--`` after it to indicate the end of optional arguments. This tells the parser to
+  treat everything after ``--`` as positional arguments. Without the ``--``, Barman may
+  misinterpret positional arguments as values for the last option.
+
+.. deprecated:: 3.15
+    ``--history-tags`` is deprecated. Use ``--history-tag`` instead.
 
 **Extra options for the AWS cloud provider**
 
@@ -153,6 +184,7 @@ Barman server. Additionally, it can be utilized as a hook script for WAL archivi
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.
 
 ``--encryption-scope``
   The name of an encryption scope defined in the Azure Blob Storage service which is to

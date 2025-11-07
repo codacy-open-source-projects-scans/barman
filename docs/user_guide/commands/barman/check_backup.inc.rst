@@ -8,7 +8,9 @@ Synopsis
 
 .. code-block:: text
     
-    check-backup SERVER_NAME BACKUP_ID
+    check-backup
+        [ { -h | --help } ]
+        SERVER_NAME BACKUP_ID
 
 Description
 ^^^^^^^^^^^
@@ -25,6 +27,9 @@ Parameters
 
 ``BACKUP_ID``
     Id of the backup in barman catalog.
+
+``-h`` / ``--help``
+    Show a help message and exit. Provides information about command usage.
 
 .. only:: man
 
@@ -44,7 +49,6 @@ Parameters
         * - **last/latest**
           - Most recent available backup for the server, in chronological order.
         * - **last-full/latest-full**
-          - Most recent full backup eligible for a block-level incremental backup using the
-            ``--incremental`` option.
+          - Most recent full backup taken with methods ``rsync`` or ``postgres``.
         * - **last-failed**
           - Most recent backup that failed, in chronological order.

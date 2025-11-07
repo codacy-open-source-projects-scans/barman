@@ -10,15 +10,15 @@
   barman-cloud-backup-list
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
-                  [ --format ]
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity | default } ]
+                  [ --format FORMAT ]
                   SOURCE_URL SERVER_NAME
 
 **Description**
@@ -94,3 +94,4 @@ This script lists backups stored in the cloud that were created using the
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.

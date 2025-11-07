@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -70,7 +70,7 @@ def _run_worker(job):
 
     :param _RsyncJob job: the job to be executed
     """
-    global _worker_callable
+    global _worker_callable  # noqa: F824
     assert (
         _worker_callable is not None
     ), "Worker has not been initialized with `_init_worker`"
@@ -221,6 +221,7 @@ class RsyncCopyController(object):
     TABLESPACE_CLASS = "tablespace"
     PGCONTROL_CLASS = "pg_control"
     CONFIG_CLASS = "config"
+    VOLATILE_BACKUP_CLASS = "volatile_backup"
 
     # This regular expression is used to parse each line of the output
     # of a "rsync --list-only" call. This regexp has been tested with any known
@@ -885,8 +886,8 @@ class RsyncCopyController(object):
         :param CommandFailedException exc: the exception which caused the
             failure
         """
-        _logger.warn("Failure executing rsync on %s (attempt %s)", item, attempt)
-        _logger.warn("Retrying in %s seconds", self.retry_sleep)
+        _logger.warning("Failure executing rsync on %s (attempt %s)", item, attempt)
+        _logger.warning("Retrying in %s seconds", self.retry_sleep)
 
     def _analyze_directory(self, item):
         """

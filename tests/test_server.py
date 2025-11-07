@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -20,6 +20,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import tarfile
 import time
 from collections import namedtuple
@@ -37,6 +38,7 @@ from testing_helpers import (
 )
 
 from barman import output
+from barman.config import BackupOptions
 from barman.exceptions import (
     CommandFailedException,
     LockFileBusy,
@@ -270,10 +272,13 @@ class TestServer(object):
         # unpatch os.path
         os_mock.path = os.path
         # Setup temp dir and server
+        wal_dir = tmpdir.mkdir("wals")
         server = build_real_server(
             global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
-            main_conf={"wals_directory": tmpdir.mkdir("wals").strpath},
+            main_conf={"wals_directory": wal_dir.strpath},
         )
+        # create xlog.db file
+        wal_dir.join(server.xlogdb_file_name).open(mode="a")
         # Test the execution of the fsync on xlogdb file
         with server.xlogdb("w") as fxlogdb:
             fxlogdb.write("00000000000000000000")
@@ -292,6 +297,123 @@ class TestServer(object):
         # If the file is readonly exit method of the context manager must
         # skip calls on fsync method
         assert not os_mock.fsync.called
+
+    @patch("barman.server.os")
+    @patch("barman.server.ServerXLOGDBLock")
+    def test_xlogdb_is_rebuilt_if_not_present(self, lock_file_mock, os_mock, tmpdir):
+        """
+        Test that xlogdb file is rebuilt if it does not exist yet when accessed
+        """
+        # unpatch os.path
+        os_mock.path = os.path
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={"wals_directory": tmpdir.mkdir("wals")},
+        )
+        server.rebuild_xlogdb = Mock(wraps=server.rebuild_xlogdb)
+        with server.xlogdb("r"):
+            pass
+        server.rebuild_xlogdb.assert_called_once_with(silent=True)
+
+    def test_rebuild_xlogdb(self, tmpdir):
+        """Test rebuilding the xlogdb guessing it from the wals directory structure"""
+        # set up the wal and xlogdb temp directories
+        xlogdb_dir = tmpdir.mkdir("xlogdb_directory")
+        wals_dir = tmpdir.mkdir("wals")
+        # set up a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "xlogdb_directory": xlogdb_dir.strpath,
+                "wals_directory": wals_dir.strpath,
+            },
+        )
+        # create some WAL files in the wals directory
+        w1 = wals_dir.join("0000000100000000").join("000000010000000000000001").ensure()
+        w2 = wals_dir.join("0000000100000000").join("000000010000000000000002").ensure()
+        w3 = wals_dir.join("0000000100000000").join("000000010000000000000003").ensure()
+        w4 = (
+            wals_dir.join("0000000100000000")
+            .join("000000010000000000000004.00000001.backup")
+            .ensure()
+        )
+        w5 = wals_dir.join("0000000100000000").join("000000010000000000000005").ensure()
+        w6 = wals_dir.join("00000001.history").ensure()
+        w7 = wals_dir.join("0000000200000000").join("000000010000000000000001").ensure()
+        # the history file is the first to be read so the list ordering reflects it
+        wals_created = [w6, w1, w2, w3, w4, w5, w7]
+        # rebuild the xlogdb based on the wals present in the wals directory
+        server.rebuild_xlogdb()
+        # assert that every wal has been registered in the xlogdb file
+        with open(server.xlogdb_file_path, mode="r") as xlogdb_file:
+            for wal in wals_created:
+                # {walname} + tab + {size} + tab + {timecreated} + tab + {compression}
+                expected_line = rf"^{wal.basename}\t0\t[0-9]+\.[0-9]+\tNone\tNone$"
+                assert re.match(expected_line, xlogdb_file.readline()) is not None
+            assert xlogdb_file.readline() == ""
+
+    def test_rebuild_xlogdb_unkown_files_present(self, tmpdir):
+        """Test rebuilding the xlogdb is ignoring unkown files present"""
+        # set up the wal and xlogdb temp directories
+        xlogdb_dir = tmpdir.mkdir("xlogdb_directory")
+        wals_dir = tmpdir.mkdir("wals")
+        # set up a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "xlogdb_directory": xlogdb_dir.strpath,
+                "wals_directory": wals_dir.strpath,
+            },
+        )
+        # create some WAL files together with random files inside the wals directory
+        w1 = wals_dir.join("0000000100000000").join("000000010000000000000001").ensure()
+        wals_dir.join("0000000100000000").join("random-file").ensure()
+        w3 = wals_dir.join("0000000100000000").join("000000010000000000000002").ensure()
+        wals_dir.join("random-file").ensure()
+        # only the legitimate wal files should be considered, so this list reflects it
+        wals_created = [w1, w3]
+        # rebuild the xlogdb based on the wals present in the wals directory
+        server.rebuild_xlogdb()
+        # assert that only legimitate wal files have been registered in the xlogdb file
+        with open(server.xlogdb_file_path, mode="r") as xlogdb_file:
+            for wal in wals_created:
+                # {walname} + tab + {size} + tab + {timecreated} + tab + {compression}
+                expected_line = rf"^{wal.basename}\t0\t[0-9]+\.[0-9]+\tNone\tNone$"
+                assert re.match(expected_line, xlogdb_file.readline()) is not None
+            assert xlogdb_file.readline() == ""
+
+    def test_rebuild_xlogdb_with_compression(self, tmpdir):
+        """Test rebuilding the xlogdb when compression is enabled"""
+        # set up the wal and xlogdb temp directories
+        xlogdb_dir = tmpdir.mkdir("xlogdb_directory")
+        wals_dir = tmpdir.mkdir("wals")
+        # set up a server
+        server = build_real_server(
+            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
+            main_conf={
+                "xlogdb_directory": xlogdb_dir.strpath,
+                "wals_directory": wals_dir.strpath,
+            },
+        )
+        # create a WAL file
+        wals_dir.join("0000000100000000").join("000000010000000000000001").ensure()
+        # mock the backup manager
+
+        server.backup_manager = Mock()
+
+        # mock the wal_file object returned by the compression manager
+        mock_wal_info = Mock()
+        expected_line = (
+            "000000010000000000000001\t16777216\t1733775204.2337587\tgzip\tNone\n"
+        )
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
+        mock_wal_info.to_xlogdb_line.return_value = expected_line
+        # rebuild the xlogdb based on the wals present in the wals directory
+        server.rebuild_xlogdb()
+        # assert that the correct line was written to the file
+        with open(server.xlogdb_file_path, mode="r") as xlogdb_file:
+            assert xlogdb_file.readline() == expected_line
+            assert xlogdb_file.readline() == ""
 
     def test_get_wal_full_path(self, tmpdir):
         """
@@ -533,26 +655,7 @@ class TestServer(object):
         :param expected_indices: expected WalFileInfo.name indices (values refers to wal_info_files)
         :param tmpdir: _pytest.tmpdir
         """
-        # Prepare input string
-        walstring = get_wal_lines_from_wal_list(wal_info_files)
-
-        # Prepare expected list
-        expected_wals = get_wal_names_from_indices_selection(
-            wal_info_files, expected_indices
-        )
-
-        # create a xlog.db and add those entries
         wals_dir = tmpdir.mkdir("wals")
-        xlog = wals_dir.join("xlog.db")
-        xlog.write(walstring)
-
-        # Populate wals_dir with fake WALs
-        for wal in wal_info_files:
-            if wal.name.endswith("history"):
-                wals_dir.join(wal.name).ensure()
-            else:
-                subdir = wal.name[0:16]
-                wals_dir.join(subdir).join(wal.name).ensure()
 
         # fake backup
         backup = build_test_backup_info(
@@ -566,6 +669,26 @@ class TestServer(object):
             global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
             main_conf={"wals_directory": wals_dir.strpath},
         )
+
+        # Prepare input string
+        walstring = get_wal_lines_from_wal_list(wal_info_files)
+
+        # create a xlog.db and add those entries
+        xlog = wals_dir.join(server.xlogdb_file_name)
+        xlog.write(walstring)
+
+        # Prepare expected list
+        expected_wals = get_wal_names_from_indices_selection(
+            wal_info_files, expected_indices
+        )
+
+        # Populate wals_dir with fake WALs
+        for wal in wal_info_files:
+            if wal.name.endswith("history"):
+                wals_dir.join(wal.name).ensure()
+            else:
+                subdir = wal.name[0:16]
+                wals_dir.join(subdir).join(wal.name).ensure()
 
         for target_tli in target_tlis:
             wals = []
@@ -622,17 +745,7 @@ class TestServer(object):
         :param expected_indices: expected WalFileInfo.name indices (values refers to wal_info_files)
         :param tmpdir: _pytest.tmpdir
         """
-
-        walstring = get_wal_lines_from_wal_list(wal_info_files)
-
-        # Prepare expected list
-        expected_wals = get_wal_names_from_indices_selection(
-            wal_info_files, expected_indices
-        )
-        # create a xlog.db and add those entries
         wals_dir = tmpdir.mkdir("wals")
-        xlog = wals_dir.join("xlog.db")
-        xlog.write(walstring)
         # fake backup
         backup = build_test_backup_info(
             begin_wal="000000020000000000000001", end_wal="000000020000000000000004"
@@ -643,6 +756,17 @@ class TestServer(object):
             global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
             main_conf={"wals_directory": wals_dir.strpath},
         )
+
+        # create a xlog.db and add entries
+        walstring = get_wal_lines_from_wal_list(wal_info_files)
+        xlog = wals_dir.join(server.xlogdb_file_name)
+        xlog.write(walstring)
+
+        # Prepare expected list
+        expected_wals = get_wal_names_from_indices_selection(
+            wal_info_files, expected_indices
+        )
+
         get_backup_mock.return_value = build_test_backup_info(
             backup_id="1234567899",
             begin_wal="000000020000000000000006",
@@ -762,6 +886,138 @@ class TestServer(object):
             archiver_remote_status["last_failed_wal"],
             archiver_remote_status["last_failed_time"].ctime(),
         )
+
+    @patch("barman.output.result")
+    def test_status_active_model(self, mock_output_result, capsys):
+        """
+        Test the output of the status command for active configuration model
+
+        :param mock_output_result: mock the output.result method
+        :param capsys: retrieve output from console
+        """
+
+        # Create a mock config without an active model
+        mock_config_no_model = MagicMock()
+        mock_config_no_model.configure_mock(active_model=None)
+        mock_config_no_model.name = "TestConfigNoActive"
+
+        # Create a Server instance with the mock config
+        server_no_active = build_real_server(
+            global_conf={
+                "archiver": "on",
+                "backup_options": "exclusive_backup",
+            }
+        )
+        server_no_active.config = mock_config_no_model
+
+        # Call the status method
+        server_no_active.status()
+        (out, err) = capsys.readouterr()
+
+        # Verify output.result is called with the correct parameters
+        mock_output_result.assert_any_call(
+            "status",
+            "TestConfigNoActive",
+            "active_model",
+            "Active configuration model",
+            None,
+        )
+
+        # Reset the mock
+        mock_output_result.reset_mock()
+
+        # Create a mock config with an active model
+        mock_config = MagicMock()
+        mock_config.active_model = MagicMock()
+        mock_config.active_model.name = "TestModel"
+        mock_config.name = "TestConfig"
+
+        # Create a Server instance with the mock config
+        server = build_real_server(
+            global_conf={
+                "archiver": "on",
+                "backup_options": "exclusive_backup",
+            }
+        )
+        server.config = mock_config
+
+        # Call the status method
+        server.status()
+        (out, err) = capsys.readouterr()
+
+        # Verify output.result is called with the correct parameters
+        mock_output_result.assert_any_call(
+            "status",
+            "TestConfig",
+            "active_model",
+            "Active configuration model",
+            "TestModel",
+        )
+
+    @patch("barman.output.result")
+    def test_show_active_model(self, mock_output_result, capsys):
+        """
+        Test the output of the show server command for active configuration model
+
+        :param mock_output_result: mock the output.result method
+        :param capsys: retrieve output from console
+        """
+
+        # Create a mock config without an active model
+        mock_config_no_model = MagicMock()
+        mock_config_no_model.configure_mock(active_model=None)
+        mock_config_no_model.name = "TestConfigNoActive"
+        mock_config_no_model.last_backup_maximum_age = None
+        mock_config_no_model.to_json.return_value = {}
+
+        # Create a Server instance with the mock config
+        server_no_active = build_real_server(
+            global_conf={
+                "archiver": "on",
+                "backup_options": "exclusive_backup",
+            }
+        )
+        server_no_active.config = mock_config_no_model
+        server_no_active.passive_node = False
+
+        # Call the show method
+        server_no_active.show()
+        (out, err) = capsys.readouterr()
+
+        # Verify output.result is called with the correct parameters
+        result_call_args = mock_output_result.call_args[0]
+        result_data = result_call_args[2]
+        assert result_data["active_model"] is None
+
+        # Reset the mock
+        mock_output_result.reset_mock()
+
+        # Create a mock config with an active model
+        mock_config = MagicMock()
+        mock_config.active_model = MagicMock()
+        mock_config.active_model.name = "TestModel"
+        mock_config.name = "TestConfig"
+        mock_config.last_backup_maximum_age = None
+        mock_config.to_json.return_value = {}
+
+        # Create a Server instance with the mock config
+        server = build_real_server(
+            global_conf={
+                "archiver": "on",
+                "backup_options": "exclusive_backup",
+            }
+        )
+        server.config = mock_config
+        server.passive_node = False
+
+        # Call the show method
+        server.show()
+        (out, err) = capsys.readouterr()
+
+        # Verify output.result is called with the correct parameters
+        result_call_args = mock_output_result.call_args[0]
+        result_data = result_call_args[2]
+        assert result_data["active_model"] == "TestModel"
 
     @patch("barman.server.Server.get_remote_status")
     def test_check_postgres_too_old(self, postgres_mock, capsys):
@@ -1311,6 +1567,53 @@ class TestServer(object):
         out, err = capsys.readouterr()
         assert "Permission denied, unable to access" in err
 
+    @patch("barman.server.BackupManager.remove_wal_before_backup")
+    @patch("barman.server.BackupManager.get_previous_backup")
+    @patch("barman.server.Server.check")
+    @patch("barman.server.Server._make_directories")
+    @patch("barman.backup.BackupManager.backup")
+    @patch("barman.server.Server.archive_wal")
+    @patch("barman.server.ServerBackupLock")
+    def test_backup_worm_mode_skip(
+        self,
+        backup_lock_mock,
+        archive_wal_mock,
+        backup_mock,
+        dir_mock,
+        check_mock,
+        gpm_mock,
+        rwbb_mock,
+        capsys,
+    ):
+        """
+        Test creating the first backup in the catalog and skipping the removal of
+        unused WAL files when :attr:`worm_mode` is enabled
+
+        :param backup_lock_mock: mock ServerBackupLock
+        :param archive_wal_mock: mock archive_wal server method
+        :param backup_mock: mock BackupManager.backup
+        :param dir_mock: mock _make_directories
+        :param check_mock: mock check
+        :param gpm_mock: mock BackupManager.get_previous_backup
+        :param rwbb_mock: mock BackupManager.remove_wal_before_backup
+        :param capsys: mock standard output and error
+        """
+        # This is the first backup
+        gpm_mock.return_value = None
+
+        server = build_real_server(
+            main_conf={
+                "backup_options": BackupOptions.EXCLUSIVE_BACKUP,
+                "worm_mode": "on",
+            }
+        )
+        dir_mock.side_effect = None
+        server.backup()
+        backup_mock.assert_called_once_with(wait=False, wait_timeout=None, name=None)
+        archive_wal_mock.assert_called_once_with(verbose=False)
+        # Assert that BackupManager.remove_wal_before_backup is not called
+        rwbb_mock.assert_not_called()
+
     @patch("barman.backup.BackupManager.should_keep_backup")
     def test_cannot_delete_keep_backup(self, mock_should_keep_backup, caplog, tmpdir):
         """Verify that we cannot delete backups directly if they have a keep"""
@@ -1358,6 +1661,50 @@ class TestServer(object):
             % (backup_info.backup_id, server.config.name)
             in caplog.text
         )
+
+    @patch("barman.server.Server.perform_delete_backup")
+    @patch("barman.backup.BackupManager.get_available_backups")
+    def test_can_delete_backup_due_to_minimum_redundancy_and_being_incremental(
+        self, mock_get_available_backups, mock_perform_delete, caplog, tmpdir
+    ):
+        """
+        Verify that we can delete a backup when it is an incremental backup even if it
+        does not satisfy the server's minimum redundancy policy.
+        """
+        server = build_real_server({"barman_home": tmpdir.strpath})
+        server.config.minimum_redundancy = 2
+
+        backup_info = build_test_backup_info(
+            backup_id="full_backup_id",
+            status=BackupInfo.DONE,
+            server=server,
+            mode="postgres",
+        )
+
+        backup_info_ch = build_test_backup_info(
+            backup_id="child_backup_id",
+            status=BackupInfo.DONE,
+            server=server,
+            mode="postgres",
+            parent_backup_id="full_backup_id",
+        )
+
+        mock_get_available_backups.return_value = {
+            backup_info.backup_id: backup_info,
+            backup_info_ch.backup_id: backup_info_ch,
+        }
+        mock_perform_delete.return_value = True
+        # Test we CAN delete an incremental backup
+        res = server.delete_backup(backup_info_ch)
+        mock_perform_delete.assert_called_once_with(backup_info_ch)
+        assert res is True
+
+        # Test we CANNOT delete a full backup
+        mock_perform_delete.reset_mock()
+        res = server.delete_backup(backup_info)
+        mock_perform_delete.assert_not_called()
+        assert res is not True
+        assert "Skipping delete of backup full_backup_id for server main" in caplog.text
 
     @patch("barman.server.BackupManager.delete_backup")
     @patch("barman.backup.BackupManager.get_available_backups")
@@ -1609,74 +1956,126 @@ class TestServer(object):
         assert "No switch required for server 'main'" in out
         assert server.postgres.checkpoint.called is False
 
-    def test_check_archive(self, tmpdir):
+    @patch("barman.server.Server._is_xlogdb_empty", return_value=True)
+    @patch("barman.server.Server.get_last_backup_id", return_value=None)
+    @patch("barman.server.Server.archive_wal")
+    @patch("barman.server.Server.switch_wal")
+    @patch("barman.server.Server._check_wal_queue")
+    def test_check_archive(
+        self,
+        mock_check_wal_queue,
+        mock_switch_wal,
+        mock_archive_wal,
+        mock_get_last_backup,
+        mock_is_xlogdb_empty,
+        tmpdir,
+    ):
         """
-        Test the check_archive method
+        Test the check_archive method.
+
+        The defaults of this test make every check fail. In every case we modify
+        a different piece of the logic which makes it succeed. When the check fails
+        the ``strategy.result`` method is called, that's how we identify it here.
         """
-        # Setup temp dir and server
+        # Setup temp a server
         server = build_real_server(
             global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
             main_conf={
+                "check_timeout": 60,
                 "wals_directory": tmpdir.mkdir("wals").strpath,
                 "incoming_wals_directory": tmpdir.mkdir("incoming").strpath,
                 "streaming_wals_directory": tmpdir.mkdir("streaming").strpath,
             },
         )
-        strategy = CheckStrategy()
+        server.postgres = None
 
-        # Call the server on an unexistent xlog file. expect it to fail
-        server.check_archive(strategy)
-        assert strategy.has_error is True
-        assert strategy.check_result[0].check == "WAL archive"
-        assert strategy.check_result[0].status is False
+        # Case 1: The defaults of this test makes every check fail, so this first case
+        # should not succeed
+        mock_strategy = Mock()
+        server.check_archive(mock_strategy)
+        mock_strategy.result.assert_called_once_with(
+            server.config.name,
+            False,
+            hint="please make sure WAL shipping is setup",
+        )
+        mock_check_wal_queue.assert_has_calls(
+            [
+                mock.call(mock_strategy, "incoming", "archiver"),
+                mock.call(mock_strategy, "streaming", "streaming_archiver"),
+            ]
+        )
 
-        # Call the check on an empty xlog file. expect it to contain errors.
-        with open(server.xlogdb_file_name, "a"):
-            # the open call forces the file creation
-            pass
+        # Reset mocks for the next case
+        mock_check_wal_queue.reset_mock()
 
-        server.check_archive(strategy)
-        assert strategy.has_error is True
-        assert strategy.check_result[0].check == "WAL archive"
-        assert strategy.check_result[0].status is False
+        # Case 2: xlogdb is not empty, then it succeeds
+        mock_is_xlogdb_empty.return_value = False
+        mock_strategy = Mock()
+        server.check_archive(mock_strategy)
+        mock_strategy.result.assert_not_called()
+        mock_check_wal_queue.assert_has_calls(
+            [
+                mock.call(mock_strategy, "incoming", "archiver"),
+                mock.call(mock_strategy, "streaming", "streaming_archiver"),
+            ]
+        )
+        # Reset mocks for the next case
+        mock_is_xlogdb_empty.return_value = True
+        mock_check_wal_queue.reset_mock()
 
-        # Write something in the xlog db file and check for the results
-        with server.xlogdb("w") as fxlogdb:
-            fxlogdb.write("00000000000000000000")
-        # The check strategy should contain no errors.
-        strategy = CheckStrategy()
-        server.check_archive(strategy)
-        assert strategy.has_error is False
-        assert len(strategy.check_result) == 0
+        # Case 3: xlogdb is empty, but there is a backup in WAITING_FOR_WALS
+        # so it succeeds
+        mock_get_last_backup.return_value = "last_backup_id"
+        mock_strategy = Mock()
+        server.check_archive(mock_strategy)
+        mock_strategy.result.assert_not_called()
+        mock_check_wal_queue.assert_has_calls(
+            [
+                mock.call(mock_strategy, "incoming", "archiver"),
+                mock.call(mock_strategy, "streaming", "streaming_archiver"),
+            ]
+        )
 
-        # Call the server on with archive = off and
-        # the incoming directory not empty
-        with open(
-            "%s/00000000000000000000" % server.config.incoming_wals_directory, "w"
-        ) as f:
-            f.write("fake WAL")
-        server.config.archiver = False
-        server.check_archive(strategy)
-        assert strategy.has_error is False
-        assert strategy.check_result[0].check == "empty incoming directory"
-        assert strategy.check_result[0].status is False
+        # Reset mocks for the next case
+        mock_get_last_backup.return_value = None
+        mock_check_wal_queue.reset_mock()
+        mock_archive_wal.reset_mock()
 
-        # Check that .tmp files are ignored
-        # Create a nonempty tmp file
-        with open(
-            os.path.join(
-                server.config.incoming_wals_directory, "00000000000000000000.tmp"
-            ),
-            "w",
-        ) as wal:
-            wal.write("a")
-        # The check strategy should contain no errors.
-        strategy = CheckStrategy()
-        server.config.archiver = True
-        server.check_archive(strategy)
-        # Check that is ignored
-        assert strategy.has_error is False
-        assert len(strategy.check_result) == 0
+        # Case 4: xlogdb empty, no last backup, but incoming/streaming directories
+        # might have files, so tries to archive such files and succeeds if successful
+        mock_is_xlogdb_empty.side_effect = [True, False]
+        mock_strategy = Mock()
+        server.check_archive(mock_strategy)
+        mock_archive_wal.assert_called_once_with(verbose=False)
+        mock_strategy.result.assert_not_called()
+        mock_check_wal_queue.assert_has_calls(
+            [
+                mock.call(mock_strategy, "incoming", "archiver"),
+                mock.call(mock_strategy, "streaming", "streaming_archiver"),
+            ]
+        )
+
+        # Reset mocks for the next case
+        mock_is_xlogdb_empty.return_value = True
+        mock_archive_wal.reset_mock()
+        mock_check_wal_queue.reset_mock()
+
+        # Case 5: xlogdb empty, no last backup, no files in incoming/streaming
+        # directories, so it tries running switch-wal
+        mock_is_xlogdb_empty.side_effect = [True, True, False]
+        server.postgres = Mock()
+        mock_strategy = Mock()
+        server.check_archive(mock_strategy)
+        mock_switch_wal.assert_called_once_with(
+            force=False, archive=True, archive_timeout=20
+        )
+        mock_strategy.result.assert_not_called()
+        mock_check_wal_queue.assert_has_calls(
+            [
+                mock.call(mock_strategy, "incoming", "archiver"),
+                mock.call(mock_strategy, "streaming", "streaming_archiver"),
+            ]
+        )
 
     @pytest.mark.parametrize(
         "icoming_name, archiver_name",
@@ -1705,7 +2104,7 @@ class TestServer(object):
 
         # Create some content in the fake xlog.db to avoid triggering
         # empty xlogdb errors
-        with open(server.xlogdb_file_name, "a") as fxlogdb:
+        with open(server.xlogdb_file_path, "a") as fxlogdb:
             # write something
             fxlogdb.write("00000000000000000000")
 
@@ -1908,16 +2307,41 @@ class TestServer(object):
         assert len(server.get_children_timelines(3)) == 0
         assert len(server.get_children_timelines(4)) == 0
 
+    def test_xlogdb_directory(self):
+        """
+        Test the xlogdb_directory server property
+        """
+        # It's just a shortcut to config.xlogdb_directory
+        server = build_real_server()
+        assert server.xlogdb_directory == server.config.xlogdb_directory
+
     def test_xlogdb_file_name(self):
         """
         Test the xlogdb_file_name server property
         """
+        # It's the pattern {servername}-xlog.db
         server = build_real_server()
-        server.config.wals_directory = "mock_wals_directory"
+        assert server.xlogdb_file_name == "%s-xlog.db" % server.config.name
 
-        result = os.path.join(server.config.wals_directory, server.XLOG_DB)
+    def test_xlogdb_file_path(self):
+        """
+        Test the xlogdb_file_path server property
+        """
+        server = build_real_server()
 
-        assert server.xlogdb_file_name == result
+        # It should be a combination of xlogdb_directory and xlogdb_file_name
+        with patch.object(
+            Server, "xlogdb_directory", new_callable=PropertyMock
+        ) as xlogdb_dir_mock:
+            with patch.object(
+                Server, "xlogdb_file_name", new_callable=PropertyMock
+            ) as xlogdb_name_mock:
+                xlogdb_dir_mock.return_value = "/custom/global/xlogdb_directory"
+                xlogdb_name_mock.return_value = "servername_xlog.db"
+                assert (
+                    server.xlogdb_file_path
+                    == "/custom/global/xlogdb_directory/servername_xlog.db"
+                )
 
     def test_create_physical_repslot(self, capsys):
         """
@@ -1952,6 +2376,16 @@ class TestServer(object):
         create_physical_repslot.assert_called_with("test_repslot")
         out, err = capsys.readouterr()
         assert "Replication slot 'test_repslot' already exists" in err
+
+        # If the replication slot was already created but duplicates are ignored
+        # check that no error is reported
+        create_physical_repslot.side_effect = PostgresDuplicateReplicationSlot
+        server.create_physical_repslot(ignore_duplicate=True)
+        create_physical_repslot.assert_called_with("test_repslot")
+        out, err = capsys.readouterr()
+        assert "Replication slot 'test_repslot' already exists and --if-not-exists was "
+        "specified. Skipping creation" in out
+        assert not err
 
         # Test the method failure if the replication slots
         # on the server are all taken
@@ -2236,14 +2670,27 @@ class TestServer(object):
         # error
         server.wait_for_wal(wal_file="00000001000000EF000000AB", archive_timeout=0.1)
 
+    @patch("tempfile.mkdtemp")
+    @patch("barman.xlog.is_partial_file", return_value=False)
     @patch("barman.server.NamedTemporaryFile")
     @patch("barman.backup.CompressionManager")
-    def test_get_wal_sendfile_uncompress_fail(
-        self, mock_compression_manager, _mock_named_temporary_file, capsys
+    def test_get_wal_sendfile_decompress_fail(
+        self,
+        mock_compression_manager,
+        _mock_named_temporary_file,
+        _mock_is_partial,
+        mock_mkdtemp,
+        capsys,
     ):
-        """Verify CommandFailedException uncompressing WAL is handled"""
+        """Verify CommandFailedException decompressing WAL is handled"""
         # GIVEN a server
-        server = build_real_server()
+        server = build_real_server(
+            main_conf={"encryption_passphrase_command": "echo 'passphrase'"}
+        )
+        server.backup_manager = Mock()
+        mock_wal_info = Mock()
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
+        mock_wal_info.fullpath.return_value = "/some/path"
         # AND no existing errors in the output
         output.error_occurred = False
         # AND a mock compressor which raises CommandFailedException
@@ -2252,14 +2699,12 @@ class TestServer(object):
             "an error happened"
         )
         # Make sure the two compressors used by get_wal_sendfile are different mocks
-        mock_compression_manager.return_value.get_compressor.side_effect = [
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
             mock_compressor,
             Mock(),
         ]
         mock_wal_info = Mock()
-        mock_compression_manager.return_value.get_wal_file_info.return_value = (
-            mock_wal_info
-        )
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
 
         # WHEN get_wal_sendfile is called
         server.get_wal_sendfile(
@@ -2273,6 +2718,61 @@ class TestServer(object):
         _out, err = capsys.readouterr()
         assert "ERROR: Error decompressing WAL: an error happened" in err
 
+    @patch("tempfile.mkdtemp")
+    @patch("barman.server.open")
+    @patch("barman.server.shutil")
+    @patch("barman.server.NamedTemporaryFile")
+    @patch("barman.xlog.is_partial_file")
+    @patch("barman.backup.CompressionManager")
+    def test_get_wal_sendfile_ignores_partial(
+        self,
+        mock_compression_manager,
+        mock_is_partial,
+        _mock_named_temporary_file,
+        _mock_shutil,
+        _mock_open,
+        mock_tempdir,
+    ):
+        """
+        Assert partial WAL files are ignored for compression/decompression.
+
+        .. note::
+            This addresses a previous issue, where partial WAL files were attempted to
+            be decompressed when requested if a custom compression was set on the
+            server. Partial WAL files are never compressed/decompressed.
+        """
+        # GIVEN a server
+        server = build_real_server(
+            main_conf={"encryption_passphrase_command": "echo 'passphrase'"}
+        )
+        server.backup_manager = Mock()
+        # AND a mock compressor
+        mock_compressor = Mock()
+        mock_compressor.compression = "custom compression"
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
+            Mock(),
+            Mock(),
+        ]
+        # WHEN get_wal_sendfile is called and the WAL file is partial
+        mock_is_partial.return_value = True
+        server.get_wal_sendfile("test_wal_file.partial", None, False, "/path/to/dest")
+        # THEN decompression should not occur
+        mock_compressor.decompress.assert_not_called()
+
+        # Reset mock and side effect
+        mock_compressor.reset_mock()
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
+            mock_compressor,
+            Mock(),
+        ]
+
+        # WHEN get_wal_sendfile is called and the WAL file is not partial
+        mock_is_partial.return_value = False
+        server.get_wal_sendfile("test_wal_file", None, False, "/path/to/dest")
+        # THEN decompression should occur
+        mock_compressor.decompress.assert_called_once()
+
+    @patch("tempfile.mkdtemp")
     @patch("barman.server.open")
     @patch("barman.server.shutil")
     @patch("barman.server.NamedTemporaryFile")
@@ -2283,14 +2783,21 @@ class TestServer(object):
         _mock_named_temporary_file,
         _mock_shutil,
         _mock_open,
+        mock_tempdir,
     ):
         """Assert `--keep-compression` option works in the ``get_wal_sendfile`` method"""
         # GIVEN a server
-        server = build_real_server()
+        server = build_real_server(
+            main_conf={"encryption_passphrase_command": "echo 'passphrase'"}
+        )
+        server.backup_manager = Mock()
+        mock_wal_info = Mock()
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
+        mock_wal_info.fullpath.return_value = "/some/path"
         # AND a mock compressor, which is only present if the WAL is compressed
         mock_compressor = Mock()
         mock_compressor.compression = "some compression"
-        mock_compression_manager.return_value.get_compressor.side_effect = [
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
             mock_compressor,
             Mock(),
         ]
@@ -2305,7 +2812,7 @@ class TestServer(object):
 
         # Reset mock and side effect
         mock_compressor.reset_mock()
-        mock_compression_manager.return_value.get_compressor.side_effect = [
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
             mock_compressor,
             Mock(),
         ]
@@ -2317,6 +2824,232 @@ class TestServer(object):
         )
         # THEN decompression should not occur
         mock_compressor.decompress.assert_not_called()
+
+    @patch("tempfile.mkdtemp")
+    @patch("barman.server.open")
+    @patch("barman.server.shutil")
+    @patch("barman.server.NamedTemporaryFile")
+    @patch("barman.backup.CompressionManager")
+    def test_get_wal_honoring_custom_decompression(
+        self,
+        mock_compression_manager,
+        _mock_named_temporary_file,
+        _mock_shutil,
+        _mock_open,
+        mock_tempdir,
+    ):
+        """
+        Assert that it always prioritize using the custom decompression filter set.
+
+        .. note::
+            This handle cases where e.g., the user is using a custom compression filter
+            which implements, let's say, the LZ4 algorithm. LZ4 is an algorithm
+            supported natively by Barman so it has its own ways of handling it.
+            However, we always have to honor the custom parameters set by the user,
+            even if having a native handler for it. This is what this test is for.
+        """
+        # GIVEN a server with custom compression set to, let's say, compression A
+        server = build_real_server(
+            main_conf={
+                "compression": "custom",
+                "custom_compression_filter": "compression-A -c",
+                "custom_decompression_filter": "compression-A -c -d",
+                "encryption_passphrase_command": "echo 'passphrase'",
+            }
+        )
+        server.backup_manager = Mock()
+        mock_wal_info = Mock()
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
+        mock_wal_info.fullpath.return_value = "/some/path"
+        mock_custom_compressor = Mock()
+        mock_custom_compressor.compression = "custom"
+        server.backup_manager.compression_manager.custom_compression_filter = (
+            "compression-A -c"
+        )
+        server.backup_manager.compression_manager.custom_decompression_filter = (
+            "compression-A -c -d"
+        )
+        # AND the compression identified by the magic number is also compression A, to
+        # which Barman also has its own internal implementation i.e. a compressor class
+        mock_compressor = Mock()
+        mock_compressor.compression = "compression-A"
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
+            mock_compressor,  # compressor found based on the magic number
+            None,  # compressor based on the `compression` param of get_wal_sendfile
+            mock_custom_compressor,  # compressor to prioritize if a custom comp is set
+        ]
+        # WHEN get_wal_sendfile is called
+        server.get_wal_sendfile("test_wal_file", None, False, "/path/to/dest")
+        # THEN decompression should occur using the custom compressor, not the one
+        # found by the magic number
+        mock_custom_compressor.decompress.assert_called_once()
+        mock_compressor.decompress.assert_not_called()
+
+        # reset mocks and side effect
+        mock_compressor.reset_mock()
+        mock_custom_compressor.reset_mock()
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
+            mock_compressor,
+            None,
+            mock_custom_compressor,
+        ]
+
+        # HOWEVER, if the custom decompression filter fails
+        mock_custom_compressor.decompress.side_effect = CommandFailedException(
+            "oh no! custom decompression failed!!!"
+        )
+
+        server.get_wal_sendfile("test_wal_file", None, False, "/path/to/dest")
+
+        # THEN it should fallback to the native internal Barman implementation
+        mock_custom_compressor.decompress.assert_called_once()
+        mock_compressor.decompress.assert_called_once()
+
+    @patch("barman.fs.LocalLibPathDeletionCommand")
+    @patch("barman.server.get_passphrase_from_command")
+    @patch("tempfile.mkdtemp")
+    @patch("barman.server.open")
+    @patch("barman.server.shutil")
+    @patch("barman.server.NamedTemporaryFile")
+    @patch("barman.backup.CompressionManager")
+    def test_get_wal_encrypted(
+        self,
+        mock_compression_manager,
+        _mock_named_temporary_file,
+        _mock_shutil,
+        _mock_open,
+        mock_tempdir,
+        mock_getpass,
+        mock_fs_cmd,
+    ):
+        """
+        Assert that it always prioritize using the custom decompression filter set.
+
+        .. note::
+            This handle cases where e.g., the user is using a custom compression filter
+            which implements, let's say, the LZ4 algorithm. LZ4 is an algorithm
+            supported natively by Barman so it has its own ways of handling it.
+            However, we always have to honor the custom parameters set by the user,
+            even if having a native handler for it. This is what this test is for.
+        """
+        # GIVEN a server with custom compression set to, let's say, compression A
+        server = build_real_server(
+            main_conf={
+                "compression": "custom",
+                "custom_compression_filter": "compression-A -c",
+                "custom_decompression_filter": "compression-A -c -d",
+                "encryption_passphrase_command": "echo 'passphrase'",
+            }
+        )
+        server.backup_manager = Mock()
+        mock_wal_info = Mock()
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
+        mock_wal_info.fullpath.return_value = "/some/path"
+        mock_wal_info.encryption = "gpg"
+        mock_custom_compressor = Mock()
+        mock_custom_compressor.compression = "custom"
+        server.backup_manager.compression_manager.custom_compression_filter = (
+            "compression-A -c"
+        )
+        server.backup_manager.compression_manager.custom_decompression_filter = (
+            "compression-A -c -d"
+        )
+        # AND the compression identified by the magic number is also compression A, to
+        # which Barman also has its own internal implementation i.e. a compressor class
+        mock_compressor = Mock()
+        mock_compressor.compression = "compression-A"
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
+            mock_compressor,  # compressor found based on the magic number
+            None,  # compressor based on the `compression` param of get_wal_sendfile
+            mock_custom_compressor,  # compressor to prioritize if a custom comp is set
+        ]
+        encryption_handler = Mock()
+        server.backup_manager.encryption_manager.get_encryption.return_value = (
+            encryption_handler
+        )
+        # WHEN get_wal_sendfile is called
+        server.get_wal_sendfile("test_wal_file", None, False, "/path/to/dest")
+
+        mock_getpass.assert_called_once_with("echo 'passphrase'")
+        server.backup_manager.encryption_manager.get_encryption.assert_called_once_with(
+            encryption=mock_wal_info.encryption
+        )
+        mock_tempdir.assert_called_once_with(
+            dir="/some/barman/home/main/wals",
+            prefix=".%s." % os.path.basename("test_wal_file"),
+        )
+
+        encryption_handler.decrypt.assert_called_once_with(
+            file="test_wal_file",
+            dest=mock_tempdir.return_value,
+            passphrase=mock_getpass.return_value,
+        )
+        server.backup_manager.compression_manager.identify_compression.assert_called_once_with(
+            encryption_handler.decrypt.return_value
+        )
+        # THEN decompression should occur using the custom compressor, not the one
+        # found by the magic number
+        mock_custom_compressor.decompress.assert_called_once_with(
+            encryption_handler.decrypt.return_value, mock.ANY
+        )
+        mock_compressor.decompress.assert_not_called()
+
+        # reset mocks and side effect
+        mock_compressor.reset_mock()
+        mock_custom_compressor.reset_mock()
+        server.backup_manager.compression_manager.get_compressor.side_effect = [
+            mock_compressor,
+            None,
+            mock_custom_compressor,
+        ]
+
+        # HOWEVER, if the custom decompression filter fails
+        mock_custom_compressor.decompress.side_effect = CommandFailedException(
+            "oh no! custom decompression failed!!!"
+        )
+
+        mock_fs_cmd.assert_called_once_with(mock_tempdir.return_value)
+        mock_fs_cmd.return_value.delete.assert_called_once_with()
+        mock_fs_cmd.reset_mock()
+        server.get_wal_sendfile("test_wal_file", None, False, "/path/to/dest")
+
+        # THEN it should fallback to the native internal Barman implementation
+        mock_custom_compressor.decompress.assert_called_once_with(
+            encryption_handler.decrypt.return_value, mock.ANY
+        )
+        mock_compressor.decompress.assert_called_once_with(
+            encryption_handler.decrypt.return_value, mock.ANY
+        )
+
+        mock_fs_cmd.assert_called_once_with(mock_tempdir.return_value)
+        mock_fs_cmd.return_value.delete.assert_called_once_with()
+
+    def test_get_wal_sendfile_encrypted_wal_with_no_passphrase_raise_exception(
+        self, caplog
+    ):
+        """
+        Test that when an encrypted WAL is found and no passphrase is passed, the
+        get_wal process (a.k.a barman-wal-restore) will raise an exception.
+        """
+        server = build_real_server(
+            main_conf={
+                "encryption_passphrase_command": None,
+            }
+        )
+        server.backup_manager = Mock()
+        mock_wal_info = Mock()
+        server.backup_manager.get_wal_file_info.return_value = mock_wal_info
+        mock_wal_info.fullpath.return_value = "/some/path"
+        mock_wal_info.encryption = "gpg"
+        mock_wal_info.name = "test_wal_file"
+
+        with pytest.raises(SystemExit):
+            server.get_wal_sendfile("test_wal_file", None, False, "/path/to/dest")
+
+        assert (
+            "Encrypted WAL file 'test_wal_file' detected, but no "
+            "'encryption_passphrase_command' is configured."
+        ) in caplog.text
 
     @pytest.mark.parametrize(
         "obj, HASHSUMS_FILE, hash_algorithm, checksum, mode, success, error_msg",
@@ -2508,35 +3241,13 @@ class TestServer(object):
             ("MD5SUMS", "md5", "sum_absent", "Missing checksum for file"),
             ("MD5SUMS", "md5", "sum_mismatch", "Bad file checksum"),
             (
-                "MD5SUMS",
-                "md5",
-                "dest_exists",
-                "Impossible to write already existing",
-            ),
-            (
                 "SHA256SUMS",
                 "sha256",
                 "file_absent",
                 "Checksum without corresponding file",
             ),
-            (
-                "SHA256SUMS",
-                "sha256",
-                "sum_absent",
-                "Missing checksum for file",
-            ),
-            (
-                "SHA256SUMS",
-                "sha256",
-                "sum_mismatch",
-                "Bad file checksum",
-            ),
-            (
-                "SHA256SUMS",
-                "sha256",
-                "dest_exists",
-                "Impossible to write already existing",
-            ),
+            ("SHA256SUMS", "sha256", "sum_absent", "Missing checksum for file"),
+            ("SHA256SUMS", "sha256", "sum_mismatch", "Bad file checksum"),
         ],
     )
     def test_put_wal_fail(
@@ -2580,14 +3291,10 @@ class TestServer(object):
             tar.add(hashsum.strpath, hashsum.basename)
         tar.close()
 
-        # If requested create a colliding file in the incoming directory
-        if mode == "dest_exists":
-            dest_file = incoming.join(wal.basename)
-            dest_file.write("some random content", ensure=True)
-
         # Feed the data to put-wal
         tar_file.seek(0)
         server.put_wal(tar_file)
+
         out, err = capsys.readouterr()
 
         # Output is always empty
@@ -2599,6 +3306,88 @@ class TestServer(object):
             "for server 'main' (SSH host: 192.168.66.99)\n" in err
         )
         assert output.error_occurred
+
+    @pytest.mark.parametrize(
+        "HASHSUMS_FILE, hash_algorithm, message, checksums_match",
+        [
+            (
+                "MD5SUMS",
+                "md5",
+                "Duplicate Files Detected with Mismatched Checksums",
+                False,
+            ),
+            ("MD5SUMS", "md5", "Duplicate Files with Identical Checksums.", True),
+            (
+                "SHA256SUMS",
+                "sha256",
+                "Duplicate Files Detected with Mismatched Checksums",
+                False,
+            ),
+            ("SHA256SUMS", "sha256", "Duplicate Files with Identical Checksums.", True),
+        ],
+    )
+    @patch("barman.server.Server.move_wal_file_to_errors_directory")
+    def test_put_wal_with_duplicate_file(
+        self,
+        mock_move_wal_file_to_errors_dir,
+        HASHSUMS_FILE,
+        hash_algorithm,
+        message,
+        checksums_match,
+        tmpdir,
+        capsys,
+        monkeypatch,
+        caplog,
+    ):
+        # See all logs
+        caplog.set_level(0)
+        lab = tmpdir.mkdir("lab")
+        incoming = tmpdir.mkdir("incoming")
+        server = build_real_server(
+            main_conf={
+                "incoming_wals_directory": incoming.strpath,
+                "backup_options": "concurrent_backup",
+            }
+        )
+        output.error_occurred = False
+
+        # Simulate a connection from a remote host
+        monkeypatch.setenv("SSH_CONNECTION", "192.168.66.99")
+
+        # Generate some test data in an in_memory tar
+        tar_file = BytesIO()
+        tar = tarfile.open(mode="w|", fileobj=tar_file)
+        wal = lab.join("00000001000000EF000000AB")
+        wal.write("some random content", ensure=True)
+        tar.add(wal.strpath, wal.basename)
+        hashsum = lab.join(HASHSUMS_FILE)
+        hashsum.write("%s *%s\n" % (wal.computehash(hash_algorithm), wal.basename))
+        tar.add(hashsum.strpath, hashsum.basename)
+        tar.close()
+
+        dest_file = incoming.join(wal.basename)
+        if checksums_match:
+            dest_file.write("some random content", ensure=True)
+        else:
+            dest_file.write("I might be corrupted!", ensure=True)
+
+        mock_move_wal_file_to_errors_dir.return_value = None
+        # Feed the data to put-wal
+        tar_file.seek(0)
+        server.put_wal(tar_file)
+
+        out, err = capsys.readouterr()
+        # Should not have an error msg
+        assert not err
+        if not checksums_match:
+            mock_move_wal_file_to_errors_dir.assert_called_once()
+            # info message from stdout/stderr
+            assert message in out
+        else:
+            # debug message from logs
+            assert message in caplog.text
+        # Should not have an error occurred
+        assert not output.error_occurred
 
     @pytest.mark.parametrize(
         "obj, HASHSUMS_FILE, hash_algorithm, checksum",
@@ -3022,6 +3811,93 @@ class TestServer(object):
             in out
         )
 
+    @patch("barman.server.tempfile.NamedTemporaryFile")
+    @patch("os.unlink")
+    def test_check_encryption(self, mock_unlink, mock_tmp_file):
+        """
+        Test the check_encryption method of the Server class.
+        """
+        # Case 1: no encryption configured so the check is ignored
+        mock_strategy = Mock()
+        server = build_real_server(main_conf={"encryption": "none"})
+        server.check_encryption(mock_strategy)
+        mock_strategy.init_check.assert_not_called()
+
+        # Case 2: encryption configuration is invalid
+        # Mock the strategy and make the validate_config raise an exception
+        mock_strategy = Mock()
+        server = build_real_server(main_conf={"encryption": "gpg"})
+        server.backup_manager.encryption_manager = Mock()
+        server.backup_manager.encryption_manager.validate_config.side_effect = (
+            ValueError("A terrible error!!!")
+        )
+        # Run the check
+        server.check_encryption(mock_strategy)
+        # Assert that the check was initialized, the validate_config was called
+        # and that the strategy result was as expected
+        mock_strategy.init_check.assert_called_once_with("encryption")
+        server.backup_manager.encryption_manager.validate_config.assert_called_once()
+        mock_strategy.result.assert_called_once_with(
+            server.config.name, False, hint="A terrible error!!!"
+        )
+
+        # Case 3: encryption configuration is valid, but encrypting fails
+        # Mock the strategy, named-temporary file and make the encrypt method
+        # raise an exception
+        mock_strategy = Mock()
+        mock_tmp_file.return_value.__enter__.return_value = Mock()
+        mock_tmp_file.return_value.__enter__.return_value.name = "path/to/tmp/file"
+        server = build_real_server(main_conf={"encryption": "gpg"})
+        server.backup_manager.encryption_manager = Mock()
+        encryption = (
+            server.backup_manager.encryption_manager.get_encryption.return_value
+        )
+        encryption.encrypt.side_effect = CommandFailedException("terrible exception!!!")
+        # Run the check
+        server.check_encryption(mock_strategy)
+        # Assert the check was initialized and that the get_encryption was called correctly
+        mock_strategy.init_check.assert_called_once_with("encryption")
+        server.backup_manager.encryption_manager.get_encryption.assert_called_once()
+        # Assert that a message was written to the temp file
+        mock_tmp_file.return_value.__enter__.return_value.write.assert_called_once_with(
+            "I am a secret message. Encrypt me!"
+        )
+        # Assert that the encrypt method was called correctly and that the result was
+        # was expected
+        encryption.encrypt.assert_called_once_with("path/to/tmp/file", "path/to/tmp")
+        mock_strategy.result.assert_called_once_with(
+            server.config.name,
+            False,
+            hint="encryption test failed. Check the log file for more details",
+        )
+
+        # Case 3: encryption configuration is valid and encrypting also succeeds
+        # Mock the strategy, named-temporary file and make the encrypt method succeeds
+        mock_strategy = Mock()
+        mock_tmp_file.return_value.__enter__.return_value = Mock()
+        mock_tmp_file.return_value.__enter__.return_value.name = "path/to/tmp/file"
+        server = build_real_server(main_conf={"encryption": "gpg"})
+        server.backup_manager.encryption_manager = Mock()
+        encryption = (
+            server.backup_manager.encryption_manager.get_encryption.return_value
+        )
+        encryption.encrypt.return_value = "path/to/tmp/file.gpg"
+        # Run the check
+        server.check_encryption(mock_strategy)
+        # Assert the check was initialized and that the get_encryption was called
+        mock_strategy.init_check.assert_called_once_with("encryption")
+        server.backup_manager.encryption_manager.get_encryption.assert_called_once()
+        # Assert that the encrypt method was called correctly and that the encrypted
+        # file generated was deleted
+        encryption.encrypt.assert_called_once_with("path/to/tmp/file", "path/to/tmp")
+        mock_unlink.assert_called_once_with("path/to/tmp/file.gpg")
+        # Assert that the result was as expected
+        mock_strategy.result.assert_called_once_with(
+            server.config.name,
+            True,
+            hint="encryption test succeeded",
+        )
+
     def test_check_backup_validity_exceeds_minimum_size(self, server, capsys):
         backup = build_test_backup_info(
             server=server,
@@ -3163,6 +4039,27 @@ class TestServer(object):
                 self.hash_algorithm = hash_algorithm
 
         return HashableTarfile()
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["duplicate", "unknown"],
+    )
+    @patch("barman.server.shutil")
+    def test_move_wal_file_to_errors_directory(self, mock_shutil, suffix):
+        errors_dir = "path/to/errors"
+        server = build_real_server(
+            main_conf={
+                "backup_options": "concurrent_backup",
+                "errors_directory": errors_dir,
+            }
+        )
+
+        src = "original_file"
+        filename = "filename"
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        error_dst = "%s/%s.%s.%s" % (errors_dir, filename, stamp, suffix)
+        server.move_wal_file_to_errors_directory(src, filename, suffix)
+        mock_shutil.move.assert_called_once_with(src, error_dst)
 
 
 class TestCheckStrategy(object):

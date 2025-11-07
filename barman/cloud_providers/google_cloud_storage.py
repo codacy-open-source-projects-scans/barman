@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -33,6 +33,9 @@ from barman.cloud import (
 )
 from barman.exceptions import CommandException, SnapshotBackupException
 
+_logger = logging.getLogger(__name__)
+
+
 try:
     # Python 3.x
     from urllib.parse import urlparse
@@ -46,7 +49,6 @@ try:
 except ImportError:
     raise SystemExit("Missing required python module: google-cloud-storage")
 
-_logger = logging.getLogger(__name__)
 
 BASE_URL = "https://console.cloud.google.com/storage/browser/"
 
@@ -142,7 +144,7 @@ class GoogleCloudInterface(CloudInterface):
             self.bucket_exists = self._check_bucket_existence()
             return True
         except GoogleAPIError as exc:
-            logging.error("Can't connect to cloud provider: %s", exc)
+            _logger.error("Can't connect to cloud provider: %s", exc)
             return False
 
     def _check_bucket_existence(self):
@@ -168,9 +170,9 @@ class GoogleCloudInterface(CloudInterface):
         try:
             self.client.create_bucket(self.container_client)
         except Conflict as e:
-            logging.warning("It seems there was a Conflict creating bucket.")
-            logging.warning(e.message)
-            logging.warning("The bucket already exist, so we continue.")
+            _logger.warning("It seems there was a Conflict creating bucket.")
+            _logger.warning(e.message)
+            _logger.warning("The bucket already exist, so we continue.")
 
     def list_bucket(self, prefix="", delimiter=DEFAULT_DELIMITER):
         """
@@ -181,14 +183,14 @@ class GoogleCloudInterface(CloudInterface):
         :return: List of objects and dirs right under the prefix
         :rtype: List[str]
         """
-        logging.debug("list_bucket: {}, {}".format(prefix, delimiter))
+        _logger.debug("list_bucket: {}, {}".format(prefix, delimiter))
         blobs = self.client.list_blobs(
             self.container_client, prefix=prefix, delimiter=delimiter
         )
         objects = list(map(lambda blob: blob.name, blobs))
         dirs = list(blobs.prefixes)
-        logging.debug("objects {}".format(objects))
-        logging.debug("dirs {}".format(dirs))
+        _logger.debug("objects {}".format(objects))
+        _logger.debug("dirs {}".format(dirs))
         return objects + dirs
 
     def download_file(self, key, dest_path, decompress):
@@ -199,7 +201,7 @@ class GoogleCloudInterface(CloudInterface):
         :param str dest_path: Where to put the destination file
         :param str|None decompress: Compression scheme to use for decompression
         """
-        logging.debug("GCS.download_file")
+        _logger.debug("GCS.download_file")
         blob = storage.Blob(key, self.container_client)
         with open(dest_path, "wb") as dest_file:
             if decompress is None:
@@ -219,10 +221,10 @@ class GoogleCloudInterface(CloudInterface):
         :return: google.cloud.storage.fileio.BlobReader | DecompressingStreamingIO | None A file-like object from which
           the stream can be read or None if the key does not exist
         """
-        logging.debug("GCS.remote_open")
+        _logger.debug("GCS.remote_open")
         blob = storage.Blob(key, self.container_client)
         if not blob.exists():
-            logging.debug("Key: {} does not exist".format(key))
+            _logger.debug("Key: {} does not exist".format(key))
             return None
         blob_reader = blob.open("rb")
         if decompressor:
@@ -239,19 +241,19 @@ class GoogleCloudInterface(CloudInterface):
           uploaded object
         """
         tags = override_tags or self.tags
-        logging.debug("upload_fileobj to {}".format(key))
+        _logger.debug("upload_fileobj to {}".format(key))
         extra_args = {}
         if self.kms_key_name is not None:
             extra_args["kms_key_name"] = self.kms_key_name
         blob = self.container_client.blob(key, **extra_args)
         if tags is not None:
             blob.metadata = dict(tags)
-        logging.debug("blob initiated")
+        _logger.debug("blob initiated")
         try:
             blob.upload_from_file(fileobj)
         except GoogleAPIError as e:
-            logging.error(type(e))
-            logging.error(e)
+            _logger.error(type(e))
+            _logger.error(e)
             raise e
 
     def create_multipart_upload(self, key):
@@ -324,7 +326,7 @@ class GoogleCloudInterface(CloudInterface):
         try:
             self.delete_objects(key)
         except GoogleAPIError as e:
-            logging.error(e)
+            _logger.error(e)
             raise e
 
     def _delete_objects_batch(self, paths):
@@ -346,7 +348,7 @@ class GoogleCloudInterface(CloudInterface):
                     failures[path] = [str(e.__class__), e.__str__()]
 
         if failures:
-            logging.error(failures)
+            _logger.error(failures)
             raise CloudProviderError()
 
     def get_prefixes(self, prefix):

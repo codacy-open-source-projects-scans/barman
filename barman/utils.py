@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -41,7 +41,7 @@ from glob import glob
 
 from dateutil import tz
 
-from barman import lockfile
+from barman import lockfile, xlog
 from barman.exceptions import TimeoutError
 
 _logger = logging.getLogger(__name__)
@@ -54,7 +54,16 @@ else:
     _text_type = unicode  # noqa
     _string_types = basestring  # noqa
 
-RESERVED_BACKUP_IDS = ("latest", "last", "oldest", "first", "last-failed")
+RESERVED_BACKUP_IDS = (
+    "latest",
+    "last",
+    "oldest",
+    "first",
+    "last-failed",
+    "latest-full",
+    "last-full",
+    "auto",
+)
 
 
 def drop_privileges(user):
@@ -123,7 +132,7 @@ def configure_logging(
     logging.root.addHandler(handler)
     if warn:
         # this will be always displayed because the default level is WARNING
-        _logger.warn(warn)
+        _logger.warning(warn)
     logging.root.setLevel(log_level)
 
 
@@ -505,6 +514,32 @@ def simplify_version(version_string):
     return ".".join(version[:-1])
 
 
+def get_major_version(text_string):
+    """
+    Finds a version number in a string and returns its major component.
+
+    :param text_string: The string containing the version number.
+    :return: The major version number as a string, or ``None`` if not found.
+    """
+    if text_string is None:
+        return None
+
+    # Step 1: Find the first number (integer or decimal) in the string.
+    # The pattern r'\d+\.?\d*' finds sequences of digits like "17" or "17.5".
+    match = re.search(r"\d+\.?\d*", text_string)
+
+    if not match:
+        return None  # No version number found in the string
+
+    # Step 2: Extract the matched version string (e.g., "17.5").
+    version_string = match.group(0)
+
+    # Step 3: Simplify it by taking the part before the first period.
+    major_version = version_string.split(".")[0]
+
+    return major_version
+
+
 def with_metaclass(meta, *bases):
     """
     Function from jinja2/_compat.py. License: BSD.
@@ -811,6 +846,61 @@ def check_aws_snapshot_lock_mode(value):
     return value
 
 
+def check_tag(value):
+    """
+    Parses and validates a tag string from the ``key,value`` format.
+
+    This function checks for character, length, and prefix constraints
+    as defined by AWS tag requirements.
+
+    :param value: The input string, e.g., ``owner,data-team``.
+    :return: A tuple of (key, value) if valid, or ``None`` if the input is empty.
+    :raises ValueError: If the format is wrong or constraints are not met.
+    """
+    if not value:
+        return None
+
+    # Split only on the first comma to allow commas in the value.
+    kv_lst = value.split(",", 1)
+    if len(kv_lst) != 2:
+        raise ValueError("Invalid tag format. Expected 'key,value'.")
+
+    # --- 1. Parse the Key and Value ---
+    key, val = kv_lst
+    key = key.strip()
+    val = val.strip()
+
+    # --- 2. Define Validation Rules ---
+    # Regex for allowed characters: letters, numbers, spaces, and _ . : / = + - @
+    # The hyphen is escaped (\-) to be treated as a literal.
+    allowed_chars_pattern = re.compile(r"^[a-zA-Z0-9\s_.:/=+\-@]*$")
+
+    # --- 3. Validate the Key ---
+    if not 1 <= len(key) <= 128:
+        raise ValueError("Tag key must be between 1 and 128 characters.")
+
+    if key.lower().startswith("aws:"):
+        raise ValueError("Tag key cannot start with the reserved prefix 'aws:'.")
+
+    if not allowed_chars_pattern.match(key):
+        raise ValueError(
+            "Tag key contains invalid characters. "
+            "Allowed are letters, numbers, spaces, and _.:/=+-@"
+        )
+
+    # --- 4. Validate the Value ---
+    if len(val) > 256:
+        raise ValueError("Tag value must be 256 characters or less.")
+
+    if not allowed_chars_pattern.match(val):
+        raise ValueError(
+            "Tag value contains invalid characters. "
+            "Allowed are letters, numbers, spaces, and _.:/=+-@"
+        )
+
+    return key, val
+
+
 def check_tli(value):
     """
     Check for a positive integer option, and also make "current" and "latest" acceptable values
@@ -1044,3 +1134,186 @@ def edit_config(file, section, option, value, lines=None):
         lines.append("[" + section + "]\n")
         lines.append(option + " = " + value + "\n")
     return lines
+
+
+def get_backup_id_from_target_time(available_backups, target_time, target_tli=None):
+    """
+    Get backup ID from the catalog based on the recovery_target *target_time* and
+    *target_tli*.
+
+    :param list[BackupInfo] available_backups: List of BackupInfo objects.
+    :param str target_time: The target value with timestamp format
+        ``%Y-%m-%d %H:%M:%S`` with or without timezone.
+    :param int|None target_tli: Target timeline value, if a specific one is required.
+    :return str|None: ID of the backup.
+    :raises:
+        :exc:`ValueError`: If *target_time* is an invalid value.
+    """
+    from barman.infofile import load_datetime_tz
+
+    try:
+        parsed_target = load_datetime_tz(target_time)
+    except Exception as e:
+        raise ValueError(
+            "Unable to parse the target time parameter %r: %s" % (target_time, e)
+        )
+    for candidate_backup in sorted(
+        available_backups, key=lambda backup: backup.backup_id, reverse=True
+    ):
+        if candidate_backup.end_time <= parsed_target:
+            if target_tli is not None and candidate_backup.timeline != target_tli:
+                continue
+            return candidate_backup.backup_id
+    return None
+
+
+def get_backup_id_from_target_lsn(available_backups, target_lsn, target_tli=None):
+    """
+    Get backup ID from the catalog based on the recovery_target *target_lsn* and
+    *target_tli*.
+
+    :param list[BackupInfo] available_backups: List of BackupInfo objects.
+    :param str target_lsn: The target value with lsn format, e.g.,
+        ``3/64000000``.
+    :param int|None target_tli: Target timeline value, if a specific one is required.
+    :return str|None: ID of the backup.
+    """
+    parsed_target = xlog.parse_lsn(target_lsn)
+    for candidate_backup in sorted(
+        available_backups, key=lambda backup: backup.backup_id, reverse=True
+    ):
+        if xlog.parse_lsn(candidate_backup.end_xlog) <= parsed_target:
+            if target_tli is not None and candidate_backup.timeline != target_tli:
+                continue
+            return candidate_backup.backup_id
+    return None
+
+
+def get_last_backup_id(available_backups):
+    """
+    Get last backup ID from the catalog.
+
+    :param list[BackupInfo] available_backups: List of BackupInfo objects.
+    :return str|None: ID of the backup.
+    """
+    if len(available_backups) == 0:
+        return None
+
+    backups = sorted(available_backups, key=lambda backup: backup.backup_id)
+    return backups[-1].backup_id
+
+
+def get_backup_id_from_target_tli(available_backups, target_tli):
+    """
+    Get backup ID from the catalog based on the recovery_target *target_tli*.
+
+    :param list[BackupInfo] available_backups: Dict values of BackupInfo objects.
+    :param int target_tli: Target timeline value.
+    :return str|None: ID of the backup.
+    """
+    if len(available_backups) == 0:
+        return None
+
+    for candidate_backup in sorted(
+        available_backups, key=lambda backup: backup.backup_id, reverse=True
+    ):
+        if candidate_backup.timeline == target_tli:
+            return candidate_backup.backup_id
+    return None
+
+
+def parse_target_tli(obj, target_tli, backup_info=None):
+    """
+    Parse target timeline shorcut, ``latest`` and ``current``.
+
+    .. note::
+        This method is used in two other methods that are part of the recovery of a
+        a backup (:meth:`_set_pitr_targets` and :meth:`get_required_xlog_files`).
+        When called with a *backup_info*, it means that the recover operation uses a
+        specific backup for recovery and ``current`` is allowed in this case because
+        this backup is considered the ``current`` backup.
+        When called without a *backup_info*, it means that the recover operation is
+        going to fetch the best backup for recovery, so ``current`` is not allowed
+        because there is no ``current`` backup.
+
+        This method can also be used in the cloud script to retrieve the latest WAL
+        from the cloud catalog when shortcut is ``latest``.
+
+    :param BackupManager|CloudBackupCatalog obj: A BackupManager or a CloudBackupCatalog
+        object.
+    :param str|int target_tli: Target timeline value. Accepts both an integer
+        representing the timeline, or keywords accepted by Postgres, such as ``current``
+        and ``latest``.
+    :param None|BackupInfo backup_info: Backup info object.
+    :return int|None: ID of the timeline.
+    :raise ValueError: if *target_tli* is an invalid value.
+    """
+    parsed_target_tli = target_tli
+    if target_tli and type(target_tli) is str:
+        if target_tli == "current":
+            if backup_info is None:
+                raise ValueError(
+                    "'%s' is not a valid timeline keyword when recovering"
+                    " without a backup_id" % target_tli
+                )
+            else:
+                parsed_target_tli = backup_info.timeline
+        elif target_tli == "latest":
+            valid_timelines = obj.get_latest_archived_wals_info()
+            parsed_target_tli = int(max(valid_timelines.keys()), 16)
+        elif target_tli.isdigit():
+            parsed_target_tli = int(target_tli)
+        else:
+            raise ValueError("'%s' is not a valid timeline keyword" % target_tli)
+    return parsed_target_tli
+
+
+@contextmanager
+def muted(logger):
+    """
+    Context manager to temporarily prevent a logger from printing any kind of
+    messages to the console.
+
+    This effectively mutes ``INFO``, ``WARNING``, and ``ERROR`` messages.
+    ``DEBUG`` messages can still logged in the log file.
+
+    This is useful to hide console outputs during internal operations where it's not
+    worth changing all methods involved to contain a ``verbose`` parameter or similar.
+
+    .. note::
+        As we are modifying an object that is used all throughout the code, it is worth
+        mentioning that it is not thread-safe. It should only be used in
+        single-threaded contexts or where the logger is not shared across threads.
+
+    :param logger: The logger to be muted
+    """
+    # Save original logging methods
+    original_info = logger.info
+    original_warning = logger.warning
+    original_error = logger.error
+
+    # Replace logging methods with no-op functions
+    logger.info = lambda *args, **kwargs: None
+    logger.warning = lambda *args, **kwargs: None
+    logger.error = lambda *args, **kwargs: None
+
+    try:
+        yield
+    finally:
+        # Restore original methods
+        logger.info = original_info
+        logger.warning = original_warning
+        logger.error = original_error
+
+
+def is_subdirectory(path1, path2):
+    """
+    Check if *path2* is a subdirectory of *path1*.
+
+    :param str path1: The parent directory path.
+    :param str path2: The child directory path.
+    :return bool: ``True`` if *path2* is a subdirectory of *path1, ``False`` otherwise
+    """
+    path1 = os.path.abspath(path1)
+    path2 = os.path.abspath(path2)
+    return os.path.commonpath([path1, path2]) == path1

@@ -3,7 +3,7 @@
 #
 # barman - Backup and Recovery Manager for PostgreSQL
 #
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -33,8 +33,8 @@ import sys
 
 from setuptools import find_packages, setup
 
-if sys.version_info < (3, 6):
-    raise SystemExit("ERROR: Barman needs at least python 3.6 to work")
+if sys.version_info < (3, 8):
+    raise SystemExit("ERROR: Barman needs at least python 3.8 to work")
 
 # Depend on pytest_runner only when the tests are actually invoked
 needs_pytest = set(["pytest", "test"]).intersection(sys.argv)
@@ -45,7 +45,34 @@ setup_requires = pytest_runner
 install_requires = [
     "psycopg2 >= 2.4.2",
     "python-dateutil",
+    "setuptools",  # Python 3.12+ no longer includes setuptools by default
 ]
+
+extras_requires = {
+    "argcomplete": ["argcomplete"],
+    "aws-snapshots": ["boto3"],
+    "azure": ["azure-identity", "azure-storage-blob"],
+    "azure-snapshots": ["azure-identity", "azure-mgmt-compute"],
+    "cloud": ["boto3"],
+    "google": [
+        "google-cloud-storage",
+    ],
+    "google-snapshots": [
+        "grpcio",
+        "google-cloud-compute",
+    ],
+    "snappy": [
+        "python-snappy",
+        "cramjam >= 2.7.0",
+    ],
+    "zstandard": ["zstandard"],
+    "lz4": ["lz4"],
+}
+
+# Automatically create "all" extra requirement by combining everything
+extras_requires["all"] = sorted(
+    {pkg for group in extras_requires.values() for pkg in group}
+)
 
 barman = {}
 with open("barman/version.py", "r", encoding="utf-8") as fversion:
@@ -86,6 +113,7 @@ setup(
                 "docs/_build/man/barman-keep.1",
                 "docs/_build/man/barman-list_backups.1",
                 "docs/_build/man/barman-list-files.1",
+                "docs/_build/man/barman-list-processes.1",
                 "docs/_build/man/barman-list-servers.1",
                 "docs/_build/man/barman-lock-directory-cleanup.1",
                 "docs/_build/man/barman-put-wal.1",
@@ -101,6 +129,7 @@ setup(
                 "docs/_build/man/barman-sync-backup.1",
                 "docs/_build/man/barman-sync-info.1",
                 "docs/_build/man/barman-sync-wals.1",
+                "docs/_build/man/barman-terminate-process.1",
                 "docs/_build/man/barman-verify.1",
                 "docs/_build/man/barman-verify-backup.1",
                 "docs/_build/man/barman-wal-restore.1",
@@ -129,27 +158,7 @@ setup(
     description=__doc__.split("\n")[0],
     long_description="\n".join(__doc__.split("\n")[2:]),
     install_requires=install_requires,
-    extras_require={
-        "argcomplete": ["argcomplete"],
-        "aws-snapshots": ["boto3"],
-        "azure": ["azure-identity", "azure-storage-blob"],
-        "azure-snapshots": ["azure-identity", "azure-mgmt-compute"],
-        "cloud": ["boto3"],
-        "google": [
-            "google-cloud-storage",
-        ],
-        "google-snapshots": [
-            "grpcio",
-            "google-cloud-compute",  # requires minimum python3.7
-        ],
-        "snappy": [
-            'python-snappy==0.6.1; python_version<"3.7"',
-            'python-snappy; python_version>="3.7"',
-            'cramjam >= 2.7.0; python_version>="3.7"',
-        ],
-        "zstandard": ["zstandard"],
-        "lz4": ["lz4"],
-    },
+    extras_require=extras_requires,
     platforms=["Linux", "Mac OS X"],
     classifiers=[
         "Environment :: Console",
@@ -160,11 +169,12 @@ setup(
         "Intended Audience :: System Administrators",
         "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
         "Programming Language :: Python",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",
         "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
     ],
     setup_requires=setup_requires,
 )

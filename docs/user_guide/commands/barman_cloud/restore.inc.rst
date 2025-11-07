@@ -10,19 +10,23 @@
   barman-cloud-restore
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity | default } ]
                   [ --snapshot-recovery-instance SNAPSHOT_RECOVERY_INSTANCE ]
+                  [ --snapshot-recovery-zone GCP_ZONE ]
                   [ --aws-region AWS_REGION ]
                   [ --gcp-zone GCP_ZONE ]
                   [ --azure-resource-group AZURE_RESOURCE_GROUP ]
-                  [ --tablespace NAME:LOCATION ]
+                  [ --tablespace NAME:LOCATION [ --tablespace NAME:LOCATION ... ] ]
+                  [ --target-lsn LSN ]
+                  [ --target-time TIMESTAMP ]
+                  [ --target-tli TLI ]
                   SOURCE_URL SERVER_NAME BACKUP_ID RECOVERY_DESTINATION
 
 **Description**
@@ -31,6 +35,10 @@ Use this script to restore a backup directly from cloud storage that was created
 the ``barman-cloud-backup`` command. Additionally, this script can prepare for recovery
 from a snapshot backup by verifying that attached disks were cloned from the correct
 snapshots and by downloading the backup label from object storage.
+
+This command does not automatically prepare Postgres for recovery. You must manually
+manage any :term:`PITR` options, custom ``restore_command`` values, signal files, or
+required WAL files to ensure Postgres starts, either manually or using external tools.
 
 .. note::
   For GCP, only authentication with ``GOOGLE_APPLICATION_CREDENTIALS`` env is supported.
@@ -45,7 +53,9 @@ snapshots and by downloading the backup label from object storage.
   ``s3://bucket/path/to/folder``.
 
 ``BACKUP_ID``
-  The ID of the backup to be restored.
+  The ID of the backup to be restored. You can use a shortcut instead of the backup ID.
+  Besides that, you can use ``auto`` to have Barman automatically find the most suitable
+  backup for the restore operation.
 
 ``RECOVERY_DESTINATION``
   The path to a directory for recovery.
@@ -79,6 +89,15 @@ snapshots and by downloading the backup label from object storage.
   
 ``--tablespace``
   Tablespace relocation rule.
+  
+``--target-lsn``
+  The recovery target lsn, e.g., ``3/64000000``.
+  
+``--target-time``
+  The recovery target timestamp with or without timezone, in the format ``%Y-%m-%d %H:%M:%S``.
+  
+``--target-tli``
+  The recovery target timeline.
 
 **Extra options for the AWS cloud provider**
 
@@ -113,6 +132,7 @@ snapshots and by downloading the backup label from object storage.
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.
 
 ``--azure-resource-group``
   The name of the Azure resource group to which the compute instance and disks defined by

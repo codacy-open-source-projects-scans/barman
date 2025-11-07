@@ -10,37 +10,38 @@
   barman-cloud-backup
                   [ { -V | --version } ]
                   [ --help ]
-                  [ { -v | --verbose } ]
-                  [ { -q | --quiet } ]
+                  [ { { -v | --verbose } | { -q | --quiet } } ]
                   [ { -t | --test } ]
                   [ --cloud-provider { aws-s3 | azure-blob-storage | google-cloud-storage } ]
-                  [ { -z | --gzip } ]
-                  [ { -j | --bzip2 } ]
-                  [ --snappy ]
+                  [ { { -z | --gzip } | { -j | --bzip2 } | --snappy } ]
                   [ { -h | --host } HOST ]
                   [ { -p | --port } PORT ]
                   [ { -U | --user } USER ]
                   [ { -d | --dbname } DBNAME ]
                   [ { -n | --name } BACKUP_NAME ]
                   [ { -J | --jobs } JOBS ]
-                  [ -S MAX_ARCHIVE_SIZE ]
+                  [ { -S | --max-archive-size } MAX_ARCHIVE_SIZE ]
                   [ --immediate-checkpoint ]
                   [ --min-chunk-size MIN_CHUNK_SIZE ]
                   [ --max-bandwidth MAX_BANDWIDTH ]
                   [ --snapshot-instance SNAPSHOT_INSTANCE ]
-                  [ --snapshot-disk NAME ]
-                  [ --tags [ TAGS ... ] ]
+                  [ --snapshot-disk NAME [ --snapshot-disk NAME ... ] ]
+                  [ --snapshot-zone GCP_ZONE ]
+                  [ -snapshot-gcp-project GCP_PROJECT ]
+                  [ --tag KEY,VALUE [ --tag KEY,VALUE ... ] ]
                   [ --endpoint-url ENDPOINT_URL ]
                   [ { -P | --aws-profile } AWS_PROFILE ]
+                  [ --profile AWS_PROFILE ]
                   [ --read-timeout READ_TIMEOUT ]
-                  [ { -e | --encryption } ENCRYPTION ]
+                  [ { -e | --encryption } { AES256 | aws:kms } ]
                   [ --sse-kms-key-id SSE_KMS_KEY_ID ]
                   [ --aws-region AWS_REGION ]
+                  [ --aws-await-snapshots-timeout AWS_AWAIT_SNAPSHOTS_TIMEOUT ]
                   [ --aws-snapshot-lock-mode { compliance | governance } ]
                   [ --aws-snapshot-lock-duration DAYS ]
                   [ --aws-snapshot-lock-cool-off-period HOURS ]
                   [ --aws-snapshot-lock-expiration-date DATETIME ]
-                  [ --azure-credential { azure-cli | managed-identity } ]
+                  [ { --azure-credential | --credential } { azure-cli | managed-identity | default } ]
                   [ --encryption-scope ENCRYPTION_SCOPE ]
                   [ --azure-subscription-id AZURE_SUBSCRIPTION_ID ]
                   [ --azure-resource-group AZURE_RESOURCE_GROUP ]
@@ -138,6 +139,9 @@ uploaded to the cloud.
 ``-S`` / ``--max-archive-size``
   Maximum size of an archive when uploading to cloud storage (default: ``100GB``).
 
+``--immediate-checkpoint``
+  Forces the initial checkpoint to be done as quickly as possible.
+
 ``--min-chunk-size``
   Minimum size of an individual chunk when uploading to cloud storage (default: ``5MB``
   for ``aws-s3``, ``64KB`` for ``azure-blob-storage``, not applicable for
@@ -153,9 +157,22 @@ uploaded to the cloud.
 ``--snapshot-disk``
   Name of a disk from which snapshots should be taken.
 
+``--tag``
+  Tag to be added to all uploaded files in cloud storage, and/or to snapshots created,
+  if snapshots are used.
+
 ``--tags``
-  Tags to be added to all uploaded files in cloud storage, and/or to snapshots created, if
-  snapshots are used.
+  Tags to be added to all uploaded files in cloud storage, and/or to snapshots created,
+  if snapshots are used.
+
+.. note::
+  If you are using ``--tags`` before positional arguments, you must insert ``--`` after
+  it to indicate the end of optional arguments. This tells the parser to treat
+  everything after ``--`` as positional arguments. Without the ``--``, Barman may
+  misinterpret positional arguments as values for the last option.
+
+.. deprecated:: 3.15
+    ``--tags`` is deprecated. Use ``--tag`` instead.
 
 **Extra options for the AWS cloud provider**
 
@@ -189,6 +206,10 @@ uploaded to the cloud.
 ``--aws-region``
   The name of the AWS region containing the EC2 VM and storage volumes defined by the
   ``--snapshot-instance`` and ``--snapshot-disk`` arguments.
+
+``--aws-await-snapshots-timeout``
+  The length of time in seconds to wait for snapshots to be created in AWS before timing
+  out (default: 3600 seconds).
 
 ``--aws-snapshot-lock-mode``
   The lock mode for the snapshot. This is only valid if ``--snapshot-instance`` and
@@ -227,6 +248,7 @@ uploaded to the cloud.
 
   * ``azure-cli``.
   * ``managed-identity``.
+  * ``default``.
 
 ``--encryption-scope``
   The name of an encryption scope defined in the Azure Blob Storage service which is to

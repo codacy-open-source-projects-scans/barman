@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -557,14 +557,6 @@ class ConsoleOutputWriter(object):
             for file_name in results["missing_files"]:
                 self.info("    %s" % file_name)
 
-        if results["delete_barman_wal"]:
-            self.info("")
-            self.info(
-                "After the recovery, please remember to remove the "
-                '"barman_wal" directory'
-            )
-            self.info("inside the PostgreSQL data directory.")
-
         if results["get_wal"]:
             self.info("")
             self.info("WARNING: 'get-wal' is in the specified 'recovery_options'.")
@@ -831,6 +823,9 @@ class ConsoleOutputWriter(object):
         if backup_method:
             output_fun(nested_row.format("Backup Method", backup_method))
 
+        encryption = backup_info.get("encryption")
+        if encryption:
+            output_fun(nested_row.format("Encryption", encryption))
         # The "show-backup" for the cloud takes the input of a backup_info,
         # not the result of  a get_backup_ext_info() call, Instead, it
         # takes a backup_info.to_dict(). So in those cases, the following
@@ -854,6 +849,9 @@ class ConsoleOutputWriter(object):
                     pretty_size(backup_size + wal_size),
                 )
             output_fun(nested_row.format("Backup Size", backup_size_output))
+        compression = backup_info.get("compression")
+        if compression and compression != "none":
+            output_fun(nested_row.format("Backup Compression", compression))
         if wal_size:
             output_fun(nested_row.format("WAL Size", pretty_size(wal_size)))
 
@@ -891,7 +889,7 @@ class ConsoleOutputWriter(object):
         # This is WAL stuff...
         wal_num = backup_info.get("wal_num")
         if wal_num:
-            output_fun(nested_row.format("WAL number", wal_num))
+            output_fun(nested_row.format("Number of WALs", wal_num))
 
         wal_compression_ratio = backup_info.get("wal_compression_ratio", 0)
         # Output WAL compression ratio for basebackup WAL files
@@ -968,7 +966,7 @@ class ConsoleOutputWriter(object):
         ):
             output_fun(header_row.format("WAL information"))
             output_fun(
-                nested_row.format("No of files", backup_info["wal_until_next_num"])
+                nested_row.format("Number of files", backup_info["wal_until_next_num"])
             )
             output_fun(
                 nested_row.format(
@@ -1380,6 +1378,25 @@ class ConsoleOutputWriter(object):
         """
         self.info(" - WAL archive check for server %s passed" % server_name)
 
+    def result_list_processes(self, process_list, server_name):
+        """
+        Output the list of subprocesses for the specified server.
+
+        If the process list is empty, outputs a message indicating that there
+        are no active subprocesses for the given server. Otherwise, it outputs
+        the PID and task of each active process.
+
+        :param list process_list: List of :class:`ProcessInfo` objects representing the
+            active subprocesses for the server.
+        :param str server_name: Name of the server.
+        """
+        if not process_list:
+            self.info("No active subprocesses found for server %s." % server_name)
+        else:
+            self.info("Active subprocesses for server %s:" % server_name)
+            for proc in process_list:
+                self.info("%s %s", proc.pid, proc.task)
+
 
 class JsonOutputWriter(ConsoleOutputWriter):
     def __init__(self, *args, **kwargs):
@@ -1493,13 +1510,6 @@ class JsonOutputWriter(ConsoleOutputWriter):
                 "WARNING! Some configuration files have not been "
                 "saved during backup, hence they have not been "
                 "restored. See 'missing_files' key."
-            )
-
-        if results["delete_barman_wal"]:
-            self.warning(
-                "After the recovery, please remember to remove the "
-                "'barman_wal' directory inside the PostgreSQL "
-                "data directory."
             )
 
         if results["get_wal"]:
@@ -1667,6 +1677,8 @@ class JsonOutputWriter(ConsoleOutputWriter):
             # Base Backup information
             output["base_backup_information"] = dict(
                 backup_method=data["mode"],
+                encryption=data["encryption"],
+                compression=data["compression"],
                 backup_size=pretty_size(data["deduplicated_size"]),
                 backup_size_bytes=data["deduplicated_size"],
                 backup_size_with_wals=pretty_size(
@@ -2088,6 +2100,23 @@ class JsonOutputWriter(ConsoleOutputWriter):
             "WAL archive check for server %s passed" % server_name
         )
 
+    def result_list_processes(self, process_list, server_name):
+        """
+        Output the list of subprocesses for the specified server in JSON format,
+        with keys ``pid`` and ``name``. If no subprocesses are provided, an empty
+        list is returned.
+
+        :param list process_list: List of :class:`ProcessInfo` objects
+            representing the active subprocesses for the server.
+        :param str server_name: Name of the server.
+        """
+        self.json_output[server_name] = []
+        if process_list:
+            for proc in process_list:
+                self.json_output[server_name].append(
+                    {"pid": proc.pid, "name": proc.task}
+                )
+
 
 class NagiosOutputWriter(ConsoleOutputWriter):
     """
@@ -2245,7 +2274,7 @@ class NagiosOutputWriter(ConsoleOutputWriter):
         Also set the exit code as 2 (CRITICAL) in case of errors
         """
 
-        global error_occurred, error_exit_code
+        global error_occurred, error_exit_code  # noqa: F824
 
         servers, issues, perf_detail = self._parse_check_results()
 

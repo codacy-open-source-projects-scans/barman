@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2018-2023
+# © Copyright EnterpriseDB UK Limited 2018-2025
 #
 # This file is part of Barman.
 #
@@ -17,6 +17,7 @@
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>.
 
 import logging
+from contextlib import closing
 
 from barman.clients.cloud_cli import (
     GeneralErrorExit,
@@ -30,6 +31,8 @@ from barman.cloud_providers import get_cloud_interface
 from barman.exceptions import WalArchiveContentError
 from barman.utils import check_positive, force_str
 from barman.xlog import check_archive_usable
+
+_logger = logging.getLogger(__name__)
 
 
 def main(args=None):
@@ -50,25 +53,26 @@ def main(args=None):
         # If test is requested, just exit after connectivity test
         elif config.test:
             raise SystemExit(0)
-        if not cloud_interface.bucket_exists:
-            # If the bucket does not exist then the check should pass
-            return
-        catalog = CloudBackupCatalog(cloud_interface, config.server_name)
-        wals = list(catalog.get_wal_paths().keys())
-        check_archive_usable(
-            wals,
-            timeline=config.timeline,
-        )
+
+        with closing(cloud_interface):
+            cloud_interface.setup_bucket()
+
+            catalog = CloudBackupCatalog(cloud_interface, config.server_name)
+            wals = list(catalog.get_wal_paths().keys())
+            check_archive_usable(
+                wals,
+                timeline=config.timeline,
+            )
     except WalArchiveContentError as err:
-        logging.error(
+        _logger.error(
             "WAL archive check failed for server %s: %s",
             config.server_name,
             force_str(err),
         )
         raise OperationErrorExit()
     except Exception as exc:
-        logging.error("Barman cloud WAL archive check exception: %s", force_str(exc))
-        logging.debug("Exception details:", exc_info=exc)
+        _logger.error("Barman cloud WAL archive check exception: %s", force_str(exc))
+        _logger.debug("Exception details:", exc_info=exc)
         raise GeneralErrorExit()
 
 

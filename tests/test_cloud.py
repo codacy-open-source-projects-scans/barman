@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # Client Utilities for Barman, Backup and Recovery Manager for PostgreSQL
 #
@@ -28,13 +28,19 @@ from functools import partial
 from io import BytesIO
 from tarfile import TarFile, TarInfo
 from tarfile import open as open_tar
+from tempfile import NamedTemporaryFile
 from unittest import TestCase
 
+import botocore
 import mock
 import pytest
 import snappy
 from azure.core.exceptions import ResourceNotFoundError, ServiceRequestError
-from azure.identity import AzureCliCredential, ManagedIdentityCredential
+from azure.identity import (
+    AzureCliCredential,
+    DefaultAzureCredential,
+    ManagedIdentityCredential,
+)
 from azure.storage.blob import PartialBatchErrorException
 from boto3.exceptions import Boto3Error
 from botocore.exceptions import ClientError, EndpointConnectionError
@@ -42,6 +48,7 @@ from google.api_core.exceptions import Conflict, GoogleAPIError
 from mock.mock import MagicMock
 
 from barman.annotations import KeepManager
+from barman.clients.cloud_cli import NetworkErrorExit, OperationErrorExit
 from barman.cloud import (
     DEFAULT_DELIMITER,
     CloudBackupCatalog,
@@ -63,7 +70,7 @@ from barman.cloud_providers.aws_s3 import S3CloudInterface
 from barman.cloud_providers.azure_blob_storage import AzureCloudInterface
 from barman.cloud_providers.google_cloud_storage import GoogleCloudInterface
 from barman.exceptions import BackupPreconditionException
-from barman.infofile import BackupInfo
+from barman.infofile import BackupInfo, WalFileInfo
 
 if sys.version_info.major > 2:
     from unittest.mock import patch as unittest_patch
@@ -398,21 +405,15 @@ class TestCloudInterface(object):
         with pytest.raises(CloudUploadingError):
             interface._handle_async_errors()
 
-    @mock.patch("barman.cloud.NamedTemporaryFile")
     @mock.patch("barman.cloud.CloudInterface._handle_async_errors")
     @mock.patch("barman.cloud.CloudInterface._ensure_async")
-    def test_async_upload_part(
-        self, ensure_async_mock, handle_async_errors_mock, temp_file_mock
-    ):
-        temp_name = "tmp_file"
-        temp_stream = temp_file_mock.return_value.__enter__.return_value
-        temp_stream.name = temp_name
-
+    def test_async_upload_part(self, ensure_async_mock, handle_async_errors_mock):
+        tmp_file = NamedTemporaryFile(
+            delete=False, prefix="barman-upload-", suffix=".part"
+        )
         interface = S3CloudInterface(url="s3://bucket/path/to/dir", encryption=None)
         interface.queue = Queue()
-        interface.async_upload_part(
-            {"UploadId": "upload_id"}, "test/key", BytesIO(b"test"), 1
-        )
+        interface.async_upload_part({"UploadId": "upload_id"}, "test/key", tmp_file, 1)
         ensure_async_mock.assert_called_once_with()
         handle_async_errors_mock.assert_called_once_with()
         assert not interface.queue.empty()
@@ -420,7 +421,7 @@ class TestCloudInterface(object):
             "job_type": "upload_part",
             "upload_metadata": {"UploadId": "upload_id"},
             "key": "test/key",
-            "body": temp_name,
+            "body": tmp_file.name,
             "part_number": 1,
         }
 
@@ -453,11 +454,66 @@ class TestCloudInterface(object):
             }
         )
 
+    @pytest.mark.parametrize(
+        "test_connectivity, bucket_exists, expected_error, exit_code, err_msg",
+        [
+            (False, None, NetworkErrorExit, 2, ""),
+            (True, None, OperationErrorExit, 1, "Bucket bucket does not exist"),
+            (True, True, None, 0, ""),
+        ],
+    )
+    @mock.patch("barman.cloud.CloudInterface")
+    def test_verify_cloud_connectivity_and_bucket_existence(
+        self,
+        mock_cloud_interface,
+        test_connectivity,
+        bucket_exists,
+        expected_error,
+        exit_code,
+        err_msg,
+        caplog,
+    ):
+        interface = S3CloudInterface(url="s3://bucket/path/to/dir")
+        interface.test_connectivity = mock.MagicMock()
+        interface.test_connectivity.return_value = test_connectivity
+        interface.bucket_exists = bucket_exists
+
+        if expected_error:
+            with pytest.raises(expected_error) as exc:
+                interface.verify_cloud_connectivity_and_bucket_existence()
+            assert exc.value.code == exit_code
+        else:
+            interface.verify_cloud_connectivity_and_bucket_existence()
+        assert err_msg in caplog.text
+        interface.test_connectivity.assert_called_once_with()
+
 
 class TestS3CloudInterface(object):
     """
     Tests which verify backend-specific behaviour of S3CloudInterface.
     """
+
+    @pytest.fixture
+    def client_error_factory(self):
+        """A factory fixture that creates botocore.exceptions.ClientError objects."""
+
+        def _make_client_error(code, message):
+            error_response = {
+                "Error": {
+                    "Code": code,  # The specific error code
+                    "Message": message,
+                },
+                "ResponseMetadata": {
+                    "RequestId": "18688D37F129A2F5",
+                    "HTTPStatusCode": 400,
+                },
+            }
+            operation_name = "DeleteObjects"
+            return botocore.exceptions.ClientError(
+                error_response=error_response, operation_name=operation_name
+            )
+
+        return _make_client_error
 
     @mock.patch("barman.cloud_providers.aws_s3.Config")
     @mock.patch("barman.cloud_providers.aws_s3.boto3")
@@ -956,6 +1012,7 @@ class TestS3CloudInterface(object):
 
         mock_keys = ["path/to/object/1", "path/to/object/2"]
 
+        # Test AccessDenied error
         s3_client.delete_objects.return_value = {
             "Errors": [
                 {
@@ -975,9 +1032,341 @@ class TestS3CloudInterface(object):
         )
 
         assert (
-            "Deletion of object path/to/object/1 failed with error code: "
+            "Bulk deletion of object path/to/object/1 failed with error code: "
             '"AccessDenied", message: "Access Denied"'
         ) in caplog.text
+
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test__delete_object_partial_failure(
+        self, boto_mock, client_error_factory, caplog
+    ):
+        """
+        Test partial failure scenarios when deleting objects from S3 using
+        `S3CloudInterface`.
+        This test verifies that the `_delete_object` method of `S3CloudInterface`
+        correctly handles and logs errors when deletion fails due to various exceptions,
+        such as AWS client errors and generic exceptions. It ensures that the
+        appropriate exceptions are raised and that error messages are logged for each
+        failed deletion attempt.
+
+        Parameters
+        ----------
+        self : object
+            The test class instance.
+        boto_mock : unittest.mock.Mock
+            Mocked boto3 session and resource.
+        client_error_factory : Callable
+            Factory function to create AWS client errors.
+        caplog : pytest.LogCaptureFixture
+            Pytest fixture to capture log output.
+
+        Raises
+        ------
+        `CloudProviderError`
+            If deletion of an object fails due to an AWS client error or a generic
+            exception.
+
+        Asserts
+        -------
+        - The `delete_object` method is called for each key.
+        - The correct calls are made to `delete_object` with expected parameters.
+        - Error messages are logged for each failed deletion attempt.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir")
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+
+        mock_keys = ["path/to/object/1", "path/to/object/2"]
+
+        # Test AccessDenied error
+        s3_client.delete_object.side_effect = client_error_factory(
+            code="AnyOtherError", message="Any other error message"
+        )
+
+        for key in mock_keys:
+            with pytest.raises(CloudProviderError):
+                cloud_interface._delete_object(key)
+
+        s3_client.delete_object.call_count == 2
+        s3_client.delete_object.assert_has_calls(
+            [
+                mock.call(Bucket="bucket", Key="path/to/object/1"),
+                mock.call(Bucket="bucket", Key="path/to/object/2"),
+            ]
+        )
+        assert (
+            "Deletion of object path/to/object/1 failed with error code: "
+            '"AnyOtherError", message: "Any other error message'
+        ) in caplog.text
+        assert (
+            "Deletion of object path/to/object/2 failed with error code: "
+            '"AnyOtherError", message: "Any other error message'
+        ) in caplog.text
+        s3_client.delete_object.reset_mock()
+        # Test AccessDenied error
+        s3_client.delete_object.side_effect = Exception
+
+        for key in mock_keys:
+            with pytest.raises(CloudProviderError):
+                cloud_interface._delete_object(key)
+
+        s3_client.delete_object.call_count == 2
+        s3_client.delete_object.assert_has_calls(
+            [
+                mock.call(Bucket="bucket", Key="path/to/object/1"),
+                mock.call(Bucket="bucket", Key="path/to/object/2"),
+            ]
+        )
+
+        assert ("Deletion of object path/to/object/1 failed with error:") in caplog.text
+        assert ("Deletion of object path/to/object/2 failed with error:") in caplog.text
+
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface._delete_object")
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_delete_objects_botocore_exceptions_ClientError(
+        self, boto_mock, mock_delete_obj, client_error_factory, caplog
+    ):
+        """
+        Test `S3CloudInterface.delete_objects` handling of `botocore.exceptions.ClientError`.
+        This test verifies that when a bulk delete operation fails with a specific
+        `ClientError` (e.g., 'MissingContentMD5'), the interface falls back to deleting
+        objects individually and logs the appropriate message. It also checks that for
+        other errors, the exception is propagated and no individual deletions are
+        attempted.
+
+        Parameters
+        ----------
+        boto_mock : unittest.mock.Mock
+            Mocked boto3 session and resource.
+        mock_delete_obj : unittest.mock.Mock
+            Mock for the individual object deletion method.
+        client_error_factory : Callable
+            Factory to generate botocore.exceptions.ClientError instances.
+        caplog : _pytest.logging.LogCaptureFixture
+            Pytest fixture to capture log output.
+
+        Raises
+        ------
+        botocore.exceptions.ClientError
+            If the error code is not 'MissingContentMD5', the exception is propagated.
+
+        Asserts
+        -------
+        - The fallback to individual deletion occurs for 'MissingContentMD5'.
+        - The appropriate log message is present.
+        - Individual deletions are called for 'MissingContentMD5' error.
+        - No individual deletions are called for other errors.
+        - The correct exception message is raised for other errors.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir", encryption=None)
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+
+        mock_keys = ["path/to/object/1", "path/to/object/2"]
+
+        s3_client.delete_objects.side_effect = client_error_factory(
+            code="MissingContentMD5",
+            message="Missing required header for this request: Content-Md5.",
+        )
+
+        cloud_interface.delete_objects(mock_keys)
+
+        assert "Bulk delete failed with 'MissingContentMD5'. Falling back to deleting "
+        "files individually." in caplog.text
+
+        mock_delete_obj.call_count == 2
+        mock_delete_obj.assert_has_calls(
+            [mock.call("path/to/object/1"), mock.call("path/to/object/2")]
+        )
+
+        mock_delete_obj.reset_mock()
+        s3_client.delete_objects.side_effect = client_error_factory(
+            code="AnyOtherError", message="Any other error message"
+        )
+
+        with pytest.raises(botocore.exceptions.ClientError) as exc:
+            cloud_interface.delete_objects(mock_keys)
+
+        assert str(exc.value) == (
+            "An error occurred (AnyOtherError) when calling the DeleteObjects "
+            "operation: Any other error message"
+        )
+
+        mock_delete_obj.assert_not_called()
+
+    @pytest.mark.parametrize("prefix", ["/", "", "/something/prefix"])
+    def test_delete_under_prefix_raise_ValueError(self, prefix, caplog):
+        """
+        Test that attempting to delete all objects under a given prefix raises a
+        `ValueError`.
+        This test verifies that the `delete_under_prefix` method of `S3CloudInterface`
+        raises a `ValueError` when called with a specific prefix, and that the exception
+        message matches the expected format.
+
+        Parameters
+        ----------
+        prefix : str
+            The prefix under which deletion is attempted.
+        caplog : pytest.LogCaptureFixture
+            Pytest fixture for capturing log messages.
+
+        Raises
+        ------
+        `ValueError`
+            If deletion under the specified prefix is not allowed.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir", encryption=None)
+
+        with pytest.raises(ValueError) as exc:
+            cloud_interface.delete_under_prefix(prefix)
+
+        assert str(exc.value) == (
+            "Deleting all objects under prefix %s is not allowed" % prefix
+        )
+
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_delete_under_prefix_with_s3_bucket_delete(self, boto_mock, caplog):
+        """
+        Test the `delete_under_prefix` method of `S3CloudInterface` for object deletion
+        under a given prefix.
+
+        This test covers two scenarios:
+        1. When deletion of an object fails with HTTP status code 400,
+           it asserts that a `CloudProviderError` is raised and the appropriate error
+           message is logged.
+        2. When all objects are deleted successfully (HTTP status code 200),
+           it asserts that no error messages are logged.
+
+        Parameters
+        ----------
+        boto_mock : unittest.mock.Mock
+            Mocked boto3 session and resource for simulating S3 interactions.
+        caplog : _pytest.logging.LogCaptureFixture
+            Pytest fixture for capturing log output.
+
+        Raises
+        ------
+        `CloudProviderError`
+            If any object deletion under the prefix fails with an error code.
+        """
+        prefix = "/prefix/"
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir", encryption=None)
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        bucket = s3_mock.Bucket.return_value
+
+        # --- Case 1: one object fails with 400 ---
+        mock_responses = [
+            {"ResponseMetadata": {"HTTPStatusCode": 200}},
+            {"ResponseMetadata": {"HTTPStatusCode": 400}},
+            {"ResponseMetadata": {"HTTPStatusCode": 200}},
+        ]
+
+        bucket.objects.filter.return_value.delete.return_value = mock_responses
+
+        with pytest.raises(CloudProviderError):
+            cloud_interface.delete_under_prefix(prefix)
+
+        assert (
+            'Deletion of objects under %s failed with error code: "400"' % prefix
+        ) in caplog.text
+
+        # --- Case 2: all objects succeed ---
+        caplog.clear()  # --- Case 1: one object fails with 400 ---
+        mock_responses = [
+            {"ResponseMetadata": {"HTTPStatusCode": 200}},
+            {"ResponseMetadata": {"HTTPStatusCode": 200}},
+            {"ResponseMetadata": {"HTTPStatusCode": 200}},
+        ]
+
+        bucket.objects.filter.return_value.delete.return_value = mock_responses
+
+        cloud_interface.delete_under_prefix(prefix)
+
+        # no error logs expected
+        assert "failed with error code" not in caplog.text
+
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface._delete_object")
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_delete_under_prefix_botocore_exceptions_ClientError(
+        self, boto_mock, mock_delete_obj, client_error_factory, caplog
+    ):
+        """
+        Test the `delete_under_prefix` method of `S3CloudInterface` for handling
+        `botocore.exceptions.ClientError`.
+
+        This test covers two scenarios:
+
+        1. When a `ClientError` with code "MissingContentMD5" is raised during object
+           deletion, the method should fallback to calling `_delete_object` for the
+           affected key.
+        2. When a `ClientError` with any other error code is raised, the exception
+           should be propagated.
+
+        Mocks:
+            - `barman.cloud_providers.aws_s3.boto3`: Mocks AWS S3 interactions.
+            - `barman.cloud_providers.aws_s3.S3CloudInterface._delete_object`: Mocks the
+              fallback deletion method.
+
+        Parameters
+        ----------
+        boto_mock : MagicMock
+            Mocked boto3 module.
+        mock_delete_obj : MagicMock
+            Mocked `_delete_object` method.
+        client_error_factory : Callable
+            Factory function to create `ClientError` exceptions.
+        caplog : pytest.LogCaptureFixture
+            Pytest fixture for capturing log output.
+
+        Asserts
+        -------
+        - `_delete_object` is called once with the correct key when "MissingContentMD5"
+          error occurs.
+        - For other error codes, the `ClientError` is raised and `_delete_object` is not
+          called.
+        """
+        # Create cloud interface
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir")
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        bucket = s3_mock.Bucket.return_value
+
+        # --- Case 1: MissingContentMD5 (fallback) ---
+        mock_obj = mock.MagicMock()
+        mock_obj.key = "some-key"
+
+        # .delete() raises ClientError first
+        delete_mock = mock.Mock()
+        delete_mock.delete.side_effect = client_error_factory(
+            code="MissingContentMD5",
+            message="Missing required header for this request: Content-Md5.",
+        )
+
+        # First call returns delete_mock, second call returns iterable
+        bucket.objects.filter.side_effect = [delete_mock, [mock_obj]]
+
+        cloud_interface.delete_under_prefix("/prefix1/")
+
+        mock_delete_obj.assert_called_once_with("some-key")
+
+        # --- Case 2: other ClientError (propagate) ---
+        caplog.clear()
+        mock_delete_obj.reset_mock()
+
+        other_delete_mock = mock.Mock()
+        other_delete_mock.delete.side_effect = client_error_factory(
+            code="AnyOtherError", message="Any other error message"
+        )
+        bucket.objects.filter.side_effect = [other_delete_mock, [mock_obj]]
+
+        with pytest.raises(botocore.exceptions.ClientError) as exc:
+            cloud_interface.delete_under_prefix("/prefix1/")
+
+        assert "AnyOtherError" in str(exc.value)
+        mock_delete_obj.assert_not_called()
 
     @pytest.mark.skipif(sys.version_info < (3, 0), reason="Requires Python 3 or higher")
     @pytest.mark.parametrize("compression", (None, "bzip2", "gzip", "snappy"))
@@ -1207,6 +1596,7 @@ class TestS3CloudInterface(object):
             {"ResponseMetadata": {"HTTPStatusCode": 500}},
             {"ResponseMetadata": {"HTTPStatusCode": 200}},
         ]
+
         bucket_mock.objects.filter.return_value.delete.return_value = mock_responses
 
         # AND an S3CloudInterface to that bucket
@@ -1491,7 +1881,9 @@ class TestAzureCloudInterface(object):
         # Bucket existence checking is carried out by checking we can successfully
         # iterate the bucket contents
         container_client = container_client_mock.from_connection_string.return_value
-        container_client.list_blobs.assert_called_once_with()
+        container_client.list_blobs.assert_called_once_with(
+            name_starts_with="path/to/blob",
+        )
         blobs_iterator = container_client.list_blobs.return_value
         blobs_iterator.next.assert_called_once_with()
         # Also test that an empty bucket passes connectivity test
@@ -1527,7 +1919,9 @@ class TestAzureCloudInterface(object):
         )
         cloud_interface.setup_bucket()
         container_client = container_client_mock.from_connection_string.return_value
-        container_client.list_blobs.assert_called_once_with()
+        container_client.list_blobs.assert_called_once_with(
+            name_starts_with="path/to/blob",
+        )
         blobs_iterator = container_client.list_blobs.return_value
         blobs_iterator.next.assert_called_once_with()
 
@@ -1546,7 +1940,9 @@ class TestAzureCloudInterface(object):
         blobs_iterator = container_client.list_blobs.return_value
         blobs_iterator.next.side_effect = ResourceNotFoundError()
         cloud_interface.setup_bucket()
-        container_client.list_blobs.assert_called_once_with()
+        container_client.list_blobs.assert_called_once_with(
+            name_starts_with="path/to/blob",
+        )
         blobs_iterator.next.assert_called_once_with()
         container_client.create_container.assert_called_once_with()
 
@@ -2293,7 +2689,7 @@ class TestGoogleCloudInterface(TestCase):
         container_client_mock.exists.assert_called_once_with()
         service_client_mock.create_bucket.assert_called_once_with(container_client_mock)
 
-    @mock.patch("barman.cloud_providers.google_cloud_storage.logging")
+    @mock.patch("barman.cloud_providers.google_cloud_storage._logger")
     @mock.patch("barman.cloud_providers.google_cloud_storage.storage.Client")
     def test_setup_bucket_create_conflict_error(self, gcs_client_mock, logging_mock):
         """
@@ -2512,7 +2908,7 @@ class TestGoogleCloudInterface(TestCase):
         mock_calls = list(map(lambda x: mock.call(x), mock_keys))
         container_client_mock.blob.assert_has_calls(mock_calls, any_order=True)
 
-    @mock.patch("barman.cloud_providers.google_cloud_storage.logging")
+    @mock.patch("barman.cloud_providers.google_cloud_storage._logger")
     @mock.patch("barman.cloud_providers.google_cloud_storage.storage.Client")
     def test_delete_objects_with_error(self, gcs_client_mock, logging_mock):
         mock_blob1 = mock.MagicMock()
@@ -2804,6 +3200,7 @@ class TestGetCloudInterface(object):
         "credential_arg,expected_credential",
         [
             ("azure-cli", AzureCliCredential),
+            ("default", DefaultAzureCredential),
             ("managed-identity", ManagedIdentityCredential),
         ],
     )
@@ -3332,6 +3729,47 @@ end_time=2022-11-09 12:05:00
             exc.value
         )
 
+    def test__get_backup_id_using_shortcut(self):
+        """
+        Verify that CloudBackupCatalog._get_backup_id_using_shortcut resolves:
+        - first/oldest to the earliest backup ID
+        - last/latest to the most recent backup ID
+        - last-failed to the most recent FAILED backup ID
+        - non-string or unknown shortcuts return None
+        """
+        dummy_cloud_interface = MagicMock()
+        catalog = CloudBackupCatalog(dummy_cloud_interface, "test-server")
+
+        # Set up a backups dictionary with three backups
+        backups = {
+            "20210723T133818": MagicMock(),
+            "20210723T154445": MagicMock(),
+            "20210723T154554": MagicMock(),
+        }
+        backups["20210723T133818"].status = BackupInfo.DONE
+        backups["20210723T154445"].status = BackupInfo.FAILED
+        backups["20210723T154554"].status = BackupInfo.DONE
+
+        # Override get_backup_list() so we simulate these available backups
+        catalog.get_backup_list = lambda: backups
+
+        # Verify the 'first' and 'oldest' shortcuts return the earliest backup
+        assert catalog._get_backup_id_using_shortcut("first") == "20210723T133818"
+        assert catalog._get_backup_id_using_shortcut("oldest") == "20210723T133818"
+
+        # Verify the 'last' and 'latest' shortcuts return the latest backup
+        assert catalog._get_backup_id_using_shortcut("last") == "20210723T154554"
+        assert catalog._get_backup_id_using_shortcut("latest") == "20210723T154554"
+
+        # Verify the 'last-failed' shortcut returns the most recent backup with status FAILED
+        assert catalog._get_backup_id_using_shortcut("last-failed") == "20210723T154445"
+
+        # Non-string input should return None
+        assert catalog._get_backup_id_using_shortcut(123) is None
+
+        # An unrecognized shortcut should return None
+        assert catalog._get_backup_id_using_shortcut("name") is None
+
     def test_get_wal_prefixes(self):
         """Verify the retrieval of common WAL prefixes."""
         # GIVEN a mock cloud interface
@@ -3343,6 +3781,54 @@ end_time=2022-11-09 12:05:00
         # THEN the get_prefixes method of the cloud interface is called with the
         # wal_prefix of the catalog
         mock_cloud_interface.get_prefixes.assert_called_once_with(catalog.wal_prefix)
+
+    @pytest.mark.parametrize(
+        ("wal_paths", "expected_result"),
+        (
+            # Backup names should resolve to the ID of the backup which has that name
+            ({}, {}),
+            # The backup ID should resolve to itself
+            (
+                {
+                    "0000000100000003000000BA": "server_name/wals/0000000100000003/0000000100000003000000BA.gz",
+                    "0000000200000003000000BA": "server_name/wals/0000000200000003/0000000200000003000000BA.gz",
+                    "0000000200000003000000FF": "server_name/wals/0000000200000003/0000000200000003000000FF.gz",
+                    "0000000300000003000001AB": "server_name/wals/0000000300000003/0000000300000003000001AB.gz",
+                    "0000000400000003000000CD": "server_name/wals/0000000400000003/0000000400000003000000CD.gz",
+                    "0000000400000003000000FF": "server_name/wals/0000000400000003/0000000400000003000000FF.gz",
+                    "0000000500000003000001DE": "server_name/wals/0000000500000003/0000000500000003000001DE.gz",
+                },
+                {
+                    "00000005": WalFileInfo(
+                        compression=None,
+                        name="0000000500000003000001DE",
+                        size=None,
+                        time=None,
+                    )
+                },
+            ),
+        ),
+    )
+    @mock.patch("barman.cloud.CloudBackupCatalog.get_wal_paths")
+    def test_get_latest_archived_wals_info(
+        self, mock_get_wal_paths, wal_paths, expected_result
+    ):
+        mock_cloud_interface = mock.Mock(path="namespace")
+        catalog = CloudBackupCatalog(mock_cloud_interface, "server_name")
+        mock_get_wal_paths.return_value = wal_paths
+
+        timelines = catalog.get_latest_archived_wals_info()
+
+        assert timelines.keys() == expected_result.keys()
+
+        if timelines:
+            assert timelines["00000005"].name == expected_result["00000005"].name
+            assert timelines["00000005"].size == expected_result["00000005"].size
+            assert timelines["00000005"].time == expected_result["00000005"].time
+            assert (
+                timelines["00000005"].compression
+                == expected_result["00000005"].compression
+            )
 
 
 class TestCloudTarUploader(object):
@@ -3872,6 +4358,7 @@ class TestCloudBackupUploaderBarman(object):
         )
         backup_id = "backup_id"
         backup_dir = "/path/to/{}/{}".format(self.server_name, backup_id)
+        backup_info_path = "/path/to/backup_info"
         expected_max_archive_size = 99999
         expected_min_chunk_size = 111
         expected_max_bandwidth = 222
@@ -3881,6 +4368,7 @@ class TestCloudBackupUploaderBarman(object):
             expected_max_archive_size,
             backup_dir,
             backup_id,
+            backup_info_path,
             min_chunk_size=expected_min_chunk_size,
             max_bandwidth=expected_max_bandwidth,
         )

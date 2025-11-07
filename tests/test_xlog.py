@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -24,7 +24,12 @@ from mock import mock
 import barman.exceptions
 from barman import xlog
 from barman.compression import CompressionManager
-from barman.exceptions import CommandException, WalArchiveContentError
+from barman.encryption import EncryptionManager
+from barman.exceptions import (
+    BadXlogSegmentName,
+    CommandException,
+    WalArchiveContentError,
+)
 from barman.infofile import WalFileInfo
 
 
@@ -348,12 +353,15 @@ class Test(object):
         config_mock = mock.Mock()
         config_mock.compression = "gzip"
         comp_manager = CompressionManager(config_mock, None)
+        encryption_manager = EncryptionManager(config_mock, None)
         compressor = mock.Mock()
 
         # Regular history file
         p = tmpdir.join("00000002.history")
         p.write('1\t2/83000168\tat restore point "myrp"\n')
-        wal_info = WalFileInfo.from_file(p.strpath, comp_manager)
+        wal_info = WalFileInfo.from_file(
+            p.strpath, comp_manager, encryption_manager=encryption_manager
+        )
         result = xlog.HistoryFileData(
             tli=2,
             parent_tli=1,
@@ -366,7 +374,9 @@ class Test(object):
         # Comments must be skipped
         p = tmpdir.join("00000003.history")
         p.write('# Comment\n1\t2/83000168\tat restore point "testcomment"\n')
-        wal_info = WalFileInfo.from_file(p.strpath, comp_manager)
+        wal_info = WalFileInfo.from_file(
+            p.strpath, comp_manager, encryption_manager=encryption_manager
+        )
         result = xlog.HistoryFileData(
             tli=3,
             parent_tli=1,
@@ -379,7 +389,9 @@ class Test(object):
         # History file with comments and empty lines
         p = tmpdir.join("00000004.history")
         p.write('# Comment\n\n1\t2/83000168\ttesting "testemptyline"\n')
-        wal_info = WalFileInfo.from_file(p.strpath, comp_manager)
+        wal_info = WalFileInfo.from_file(
+            p.strpath, comp_manager, encryption_manager=encryption_manager
+        )
         result = xlog.HistoryFileData(
             tli=4,
             parent_tli=1,
@@ -401,7 +413,9 @@ class Test(object):
             switchpoint=0x283000168,
         )
         comp_manager.get_compressor("gzip").compress(u.strpath, p.strpath)
-        wal_info = WalFileInfo.from_file(p.strpath, comp_manager)
+        wal_info = WalFileInfo.from_file(
+            p.strpath, comp_manager, encryption_manager=encryption_manager
+        )
         assert xlog.decode_history_file(wal_info, comp_manager) == [result]
 
         with pytest.raises(barman.exceptions.BadHistoryFileContents):
@@ -507,6 +521,34 @@ class Test(object):
     )
     def test_xlog_segment_mask(self, mask, size):
         assert mask == xlog.xlog_segment_mask(size)
+
+    @pytest.mark.parametrize(
+        "segment, xlog_segment_size, expected",
+        [
+            # Regular decrement
+            ("000000010000000200000002", 1 << 24, "000000010000000200000001"),
+            ("000000010000000200000001", 1 << 24, "000000010000000200000000"),
+            # At segment 0, should wrap to previous log and last segment
+            (
+                "000000010000000200000000",
+                1 << 24,
+                "0000000100000001" + "%08X" % xlog.xlog_segments_per_file(1 << 24),
+            ),
+            # Different segment sizes
+            (
+                "000000010000000200000000",
+                1 << 22,
+                "0000000100000001" + "%08X" % xlog.xlog_segments_per_file(1 << 22),
+            ),
+            ("000000010000000200000005", 1 << 22, "000000010000000200000004"),
+        ],
+    )
+    def test_previous_segment_name(self, segment, xlog_segment_size, expected):
+        assert xlog.previous_segment_name(segment, xlog_segment_size) == expected
+
+    def test_previous_segment_name_invalid_segment(self):
+        with pytest.raises(BadXlogSegmentName):
+            xlog.previous_segment_name("invalidsegment", 1 << 24)
 
 
 class TestCheckArchiveUsable(object):

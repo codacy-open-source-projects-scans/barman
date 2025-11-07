@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2023
+# © Copyright EnterpriseDB UK Limited 2013-2025
 #
 # This file is part of Barman.
 #
@@ -21,11 +21,12 @@ import collections
 import inspect
 import logging
 import os
+import re
 
 import dateutil.parser
 import dateutil.tz
 
-from barman import xlog
+from barman import output, xlog
 from barman.cloud_providers import snapshots_info_from_dict
 from barman.exceptions import BackupInfoBadInitialisation
 from barman.utils import fsync_dir
@@ -335,7 +336,16 @@ class FieldListFile(object):
                     value = None
                 elif isinstance(field, Field) and callable(field.from_str):
                     value = field.from_str(value)
-                setattr(self, name, value)
+                try:
+                    setattr(self, name, value)
+                except AttributeError:
+                    output.error(
+                        "Unsupported field '%s' found in backup metadata. This "
+                        "indicates the backup was created with a newer version of "
+                        "Barman. Please upgrade to a compatible or newer version.",
+                        name,
+                    )
+                    output.close_and_exit()
 
     def items(self):
         """
@@ -372,10 +382,16 @@ class WalFileInfo(FieldListFile):
         "time", load=float, doc="WAL file modification time (seconds since epoch)"
     )
     compression = Field("compression", doc="compression type")
+    encryption = Field("encryption", doc="encryption type")
 
     @classmethod
     def from_file(
-        cls, filename, compression_manager=None, unidentified_compression=None, **kwargs
+        cls,
+        filename,
+        compression_manager=None,
+        unidentified_compression=None,
+        encryption_manager=None,
+        **kwargs,
     ):
         """
         Factory method to generate a WalFileInfo from a WAL file.
@@ -387,6 +403,8 @@ class WalFileInfo(FieldListFile):
         :param str filename: the file to inspect
         :param Compressionmanager compression_manager: a compression manager
             which will be used to identify the compression
+        :param EncryptionManager encryption_manager: an encryption manager which
+            will be used to identify the encryption
         :param str unidentified_compression: the compression to set if
             the current schema is not identifiable
         """
@@ -394,11 +412,17 @@ class WalFileInfo(FieldListFile):
         kwargs.setdefault("name", os.path.basename(filename))
         kwargs.setdefault("size", stat.st_size)
         kwargs.setdefault("time", stat.st_mtime)
+        if "encryption" not in kwargs:
+            kwargs["encryption"] = encryption_manager.identify_encryption(filename)
         if "compression" not in kwargs:
-            kwargs["compression"] = (
-                compression_manager.identify_compression(filename)
-                or unidentified_compression
-            )
+            # If the file is encrypted we are not able to identify any compression
+            if kwargs["encryption"] is not None:
+                kwargs["compression"] = None
+            else:
+                kwargs["compression"] = (
+                    compression_manager.identify_compression(filename)
+                    or unidentified_compression
+                )
         obj = cls(**kwargs)
         obj.filename = "%s.meta" % filename
         obj.orig_filename = filename
@@ -408,7 +432,13 @@ class WalFileInfo(FieldListFile):
         """
         Format the content of this object as a xlogdb line.
         """
-        return "%s\t%s\t%s\t%s\n" % (self.name, self.size, self.time, self.compression)
+        return "%s\t%s\t%s\t%s\t%s\n" % (
+            self.name,
+            self.size,
+            self.time,
+            self.compression,
+            self.encryption,
+        )
 
     @classmethod
     def from_xlogdb_line(cls, line):
@@ -418,21 +448,31 @@ class WalFileInfo(FieldListFile):
         :param str line: a line in the wal database to parse
         :rtype: WalFileInfo
         """
-        try:
-            name, size, time, compression = line.split()
-        except ValueError:
-            # Old format compatibility (no compression)
-            compression = None
-            try:
-                name, size, time = line.split()
-            except ValueError:
-                raise ValueError("cannot parse line: %r" % (line,))
+        parts = line.split()
+        # Checks length to keep compatibility with old xlog files where
+        # compression and/or encryption did not exist yet
+        if len(parts) == 3:
+            name, size, time, compression, encryption = parts + [None, None]
+        elif len(parts) == 4:
+            name, size, time, compression, encryption = parts + [None]
+        elif len(parts) == 5:
+            name, size, time, compression, encryption = parts
+        else:
+            raise ValueError("cannot parse line: %r" % (line,))
         # The to_xlogdb_line method writes None values as literal 'None'
         if compression == "None":
             compression = None
+        if encryption == "None":
+            encryption = None
         size = int(size)
         time = float(time)
-        return cls(name=name, size=size, time=time, compression=compression)
+        return cls(
+            name=name,
+            size=size,
+            time=time,
+            compression=compression,
+            encryption=encryption,
+        )
 
     def to_json(self):
         """
@@ -484,6 +524,14 @@ class BackupInfo(FieldListFile):
         NONE,
     )
 
+    # Backup types according to `backup_method``
+    FULL = "full"
+    INCREMENTAL = "incremental"
+    RSYNC = "rsync"
+    SNAPSHOT = "snapshot"
+    NOT_INCREMENTAL = (FULL, RSYNC, SNAPSHOT)
+    BACKUP_TYPE_ALL = (FULL, INCREMENTAL, RSYNC, SNAPSHOT)
+
     version = Field("version", load=int)
     pgdata = Field("pgdata")
     # Parse the tablespaces as a literal Python list of namedtuple
@@ -533,7 +581,18 @@ class BackupInfo(FieldListFile):
 
     cluster_size = Field("cluster_size", load=int)
 
+    encryption = Field("encryption")
+
     __slots__ = "backup_id", "backup_version"
+    #: "backup_version": Indicates the internal backup directory layout version.
+    #:
+    #: * ``1`` – "Legacy" layout with ``pgdata``.
+    #: * ``2`` – New layout (introduced in commit f4729f3...), where ``pgdata`` was
+    #:           renamed to ``data``. Tablespaces are stored alongside ``data`` and
+    #:           copied via dedicated rsync commands.
+    #:
+    #: Barman detects the "backup_version" based on directory structure:
+    #: ``pgdata`` -> 1, ``data`` -> 2 (default).
 
     _hide_if_null = ("backup_name", "snapshots_info")
 
@@ -836,14 +895,28 @@ class LocalBackupInfo(BackupInfo):
                 e,
             )
 
-    def get_list_of_files(self, target):
+    def get_directory_entries(self, target, empty_dirs=False):
         """
-        Get the list of files for the current backup
+        Get the list of files and optionally empty directories for the current backup.
+
+        :param str target: The type of entry to target. One among:
+
+            * ``data``: all files in the base backup directory.
+            * ``wal``: all WAL files until the next backup.
+            * ``full``: same as ``data`` plus ``wal``.
+            * ``standalone``: same as ``data`` plus the WAL files required for the
+                consistency of this backup.
+
+        :param bool empty_dirs: Whether to include empty directories in the list.
+            Defaults to ``False``.
+        :yield str: The path to a file or an empty directory.
         """
         # Walk down the base backup directory
         if target in ("data", "standalone", "full"):
-            for root, _, files in os.walk(self.get_basebackup_directory()):
+            for root, dirs, files in os.walk(self.get_basebackup_directory()):
                 files.sort()
+                if empty_dirs and len(dirs + files) == 0:
+                    yield root
                 for f in files:
                     yield os.path.join(root, f)
         if target in "standalone":
@@ -858,19 +931,34 @@ class LocalBackupInfo(BackupInfo):
 
     def detect_backup_id(self):
         """
-        Detect the backup ID from the name of the parent dir of the info file
+        Detect the backup ID from the file name or parent directory name.
+
+        .. note::
+            The ``backup.info`` file was relocated and renamed in version 3.13.2 to
+            also contain the backup id as a prefix. In previous versions, the parent
+            directory of the file was named with the backup id. This method handles
+            both cases.
         """
         if self.filename:
+            match = re.match(r"^(.+?)-backup\.info$", os.path.basename(self.filename))
+            if match:
+                return match.group(1)
             return os.path.basename(os.path.dirname(self.filename))
-        else:
-            return None
+
+    def get_base_directory(self):
+        """
+        Retrieve the base directory for this backup
+
+        :return str: the base directory for this backup
+        """
+        return self.config.basebackups_directory
 
     def get_basebackup_directory(self):
         """
         Get the default filename for the backup.info file based on
         backup ID and server directory for base backups
         """
-        return os.path.join(self.config.basebackups_directory, self.backup_id)
+        return os.path.join(self.get_base_directory(), self.backup_id)
 
     def get_data_directory(self, tablespace_oid=None):
         """
@@ -914,14 +1002,35 @@ class LocalBackupInfo(BackupInfo):
         # Return the built path
         return os.path.join(*path)
 
-    def get_filename(self):
+    def get_filename(self, write=False):
         """
-        Get the default filename for the backup.info file based on
-        backup ID and server directory for base backups
+        Get the default file path for the backup.info file.
+
+        :param bool write: if the file is to be written or not.
+
+        .. note::
+            The ``backup.info`` file was relocated and renamed in version 3.13.2 to
+            also contain the backup id as a prefix. In previous versions, it lived
+            inside the backup directory alongside the data directory. This method
+            handles both paths.
+
+            When writing, always write to the new path. When reading, it could be that
+            a user just migrated to the new version, so we also handle reading from the
+            old path.
         """
-        return os.path.join(self.get_basebackup_directory(), "backup.info")
+        path = os.path.join(self.server.meta_directory, f"{self.backup_id}-backup.info")
+        old_path = os.path.join(self.get_basebackup_directory(), "backup.info")
+        if write or os.path.exists(path) or not os.path.exists(old_path):
+            return path
+        return old_path
 
     def save(self, filename=None, file_object=None):
+        # Update the filename before saving to ensure we're using the correct value
+        # It could be that a user just migrated to version 3.13.2, which relocated the
+        # backup.info path. In this case, the file was read from the old path but has
+        # to be written to the new path
+        if not filename:
+            self.filename = self.get_filename(write=True)
         if not file_object:
             # Make sure the containing directory exists
             filename = filename or self.filename
@@ -1056,28 +1165,14 @@ class LocalBackupInfo(BackupInfo):
                 return False
         return True
 
-    def is_full_and_eligible_for_incremental(self):
+    @property
+    def is_full(self):
         """
-        Check if this is a full backup taken with `postgres` method and which is
-        eligible to be a parent for an incremental backup.
+        Check if this is a full backup.
 
-        .. note::
-            Only consider backups which are eligible for Postgres core
-            incremental backups:
-
-            * backup_method = ``postgres``
-            * summarize_wal = ``on``
-            * is_incremental = ``False``
-
-        :return bool: True if it's a full backup or False if not.
+        :return bool: ``True`` if it's a full backup or ``False`` if not.
         """
-        if (
-            self.mode == "postgres"
-            and self.summarize_wal == "on"
-            and not self.is_incremental
-        ):
-            return True
-        return False
+        return self.backup_type not in ("snapshot", "incremental")
 
     @property
     def is_orphan(self):
@@ -1088,48 +1183,119 @@ class LocalBackupInfo(BackupInfo):
         a non-empty backup.info file. This may indicate an incomplete delete operation.
 
         :return bool: ``True`` if the backup is an orphan, ``False`` otherwise.
+
+        .. note::
+            The ``backup.info`` file was relocated and renamed in version 3.13.2 to
+            also contain the backup id as a prefix. In previous versions, the parent
+            directory of the file was named with the backup id. This method handles
+            both cases.
         """
+        if self.status == BackupInfo.EMPTY:
+            return False
         backup_dir = self.get_basebackup_directory()
-        backup_info_path = os.path.join(backup_dir, "backup.info")
-        if os.path.exists(backup_dir) and os.path.exists(backup_info_path):
-            if len(os.listdir(backup_dir)) == 1 and self.status != BackupInfo.EMPTY:
+        # In the >= 3.13.2 structure, it is considered orphan if the backup.info exists
+        # in the server meta directory while no directory related to the backup exists
+        backup_info_path = self.get_filename()
+        if os.path.exists(backup_info_path) and not os.path.exists(backup_dir):
+            return True
+        # In the < 3.13.2 structure, the backup.info lived inside the backup directory.
+        # In this case, it is considered orphan if the backup.info exists alone in there
+        old_backup_info_path = os.path.join(backup_dir, "backup.info")
+        if os.path.exists(backup_dir) and os.path.exists(old_backup_info_path):
+            if len(os.listdir(backup_dir)) == 1:
                 return True
         return False
 
 
-class SyntheticBackupInfo(LocalBackupInfo):
+class VolatileBackupInfo(LocalBackupInfo):
     def __init__(
         self, server, base_directory, backup_id=None, info_file=None, **kwargs
     ):
         """
-        Stores meta information about a single synthetic backup.
+        A class to hold temporary, in-memory updates on top of a
+        :class:`LocalBackupInfo` object.
 
-        .. note::
-            A synthetic backup is a base backup which was artificially created
-            through ``pg_combinebackup``. A synthetic backup is not part of
-            the Barman backup catalog, and only exists so we are able to
-            recover a backup created by ``pg_combinebackup`` utility, as
-            almost all functions and methods require a backup info object.
+        This class allows modification of certain fields of a :class:`LocalBackupInfo`
+        object without affecting the actual backup file on disk. It is designed to
+        support methods like :meth:`RecoveryExecutor._decrypt_backup`, where custom,
+        situational updates to backup information are necessary for processing, such as
+        custom tablespace mappings during backup decompression or combination.
 
-        The only difference from this class to its parent :class:`LocalBackupInfo`
-        is that it accepts a custom base directory for the backup as synthetic
-        backups are expected to live on directories other than the default
-        ``<server_name>/base`` path.
+        The :class:`VolatileBackupInfo` does not persist changes to the disk, ensuring
+        that only in-memory instances are updated, while the original
+        :class:`BackupInfo` remains unaltered.
 
-        :param barman.server.Server server: the server that owns the
-            synthetic backup
-        :param str base_directory: the root directory where this synthetic
-            backup resides, essentially an override to the
-            ``server.config.basebackups_directory`` configuration.
-        :param str|None backup_id: the backup id of this backup
-        :param None|str|TextIO info_file: path or file descriptor of an existing
-            synthetic ``backup.info`` file
+        :param barman.server.Server server: The server of the
+            :class:`LocalBackupInfo`.
+        :param str base_directory: The directory where this backup is stored,
+            essentially an override to the
+            :attr:`barman.config.ServerConfig.basebackups_directory` configuration
+            option.
+        :param str|None backup_id: The backup id of the backup.
+        :param None|str|TextIO info_file: The path to an existing ``backup.info`` file,
+            or a file-like object from which to read the backup information.
         """
         self.base_directory = base_directory
-        super(SyntheticBackupInfo, self).__init__(
-            server, info_file, backup_id, **kwargs
-        )
+        self.parent_instance = None
+        super(VolatileBackupInfo, self).__init__(server, info_file, backup_id, **kwargs)
+
+    def get_base_directory(self):
+        """
+        Retrieve the base directory for this backup.
+
+        :return str: The base directory for this backup.
+        """
+        return self.base_directory
 
     def get_basebackup_directory(self):
-        """Get the backup directory based on its base directory"""
+        """
+        Retrieve the full path to the base backup directory for this backup.
+
+        This method constructs the path to the directory where the backup is stored
+        based on the provided :attr:`base_directory` and :attr:`backup_id`. It is
+        particularly useful for scenarios where the backup directory is customized or
+        overridden.
+
+        :return str: The full path to the base backup directory.
+        """
         return os.path.join(self.base_directory, self.backup_id)
+
+    def walk_to_root(self, return_self=True):
+        """
+        Walk through all the parent backups of the current backup.
+
+        .. note::
+            This method is similar to the one in :class:`LocalBackupInfo`, except that
+            it traverses the tree based on the in-memory :attr:`parent_instance`
+            attribute.
+
+        :param bool return_self: Whether to return the current backup.
+            Default to ``True``.
+        :yield: a generator of :class:`LocalBackupInfo` objects for each parent backup.
+        """
+        if return_self:
+            yield self
+        backup_info = self.parent_instance
+        while backup_info:
+            yield backup_info
+            backup_info = backup_info.parent_instance
+
+    def save(self, filename=None, file_object=None):
+        """
+        Serialize the object to the specified file object
+
+        .. note::
+            This method overrides the :meth:`save` method of :class:`LocalBackupInfo` to
+            prevent saving to a file. It raises a :exec:`ValueError` if no file-like object
+            is provided, as this class is intended for in-memory operations only.
+            However, we still maintain the same interface to allow :class:`LocalBackupInfo`
+            objects to be used interchangeably in some contexts.
+
+        :param str filename: path of the file to write
+        :param file file_object: a file like object to write in
+        :param str filename: the file to write
+        :raises: ValueError
+        """
+        if not file_object:
+            raise ValueError("VolatileBackupInfo does not support saving to a file")
+        super(LocalBackupInfo, self).save(filename=filename, file_object=file_object)

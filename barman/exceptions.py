@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2023
+# © Copyright EnterpriseDB UK Limited 2011-2025
 #
 # This file is part of Barman.
 #
@@ -206,9 +206,21 @@ class CompressionIncompatibility(CompressionException):
     """
 
 
+class UnsupportedCompressionFormat(CompressionException):
+    """
+    Exception for unsupported compression format
+    """
+
+
 class FileNotFoundException(CompressionException):
     """
     Exception for file not found in archive
+    """
+
+
+class CommandNotFoundException(CommandException):
+    """
+    Exception for command not found
     """
 
 
@@ -445,4 +457,10 @@ class InvalidRetentionPolicy(BarmanException):
 class BackupManifestException(BarmanException):
     """
     Exception raised when there is a problem with the backup manifest.
+    """
+
+
+class EncryptionCommandException(CommandFailedException):
+    """
+    Exception representing a failed encryption command.
     """
