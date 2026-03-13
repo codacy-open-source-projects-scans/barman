@@ -43,6 +43,7 @@ from barman.exceptions import (
     PostgresConnectionError,
     UnrecoverableHookScriptError,
 )
+from barman.infofile import BackupInfo
 from barman.postgres import PostgreSQLConnection
 from barman.utils import (
     check_aws_expiration_date_format,
@@ -208,10 +209,24 @@ def main(args=None):
                         "backup in '%s' has status '%s' (status should be: DONE)"
                         % (os.getenv("BARMAN_BACKUP_DIR"), os.getenv("BARMAN_STATUS"))
                     )
+                if "BARMAN_BACKUP_INFO_PATH" not in os.environ:
+                    raise BarmanException(
+                        "BARMAN_BACKUP_INFO_PATH environment variable not set"
+                    )
+                # Check if the backup being uploaded is compressed
+                backup_id = os.getenv("BARMAN_BACKUP_ID")
+                backup_info_path = os.getenv("BARMAN_BACKUP_INFO_PATH")
+                if backup_info_path:
+                    backup_info = BackupInfo(backup_id=backup_id)
+                    backup_info.load(backup_info_path)
+                    if backup_info.compression:
+                        raise BarmanException(
+                            "Compressed backups are not supported when running as a hook script"
+                        )
                 uploader = CloudBackupUploaderBarman(
                     backup_dir=os.getenv("BARMAN_BACKUP_DIR"),
-                    backup_id=os.getenv("BARMAN_BACKUP_ID"),
-                    backup_info_path=os.getenv("BARMAN_BACKUP_INFO_PATH"),
+                    backup_id=backup_id,
+                    backup_info_path=backup_info_path,
                     **uploader_kwargs,
                 )
                 uploader.backup()
@@ -306,6 +321,13 @@ def parse_arguments(args=None):
         help="snappy-compress the backup while uploading to the cloud ",
         action="store_const",
         const="snappy",
+        dest="compression",
+    )
+    compression.add_argument(
+        "--lz4",
+        help="lz4-compress the backup while uploading to the cloud",
+        action="store_const",
+        const="lz4",
         dest="compression",
     )
     parser.add_argument(

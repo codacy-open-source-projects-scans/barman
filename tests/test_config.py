@@ -37,6 +37,7 @@ from barman.config import (
     ModelConfig,
     RecoveryOptions,
     ServerConfig,
+    parse_aws_encryption,
     parse_backup_compression,
     parse_backup_compression_format,
     parse_backup_compression_location,
@@ -354,6 +355,8 @@ class TestConfig(object):
                 "backup_compression_workers": None,
                 "compression": "gzip",
                 "compression_level": "medium",
+                "cloud_staging_directory": "/tmp/barman/cloud-staging",
+                "cloud_staging_max_size": 30 * 1024 * 1024 * 1024,  # 30 GiB
                 "last_backup_maximum_age": timedelta(1),
                 "last_backup_minimum_size": 1048576,
                 "last_wal_maximum_age": timedelta(hours=1),
@@ -372,6 +375,7 @@ class TestConfig(object):
                 "max_incoming_wals_queue": None,
                 "primary_conninfo": None,
                 "primary_checkpoint_timeout": 0,
+                "warehousepg_dbid": None,
             }
         )
         assert main.__dict__ == expected
@@ -392,6 +396,8 @@ class TestConfig(object):
                 "backup_compression_location": None,
                 "backup_compression_workers": None,
                 "cluster": "web",
+                "cloud_staging_directory": "/tmp/barman/cloud-staging",
+                "cloud_staging_max_size": 30 * 1024 * 1024 * 1024,  # 30 GiB
                 "compression": None,
                 "compression_level": "medium",
                 "conninfo": "host=web01 user=postgres port=5432",
@@ -416,6 +422,7 @@ class TestConfig(object):
                 "max_incoming_wals_queue": None,
                 "primary_conninfo": None,
                 "primary_checkpoint_timeout": 0,
+                "warehousepg_dbid": None,
             }
         )
         assert web.__dict__ == expected
@@ -771,6 +778,27 @@ class TestConfig(object):
             with pytest.raises(ValueError):
                 parse_backup_compression(format)
 
+    @pytest.mark.parametrize(
+        ("encryption", "is_allowed"),
+        (
+            ("AES256", True),
+            ("aws:kms", True),
+            (None, True),
+            ("invalid", False),
+            ("aes256", False),  # Case-sensitive
+            ("AWS:KMS", False),  # Case-sensitive
+        ),
+    )
+    def test_parse_aws_encryption(self, encryption, is_allowed):
+        """
+        Test allowed and disallowed aws_encryption values
+        """
+        if is_allowed:
+            assert parse_aws_encryption(encryption) == encryption
+        else:
+            with pytest.raises(ValueError):
+                parse_aws_encryption(encryption)
+
     def test_global_config_to_json(self):
         """Check :meth:`Config.global_config_to_json` returns expected results.
 
@@ -837,16 +865,14 @@ class TestConfig(object):
 
         Ensure ``False`` is returned if there is no ``model`` option configured.
         """
-        fp = StringIO(
-            """
+        fp = StringIO("""
             [barman]
             barman_home = /some/barman/home
             barman_user = barman
             log_file = %(barman_home)s/log/barman.log
 
             [SOME_MODEL]
-        """
-        )
+        """)
         c = Config(fp)
         assert c._is_model("SOME_MODEL") is False
 
@@ -855,8 +881,7 @@ class TestConfig(object):
 
         Ensure ``False`` is returned if there ``model = false`` is found.
         """
-        fp = StringIO(
-            """
+        fp = StringIO("""
             [barman]
             barman_home = /some/barman/home
             barman_user = barman
@@ -864,8 +889,7 @@ class TestConfig(object):
 
             [SOME_MODEL]
             model = false
-        """
-        )
+        """)
         c = Config(fp)
         assert c._is_model("SOME_MODEL") is False
 
@@ -874,8 +898,7 @@ class TestConfig(object):
 
         Ensure ``True`` is returned if there ``model = true`` is found.
         """
-        fp = StringIO(
-            """
+        fp = StringIO("""
             [barman]
             barman_home = /some/barman/home
             barman_user = barman
@@ -883,8 +906,7 @@ class TestConfig(object):
 
             [SOME_MODEL]
             model = true
-        """
-        )
+        """)
         c = Config(fp)
         assert c._is_model("SOME_MODEL") is True
 
@@ -894,8 +916,7 @@ class TestConfig(object):
 
         Ensure an exception is face if the parser function faces an exception.
         """
-        fp = StringIO(
-            """
+        fp = StringIO("""
             [barman]
             barman_home = /some/barman/home
             barman_user = barman
@@ -903,8 +924,7 @@ class TestConfig(object):
 
             [SOME_MODEL]
             model = true
-        """
-        )
+        """)
         c = Config(fp)
         mock_parse_boolean.side_effect = ValueError("SOME_ERROR")
 
@@ -1013,6 +1033,47 @@ class TestConfig(object):
             mock_server.apply_model.assert_called_once_with(mock_model)
             mock_server.update_msg_list_and_disable_server.assert_not_called()
             mock.assert_called_once_with(mock_server._active_model_file, "r")
+
+    @pytest.mark.parametrize(
+        # This is just example. In practice, all *_directory are checked
+        "wals_directory, basebackups_directory, should_fail",
+        [
+            ("/local/path", "/local/path", True),  # Same local path fails
+            (
+                "/local/path",
+                "/another/local/path",
+                False,
+            ),  # Different local paths are ok
+            ("s3://cloud-path", "/local/path", False),  # Cloud and local paths are ok
+            ("s3://cloud-path", "s3://cloud-path", False),  # Same cloud path is ok
+        ],
+    )
+    def test_check_conflicting_paths(
+        self, wals_directory, basebackups_directory, should_fail
+    ):
+        """
+        Test that conflicting paths are correctly detected and reported.
+        """
+        c = testing_helpers.build_config_from_dicts(
+            main_conf={
+                "basebackups_directory": basebackups_directory,
+                "wals_directory": wals_directory,
+            }
+        )
+
+        c._check_conflicting_paths()
+
+        if should_fail:
+            # NOTE: there's currently a bug in _check_conflicting_paths that causes the
+            # same error to be added twice in msg_list, so we check for both occurrences
+            # for now. This will be fixed in the future
+            assert c._servers["main"].msg_list == [
+                "Conflicting path: wals_directory=%s conflicts with 'basebackups_directory' "
+                "for server 'main'" % wals_directory,
+                "Conflicting path: wals_directory=%s conflicts with 'basebackups_directory' "
+                "for server 'main'" % wals_directory,
+            ]
+            assert c._servers["main"].disabled is True
 
 
 class TestServerConfig(object):
@@ -1371,12 +1432,15 @@ class TestModelConfig:
             "archiver_batch_size": None,
             "autogenerate_manifest": None,
             "aws_await_snapshots_timeout": None,
+            "aws_encryption": None,
+            "aws_read_timeout": None,
             "aws_snapshot_lock_mode": None,
             "aws_snapshot_lock_duration": None,
             "aws_snapshot_lock_cool_off_period": None,
             "aws_snapshot_lock_expiration_date": None,
             "aws_profile": None,
             "aws_region": None,
+            "aws_sse_kms_key_id": None,
             "azure_credential": None,
             "azure_resource_group": None,
             "azure_subscription_id": None,
@@ -1391,6 +1455,11 @@ class TestModelConfig:
             "basebackup_retry_sleep": None,
             "basebackup_retry_times": None,
             "check_timeout": None,
+            "cloud_delete_batch_size": None,
+            "cloud_staging_directory": None,
+            "cloud_staging_max_size": None,
+            "cloud_upload_max_archive_size": None,
+            "cloud_upload_min_chunk_size": None,
             "cluster": "SOME_CLUSTER",
             "compression": None,
             "compression_level": None,
@@ -1448,6 +1517,7 @@ class TestModelConfig:
             "wal_conninfo": None,
             "wal_retention_policy": None,
             "wal_streaming_conninfo": None,
+            "warehousepg_dbid": None,
         }
         assert model_config.to_json() == expected
 
@@ -1472,6 +1542,8 @@ class TestModelConfig:
             "archiver_batch_size": {"source": "SOME_SOURCE", "value": None},
             "autogenerate_manifest": {"source": "SOME_SOURCE", "value": None},
             "aws_await_snapshots_timeout": {"source": "SOME_SOURCE", "value": None},
+            "aws_encryption": {"source": "SOME_SOURCE", "value": None},
+            "aws_read_timeout": {"source": "SOME_SOURCE", "value": None},
             "aws_snapshot_lock_mode": {"source": "SOME_SOURCE", "value": None},
             "aws_snapshot_lock_duration": {"source": "SOME_SOURCE", "value": None},
             "aws_snapshot_lock_cool_off_period": {
@@ -1484,6 +1556,7 @@ class TestModelConfig:
             },
             "aws_profile": {"source": "SOME_SOURCE", "value": None},
             "aws_region": {"source": "SOME_SOURCE", "value": None},
+            "aws_sse_kms_key_id": {"source": "SOME_SOURCE", "value": None},
             "azure_credential": {"source": "SOME_SOURCE", "value": None},
             "azure_resource_group": {"source": "SOME_SOURCE", "value": None},
             "azure_subscription_id": {"source": "SOME_SOURCE", "value": None},
@@ -1498,6 +1571,11 @@ class TestModelConfig:
             "basebackup_retry_sleep": {"source": "SOME_SOURCE", "value": None},
             "basebackup_retry_times": {"source": "SOME_SOURCE", "value": None},
             "check_timeout": {"source": "SOME_SOURCE", "value": None},
+            "cloud_delete_batch_size": {"source": "SOME_SOURCE", "value": None},
+            "cloud_staging_directory": {"source": "SOME_SOURCE", "value": None},
+            "cloud_staging_max_size": {"source": "SOME_SOURCE", "value": None},
+            "cloud_upload_max_archive_size": {"source": "SOME_SOURCE", "value": None},
+            "cloud_upload_min_chunk_size": {"source": "SOME_SOURCE", "value": None},
             "cluster": {"source": "SOME_SOURCE", "value": "SOME_CLUSTER"},
             "compression": {"source": "SOME_SOURCE", "value": None},
             "compression_level": {"source": "SOME_SOURCE", "value": None},
@@ -1564,6 +1642,7 @@ class TestModelConfig:
             "wal_conninfo": {"source": "SOME_SOURCE", "value": None},
             "wal_retention_policy": {"source": "SOME_SOURCE", "value": None},
             "wal_streaming_conninfo": {"source": "SOME_SOURCE", "value": None},
+            "warehousepg_dbid": {"source": "SOME_SOURCE", "value": None},
         }
         assert model_config.to_json(True) == expected
 

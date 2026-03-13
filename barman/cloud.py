@@ -30,7 +30,6 @@ import signal
 import tarfile
 import time
 from abc import ABCMeta, abstractmethod, abstractproperty
-from functools import partial
 from io import BytesIO, RawIOBase
 from tempfile import NamedTemporaryFile
 
@@ -179,15 +178,14 @@ class TarFileIgnoringTruncate(tarfile.TarFile):
 
 
 class CloudTarUploader(object):
-    # This is the method we use to create new buffers
-    # We use named temporary files, so we can pass them by name to
-    # other processes
-    _buffer = partial(
-        NamedTemporaryFile, delete=False, prefix="barman-upload-", suffix=".part"
-    )
-
     def __init__(
-        self, cloud_interface, key, chunk_size, compression=None, max_bandwidth=None
+        self,
+        cloud_interface,
+        key,
+        chunk_size,
+        compression=None,
+        max_bandwidth=None,
+        staging_dir=None,
     ):
         """
         A tar archive that resides on cloud storage
@@ -198,6 +196,8 @@ class CloudTarUploader(object):
         :param int chunk_size: the upload chunk size
         :param int max_bandwidth: the maximum amount of data per second that
           should be uploaded by this tar uploader
+        :param str|None staging_dir: the temporary directory where part files are
+          created before uploaded
         """
         self.cloud_interface = cloud_interface
         self.key = key
@@ -207,6 +207,7 @@ class CloudTarUploader(object):
         self.buffer = None
         self.counter = 0
         self.compressor = None
+        self.staging_dir = staging_dir
         # Some supported compressions (e.g. snappy) require CloudTarUploader to apply
         # compression manually rather than relying on the tar file.
         self.compressor = cloud_compression.get_compressor(compression)
@@ -223,6 +224,22 @@ class CloudTarUploader(object):
         self.stats = None
         self.time_of_last_upload = None
         self.size_of_last_upload = None
+
+    # This is the method we use to create new buffers
+    # We use named temporary files, so we can pass them by name to
+    # other processes
+    # 20251223 pvbiesen: partial broke in 3.14, this could fix it with staticmethod :
+    # _buffer = staticmethod(partial(
+    #    NamedTemporaryFile, delete=False, prefix="barman-upload-", suffix=".part"
+    # ))
+    # 20251223 pvbiesen: or, just for readability :
+    def _buffer(self):
+        return NamedTemporaryFile(
+            delete=False,
+            prefix="barman-upload-",
+            suffix=".part",
+            dir=self.staging_dir,
+        )
 
     def write(self, buf):
         if self.buffer and self.buffer.tell() > self.chunk_size:
@@ -294,6 +311,14 @@ class CloudTarUploader(object):
     def close(self):
         if self.tar:
             self.tar.close()
+        # Flush any remaining compressed data (e.g., lz4 frame end marker)
+        if self.compressor:
+            final_bytes = self.compressor.flush()
+            if final_bytes:
+                if not self.buffer:
+                    self.buffer = self._buffer()
+                self.buffer.write(final_bytes)
+                self.size += len(final_bytes)
         self.flush()
         self.cloud_interface.async_complete_multipart_upload(
             upload_metadata=self.upload_metadata,
@@ -312,6 +337,7 @@ class CloudUploadController(object):
         compression,
         min_chunk_size=None,
         max_bandwidth=None,
+        staging_dir=None,
     ):
         """
         Create a new controller that upload the backup in cloud storage
@@ -323,6 +349,8 @@ class CloudUploadController(object):
         :param int|None min_chunk_size: the minimum size of a single upload part
         :param int|None max_bandwidth: the maximum amount of data per second that
           should be uploaded during the backup
+        :param str|None staging_dir: the temporary directory where part files are
+            created before uploaded
         """
 
         self.cloud_interface = cloud_interface
@@ -352,6 +380,7 @@ class CloudUploadController(object):
         self.chunk_size = max(possible_min_chunk_sizes)
         self.compression = compression
         self.max_bandwidth = max_bandwidth
+        self.staging_dir = staging_dir
         self.tar_list = {}
 
         self.upload_stats = {}
@@ -362,6 +391,9 @@ class CloudUploadController(object):
 
         self.copy_end_time = None
         """Copy end time"""
+
+        self.size = 0
+        """Total size of the backup"""
 
     def _build_dest_name(self, name, count=0):
         """
@@ -380,6 +412,8 @@ class CloudUploadController(object):
             components.append(".bz2")
         elif self.compression == "snappy":
             components.append(".snappy")
+        elif self.compression == "lz4":
+            components.append(".lz4")
         return "".join(components)
 
     def _get_tar(self, name):
@@ -397,6 +431,7 @@ class CloudUploadController(object):
                     chunk_size=self.chunk_size,
                     compression=self.compression,
                     max_bandwidth=self.max_bandwidth,
+                    staging_dir=self.staging_dir,
                 )
             ]
         # If the current uploading file size is over DEFAULT_MAX_TAR_SIZE
@@ -494,6 +529,11 @@ class CloudUploadController(object):
                 # have been already closed
                 self.tar_list[name][-1].close()
                 self.upload_stats[name] = [tar.stats for tar in self.tar_list[name]]
+                # Calculate the total size of the backup by summing
+                # the size of all uploaded tarballs
+                for tar in self.tar_list[name]:
+                    self.size += tar.size
+
             self.tar_list[name] = None
 
         # Store the end time
@@ -1138,6 +1178,15 @@ class CloudInterface(with_metaclass(ABCMeta)):
         """
 
     @abstractmethod
+    def check_object_existence(self, key):
+        """
+        Check whether an object with the specified key exists in the bucket.
+
+        :param str key: The object key
+        :return: ``True`` if the object exists, ``False`` otherwise
+        """
+
+    @abstractmethod
     def remote_open(self, key, decompressor=None):
         """
         Open a remote object in cloud storage and returns a readable stream
@@ -1151,7 +1200,7 @@ class CloudInterface(with_metaclass(ABCMeta)):
         """
 
     @abstractmethod
-    def upload_fileobj(self, fileobj, key, override_tags=None):
+    def upload_fileobj(self, fileobj, key, override_tags=None, fail_if_exists=False):
         """
         Synchronously upload the content of a file-like object to a cloud key
 
@@ -1159,6 +1208,9 @@ class CloudInterface(with_metaclass(ABCMeta)):
         :param str key: The key to identify the uploaded object
         :param List[tuple] override_tags: List of k,v tuples which should override any
           tags already defined in the cloud interface
+        :param bool fail_if_exists: Whether to fail if the object already exists
+        :raises ObjectKeyAlreadyExists: if the object *fail_if_exists* is ``True``  and
+          the object already exists
         """
 
     @abstractmethod
@@ -1304,10 +1356,10 @@ class CloudBackup(with_metaclass(ABCMeta)):
 
     This class handles the coordination of the physical backup copy with the PostgreSQL
     server via the PostgreSQL low-level backup API. This is handled by the
-    _coordinate_backup method.
+    coordinate_backup method.
 
     Concrete classes will need to implement the following abstract methods which are
-    called during the _coordinate_backup method:
+    called during the coordinate_backup method:
 
         _take_backup
         _upload_backup_label
@@ -1315,7 +1367,7 @@ class CloudBackup(with_metaclass(ABCMeta)):
         _add_stats_to_backup_info
 
     Implementations must also implement the public backup method which should carry
-    out any prepartion and invoke _coordinate_backup.
+    out any prepartion and invoke coordinate_backup.
     """
 
     def __init__(self, server_name, cloud_interface, postgres, backup_name=None):
@@ -1347,7 +1399,7 @@ class CloudBackup(with_metaclass(ABCMeta)):
         Perform the actions necessary to create the backup.
 
         This method must be called between pg_backup_start and pg_backup_stop which
-        is guaranteed to happen if the _coordinate_backup method is used.
+        is guaranteed to happen if the coordinate_backup method is used.
         """
 
     @abstractmethod
@@ -1376,7 +1428,7 @@ class CloudBackup(with_metaclass(ABCMeta)):
 
         When providing an implementation of this method, concrete classes *must* set
         `self.backup_info` before coordinating the backup. Implementations *should*
-        call `self._coordinate_backup` to carry out the backup process.
+        call `self.coordinate_backup` to carry out the backup process.
         """
 
     # The following concrete methods are independent of backup copy mechanism.
@@ -1459,7 +1511,7 @@ class CloudBackup(with_metaclass(ABCMeta)):
             human_readable_timedelta(datetime.datetime.now() - self.copy_start_time),
         )
 
-    def _coordinate_backup(self):
+    def coordinate_backup(self):
         """
         Coordinate taking the backup with the PostgreSQL server.
         """
@@ -1594,7 +1646,7 @@ class CloudBackupUploader(CloudBackup):
         """
         return tablespace.location
 
-    def _create_upload_controller(self, backup_id):
+    def create_upload_controller(self, backup_id):
         """
         Create an upload controller from the specified backup_id
 
@@ -1790,11 +1842,11 @@ class CloudBackupUploader(CloudBackup):
         """
         server_name = "cloud"
         self.backup_info = self._get_backup_info(server_name)
-        self.controller = self._create_upload_controller(self.backup_info.backup_id)
+        self.controller = self.create_upload_controller(self.backup_info.backup_id)
 
         self._check_postgres_version()
 
-        self._coordinate_backup()
+        self.coordinate_backup()
 
 
 class CloudBackupUploaderBarman(CloudBackupUploader):
@@ -1900,7 +1952,7 @@ class CloudBackupUploaderBarman(CloudBackupUploader):
         Upload a Backup to cloud storage
 
         This deviates from other CloudBackup classes because it does not make use of
-        the self._coordinate_backup function. This is because there is no need to
+        the self.coordinate_backup function. This is because there is no need to
         coordinate the backup with a live PostgreSQL server, create a restore point
         or upload the backup label independently of the backup (it will already be in
         the base backup directoery).
@@ -1908,7 +1960,7 @@ class CloudBackupUploaderBarman(CloudBackupUploader):
         # Read the backup_info file from disk as the backup has already been created
         self.backup_info = BackupInfo(self.backup_id)
         self.backup_info.load(filename=self.backup_info_path)
-        self.controller = self._create_upload_controller(self.backup_id)
+        self.controller = self.create_upload_controller(self.backup_id)
         try:
             self.copy_start_time = datetime.datetime.now()
             self._take_backup()
@@ -2086,7 +2138,7 @@ class CloudBackupSnapshot(CloudBackup):
 
         self._check_postgres_version()
 
-        self._coordinate_backup()
+        self.coordinate_backup()
 
 
 class BackupFileInfo(object):
@@ -2350,6 +2402,8 @@ class CloudBackupCatalog(KeepManagerMixinCloud):
                         info.compression = "bzip2"
                     elif ext == "tar.snappy":
                         info.compression = "snappy"
+                    elif ext == "tar.lz4":
+                        info.compression = "lz4"
                     else:
                         _logger.warning("Skipping unknown extension: %s", ext)
                         continue

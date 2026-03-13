@@ -30,19 +30,29 @@ from collections import defaultdict
 from contextlib import closing
 from glob import glob
 
-import dateutil.parser
 import dateutil.tz
 
 from barman import output, xlog
-from barman.annotations import AnnotationManagerFile, KeepManager, KeepManagerMixin
+from barman.annotations import (
+    AnnotationManagerFile,
+    KeepManager,
+    KeepManagerMixin,
+    KeepManagerMixinCloud,
+)
 from barman.backup_executor import (
+    CloudBackupExecutor,
+    CloudPostgresBackupExecutor,
     PassiveBackupExecutor,
     PostgresBackupExecutor,
     RsyncBackupExecutor,
     SnapshotBackupExecutor,
 )
 from barman.backup_manifest import BackupManifest
-from barman.cloud_providers import get_snapshot_interface_from_backup_info
+from barman.cloud import CloudBackupCatalog
+from barman.cloud_providers import (
+    get_snapshot_interface_from_backup_info,
+    recognize_cloud_provider,
+)
 from barman.command_wrappers import PgVerifyBackup
 from barman.compression import CompressionManager
 from barman.config import BackupOptions, RecoveryOptions
@@ -52,13 +62,15 @@ from barman.exceptions import (
     BackupException,
     CommandFailedException,
     CompressionIncompatibility,
+    DuplicateWalFile,
     LockFileBusy,
+    MatchingDuplicateWalFile,
     SshCommandException,
     UnknownBackupIdException,
 )
 from barman.fs import unix_command_factory
 from barman.hooks import HookScriptRunner, RetryHookScriptRunner
-from barman.infofile import BackupInfo, LocalBackupInfo, WalFileInfo
+from barman.infofile import BackupInfo, BackupInfoFactory, WalFileInfo
 from barman.lockfile import ServerBackupIdLock, ServerBackupSyncLock
 from barman.recovery_executor import recovery_executor_factory
 from barman.remote_status import RemoteStatusMixin
@@ -76,6 +88,7 @@ from barman.utils import (
     human_readable_timedelta,
     pretty_size,
 )
+from barman.wal_archiver import CloudWalStorageStrategy
 
 _logger = logging.getLogger(__name__)
 
@@ -105,8 +118,13 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         try:
             if server.passive_node:
                 self.executor = PassiveBackupExecutor(self)
+            elif self.config.backup_method == "local-to-cloud":
+                self.executor = CloudBackupExecutor(self)
             elif self.config.backup_method == "postgres":
-                self.executor = PostgresBackupExecutor(self)
+                if recognize_cloud_provider(self.config.basebackups_directory):
+                    self.executor = CloudPostgresBackupExecutor(self)
+                else:
+                    self.executor = PostgresBackupExecutor(self)
             elif self.config.backup_method == "local-rsync":
                 self.executor = RsyncBackupExecutor(self, local_mode=True)
             elif self.config.backup_method == "snapshot":
@@ -175,14 +193,14 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         # in the backup catalog, where we will find backup.info files in both
         # locations because of backups taken with < 3.13.2
         for filename in glob("%s/*/backup.info" % self.config.basebackups_directory):
-            backup = LocalBackupInfo(self.server, filename)
+            backup = BackupInfoFactory.build_backup_info(self.server, filename)
             self._backup_cache[backup.backup_id] = backup
         # In version 3.13.2, Barman changed the location of backup.info files.
         # That was done so we have common location for the metadata, which
         # should always be in a mutable storage, independently if worm_mode
         # is enabled or not. So, this new approach takes precedence.
         for filename in glob("%s/*-backup.info" % self.server.meta_directory):
-            backup = LocalBackupInfo(self.server, filename)
+            backup = BackupInfoFactory.build_backup_info(self.server, filename)
             self._backup_cache[backup.backup_id] = backup
 
     def backup_cache_add(self, backup_info):
@@ -260,7 +278,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         """
         if not isinstance(status_filter, tuple):
             status_filter = tuple(status_filter)
-        backup = LocalBackupInfo(self.server, backup_id=backup_id)
+        backup = BackupInfoFactory.build_backup_info(self.server, backup_id=backup_id)
         available_backups = self.get_available_backups(status_filter + (backup.status,))
         return self.find_previous_backup_in(available_backups, backup_id, status_filter)
 
@@ -393,7 +411,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         """
         if not isinstance(status_filter, tuple):
             status_filter = tuple(status_filter)
-        backup = LocalBackupInfo(self.server, backup_id=backup_id)
+        backup = BackupInfoFactory.build_backup_info(self.server, backup_id=backup_id)
         available_backups = self.get_available_backups(status_filter + (backup.status,))
         return self.find_next_backup_in(available_backups, backup_id, status_filter)
 
@@ -551,6 +569,45 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         :param str backup_id: The ID of the backup to remove the annotation from.
         """
         self.annotation_manager.delete_annotation(backup_id, self.DELETE_ANNOTATION)
+
+    def keep_backup(self, backup_id, target):
+        """
+        Add a keep annotation for backup with ID *backup_id* with the specified
+        recovery *target*.
+
+        :param str backup_id: The ID of the backup to keep
+        :param str target: The desired target as defined in
+            :class:`barman.annotations.KeepManager`
+        """
+        # If a cloud storage is configured, first send a copy of the annotation to the
+        # cloud destination. This ensures compatibility with the cloud-* scripts
+        if self.server.use_backup_cloud_storage:
+            cloud_keep_manager = KeepManagerMixinCloud(
+                cloud_interface=self.server.get_backup_cloud_interface(),
+                server_name=self.config.name,
+            )
+            cloud_keep_manager.keep_backup(backup_id, target)
+
+        # Then proceed with saving the annotation locally
+        super(BackupManager, self).keep_backup(backup_id, target)
+
+    def release_keep(self, backup_id):
+        """
+        Remove the keep annotation for backup with ID *backup_id*.
+
+        :param str backup_id: The ID of the backup to release
+        """
+        # If a cloud storage is configured, a copy of the annotation is also present
+        # in the cloud destination so we should remove it as well
+        if self.server.use_backup_cloud_storage:
+            cloud_keep_manager = KeepManagerMixinCloud(
+                cloud_interface=self.server.get_backup_cloud_interface(),
+                server_name=self.config.name,
+            )
+            cloud_keep_manager.release_keep(backup_id)
+
+        # Then proceed with removing the local annotation
+        super(BackupManager, self).release_keep(backup_id)
 
     @staticmethod
     def get_timelines_to_protect(remove_until, deleted_backup, available_backups):
@@ -890,7 +947,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         backup_info = None
         try:
             # Create the BackupInfo object representing the backup
-            backup_info = LocalBackupInfo(
+            backup_info = BackupInfoFactory.build_backup_info(
                 self.server,
                 backup_id=datetime.datetime.now().strftime("%Y%m%dT%H%M%S"),
                 backup_name=name,
@@ -935,8 +992,12 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             if self.config.encryption is not None:
                 self._encrypt_backup(backup_info)
 
-            # Compute backup size and fsync it on disk
-            self.backup_fsync_and_set_sizes(backup_info)
+            # Compute backup size and fsync it on disk, if not a cloud backup
+            # Cloud backups size are calculated during the backup in the executor
+            if not self.server.use_backup_cloud_storage:
+                self.backup_fsync_and_set_sizes(backup_info)
+            else:
+                output.info("Backup size: %s" % pretty_size(backup_info.size))
 
             # Mark the backup as WAITING_FOR_WALS
             backup_info.set_attribute("status", BackupInfo.WAITING_FOR_WALS)
@@ -1100,6 +1161,8 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             configurations
         :kwparam str|None recovery_option_port: port to set in restore command
             when invoking ``barman-wal-restore``
+        :kwparam str|None custom_restore_command: Custom restore command
+            to override Barman's default (only used with get-wal mode)
         """
 
         # Archive every WAL files in the incoming directory of the server
@@ -1210,6 +1273,88 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         for archiver in self.server.archivers:
             archiver.archive(verbose)
 
+    def cloud_wal_archive(self, wal_path):
+        """
+        Archive a WAL file to cloud storage.
+
+        Intended to be used as ``archive_command`` in Postgres.
+
+        Performs archiving similar to :class:`WalArchiver`, but with the specific
+        purpose of archiving a WAL file to cloud storage directly from ``pg_wal``,
+        meaning WAL files are not staged in ``incoming`` directory and do not go through
+        the usual WAL archiving process. This is done that way because the
+        ``barman cloud-wal-archive`` command is intended to replace the script
+        ``barman-cloud-wal-archive`` when the Barman server runs in the same host as
+        Postgres. Also, this avoids having to use `cp` as `archive_command`, which could
+        send much more WALs to the ``incoming`` directory than what Barman is actually
+        able to archive in a timely manner -- besides the fact that `barman wal-archive`
+        is awaken only by `barman cron` every 1 minute, while `archive_command` is
+        called by Postgres for every WAL file generated.
+
+        .. note::
+            This method assumes validation of the WAL file and of the server
+            configuration has already been performed. At this point, we can simply
+            archive the WAL to cloud object storage.
+
+        .. important::
+            This method cannot be used with :class:`LocalWalStorageStrategy` because
+            that strategy modifies and/or removes the source WAL file as part of the
+            ``save()`` call, which is not acceptable here given we are using the WAL
+            from ``pg_wal``.
+
+        :param str wal_path: the path of the WAL file to archive
+        """
+        # Get a WAL file info and the compressor/encryptor, similar to what is done
+        # through WalArchiver when running 'barman archive-wal'.
+        wal_info = WalFileInfo.from_file(
+            filename=wal_path,
+            compression_manager=self.compression_manager,
+            unidentified_compression=None,
+            encryption_manager=self.encryption_manager,
+            encryption=None,
+        )
+        compressor = self.compression_manager.get_default_compressor()
+        encryption = self.encryption_manager.get_encryption()
+
+        wal_storage = self.server.wal_storage
+
+        # In the docstring we mention we don't perform validation here, but we still
+        # want to make sure that the WAL storage strategy is compatible with this
+        # method, otherwise we can end up in a situation where the WAL file is
+        # removed/modified without being archived in cloud storage, which can cause data
+        # loss.
+        if not isinstance(wal_storage, CloudWalStorageStrategy):
+            output.error(
+                "The 'cloud-wal-archive' command can only be used with cloud WAL "
+                "storage strategies. Please check your server configuration and ensure "
+                "that the `wals_directory` points to a cloud object storage."
+            )
+            return
+
+        try:
+            # We skip the delete because the WAL file is expected to be inside 'pg_wal',
+            # not inside the 'incoming' directory.
+            wal_storage.save(compressor, encryption, wal_info, skip_delete=True)
+            output.info("WAL file %s archived in cloud storage.", wal_info.name)
+        except MatchingDuplicateWalFile:
+            output.info(
+                "WAL file %s is already archived in cloud storage, skipping.",
+                wal_info.name,
+            )
+        except DuplicateWalFile:
+            output.warning(
+                "WAL file %s is already archived in cloud storage of server %s but "
+                "with different content",
+                wal_info.name,
+                self.config.name,
+            )
+            # We copy instead of moving the WAL file to the errors directory because
+            # 'wal_info.path' points to a WAL inside 'pg_wal', and should not be
+            # modified by Barman.
+            self.server.copy_wal_file_to_errors_directory(
+                wal_info.orig_filename, wal_info.name, "duplicate"
+            )
+
     def cron_retention_policy(self):
         """
         Retention policy management
@@ -1305,6 +1450,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
 
         :param barman.infofile.LocalBackupInfo backup: the backup to delete
         """
+        if self.server.use_backup_cloud_storage:
+            self._delete_cloud_backup_data(backup)
+            return
         # If this backup has snapshots then they should be deleted first.
         if backup.snapshots_info:
             _logger.debug(
@@ -1341,76 +1489,34 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             _logger.debug("Deleting PGDATA directory: %s" % pg_data)
             shutil.rmtree(pg_data)
 
-    def _run_pre_delete_wal_scripts(self, wal_info):
+    def _delete_cloud_backup_data(self, backup):
         """
-        Run the pre-delete hook-scripts, if any, on the given WAL.
+        Delete backup data from its cloud storage path.
 
-        :param barman.infofile.WalFileInfo wal_info: WAL to run the script on.
+        :param barman.infofile.LocalBackupInfo backup: the backup to delete
         """
-        # Run the pre_wal_delete_script if present.
-        script = HookScriptRunner(self, "wal_delete_script", "pre")
-        script.env_from_wal_info(wal_info)
-        script.run()
-        # Run the pre_wal_delete_retry_script if present.
-        retry_script = RetryHookScriptRunner(self, "wal_delete_retry_script", "pre")
-        retry_script.env_from_wal_info(wal_info)
-        retry_script.run()
-
-    def _run_post_delete_wal_scripts(self, wal_info, error=None):
-        """
-        Run the post-delete hook-scripts, if any, on the given WAL.
-
-        :param barman.infofile.WalFileInfo wal_info: WAL to run the script on.
-        :param None|str error: error message in case a failure happened.
-        """
-        # Run the post_wal_delete_retry_script if present.
-        try:
-            retry_script = RetryHookScriptRunner(
-                self, "wal_delete_retry_script", "post"
-            )
-            retry_script.env_from_wal_info(wal_info, None, error)
-            retry_script.run()
-        except AbortedRetryHookScript as e:
-            # Ignore the ABORT_STOP as it is a post-hook operation
-            _logger.warning(
-                "Ignoring stop request after receiving "
-                "abort (exit code %d) from post-wal-delete "
-                "retry hook script: %s",
-                e.hook.exit_status,
-                e.hook.script,
-            )
-        # Run the post_wal_delete_script if present.
-        script = HookScriptRunner(self, "wal_delete_script", "post")
-        script.env_from_wal_info(wal_info, None, error)
-        script.run()
-
-    def delete_wal(self, wal_info):
-        """
-        Delete a WAL segment, with the given WalFileInfo
-
-        :param barman.infofile.WalFileInfo wal_info: the WAL to delete
-        """
-        self._run_pre_delete_wal_scripts(wal_info)
-
-        error = None
-        try:
-            os.unlink(wal_info.fullpath(self.server))
+        # get_basebackup_directory returns the cloud path e.g. if basebackups_directory
+        # is s3://my-backups then it will be my-backups/<server_name>/base/<backup_id>
+        backup_path = backup.get_basebackup_directory()
+        # Get all the objects keys under the backup path and pass them to delete_objects
+        # In the future we might replace this with just calling the cloud interface's
+        # delete_under_prefix method instead, but currently that is only implemented for S3
+        cloud_interface = self.server.get_backup_cloud_interface()
+        objects_keys = [k for k in cloud_interface.list_bucket(backup_path + "/")]
+        _logger.debug("Deleting all backup data from cloud path: %s" % backup_path)
+        cloud_interface.delete_objects(objects_keys)
+        # Lastly delete the backup manifest from the local meta dir, if it exists
+        manifest_path = backup.get_backup_manifest_path()
+        if os.path.exists(manifest_path):
+            _logger.debug("Deleting backup manifest file: %s" % manifest_path)
             try:
-                os.removedirs(os.path.dirname(wal_info.fullpath(self.server)))
+                os.unlink(manifest_path)
             except OSError:
-                # This is not an error condition
-                # We always try to remove the trailing directories,
-                # this means that hashdir is not empty.
-                pass
-        except OSError as e:
-            error = "Ignoring deletion of WAL file %s for server %s: %s" % (
-                wal_info.name,
-                self.config.name,
-                e,
-            )
-            output.warning(error)
-
-        self._run_post_delete_wal_scripts(wal_info, error)
+                output.warning(
+                    "Failed to delete backup manifest file: %s. Please manually delete "
+                    "this file if it still exists.",
+                    manifest_path,
+                )
 
     def check(self, check_strategy):
         """
@@ -1553,6 +1659,13 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
 
         :rtype: dict[str, WalFileInfo]|None
         """
+        if self.server.use_wal_cloud_storage:
+            # Leverage the cloud catalog to get the latest archived WALs info
+            cloud_catalog = CloudBackupCatalog(
+                self.server.get_wal_cloud_interface(), self.config.name
+            )
+            return cloud_catalog.get_latest_archived_wals_info()
+
         from os.path import isdir, join
 
         root = self.config.wals_directory
@@ -1663,7 +1776,7 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                         wal_dir = os.path.dirname(wal_info.fullpath(self.server))
                         wals_to_remove[wal_dir].append(wal_info)
 
-                wals_removed = self.delete_wals(wals_to_remove)
+                wals_removed = self.server.wal_storage.delete(wals_to_remove)
 
                 fxlogdb_new.flush()
                 fxlogdb_new.seek(0)
@@ -1672,43 +1785,6 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
                 fxlogdb.truncate()
 
         return wals_removed
-
-    def delete_wals(self, wals_to_delete):
-        """
-        Delete the given WAL files. The entire WAL directory is deleted when possible.
-
-        :param dict[str, list[WalFileInfo]] wals_to_delete: A dictionary where key is the WAL directory name and
-            value is a list of wal_info objects representing the WALs to be deleted in
-            that directory.
-        :return list[str]: a list of deleted WAL names.
-        """
-        wals_deleted = []
-        for wal_dir, wal_list in wals_to_delete.items():
-            delete_directory = False
-            # Each directory can contain up to 256 WAL files. If the deletion list
-            # contains 256 entries, the entire directory can be safely deleted
-            # Otherwise, check if all WALs in the directory are in the deletion list
-            if len(wal_list) >= 256:
-                delete_directory = True
-            else:
-                wal_names_to_delete = {wal_info.name for wal_info in wal_list}
-                wal_names_in_dir = os.listdir(wal_dir)
-                if set(wal_names_in_dir).issubset(wal_names_to_delete):
-                    delete_directory = True
-            # If the directory can be deleted, run the hook-scripts on each WAL file
-            # before and after the rmtree. Otherwise, delete each WAL individually
-            if delete_directory:
-                for wal_info in wal_list:
-                    self._run_pre_delete_wal_scripts(wal_info)
-                shutil.rmtree(wal_dir)
-                for wal_info in wal_list:
-                    self._run_post_delete_wal_scripts(wal_info)
-                    wals_deleted.append(wal_info.name)
-            else:
-                for wal_info in wal_list:
-                    self.delete_wal(wal_info)
-                    wals_deleted.append(wal_info.name)
-        return wals_deleted
 
     def validate_last_backup_maximum_age(self, last_backup_maximum_age):
         """
@@ -1727,7 +1803,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         backup_id = self.get_last_backup_id()
         if backup_id:
             # Get the backup object
-            backup = LocalBackupInfo(self.server, backup_id=backup_id)
+            backup = BackupInfoFactory.build_backup_info(
+                self.server, backup_id=backup_id
+            )
             now = datetime.datetime.now(dateutil.tz.tzlocal())
             # Evaluate the point of validity
             validity_time = now - last_backup_maximum_age
@@ -1760,7 +1838,9 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         backup_id = self.get_last_backup_id()
         if backup_id:
             # Get the backup object
-            backup = LocalBackupInfo(self.server, backup_id=backup_id)
+            backup = BackupInfoFactory.build_backup_info(
+                self.server, backup_id=backup_id
+            )
             if backup.size < last_backup_minimum_size:
                 return False, backup.size
             else:
@@ -1859,8 +1939,8 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
             # Stop checking if we reach the last archived wal
             if wal > last_archived_wal:
                 break
-            wal_full_path = self.server.get_wal_full_path(wal)
-            if not os.path.exists(wal_full_path):
+            wal_full_path = self.server.wal_storage.get_full_path(wal)
+            if not self.server.wal_storage.exists(wal_full_path):
                 missing_wal = wal
                 break
 
@@ -1901,9 +1981,14 @@ class BackupManager(RemoteStatusMixin, KeepManagerMixin):
         This function should check if pg_verifybackup is installed and run it against backup path
         should test if pg_verifybackup is installed locally
 
-
         :param backup_info: barman.infofile.LocalBackupInfo instance
         """
+        if self.server.use_backup_cloud_storage or self.server.use_wal_cloud_storage:
+            output.error(
+                "Backup verification is not supported for servers using cloud storage"
+            )
+            return
+
         output.info("Calling pg_verifybackup")
         # Test pg_verifybackup existence
         version_info = PgVerifyBackup.get_version_info(self.server.path)

@@ -869,7 +869,11 @@ class PostgreSQLConnection(PostgreSQL):
             # while we prefer a raw value such as 300.
             cur.execute("SELECT setting FROM pg_settings WHERE name='archive_timeout'")
             result = cur.fetchone()
-            archive_timeout = int(result[0])
+            archive_timeout = 0
+            # Only on WarehousePG segments we won't get any value returned as for some
+            # reason archive_timeout is not available in pg_settings there.
+            if result is not None:
+                archive_timeout = int(result[0])
 
             return archive_timeout
         except ValueError as e:
@@ -1397,7 +1401,7 @@ class PostgreSQLConnection(PostgreSQL):
             if not self.has_backup_privileges:
                 raise BackupFunctionsAccessRequired(
                     "Postgres user '%s' is missing required privileges "
-                    '(see "Preliminary steps" in the Barman manual)'
+                    '(see "Pre-requisites" section in the Barman documentation)'
                     % self.conn_parameters.get("user")
                 )
 
@@ -1479,7 +1483,7 @@ class PostgreSQLConnection(PostgreSQL):
             if not self.has_monitoring_privileges:
                 raise BackupFunctionsAccessRequired(
                     "Postgres user '%s' is missing required privileges "
-                    '(see "Preliminary steps" in the Barman manual)'
+                    '(see "Pre-requisites" section in the Barman documentation)'
                     % self.conn_parameters.get("user")
                 )
 

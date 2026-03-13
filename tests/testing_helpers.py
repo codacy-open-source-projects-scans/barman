@@ -29,6 +29,7 @@ from barman.config import BackupOptions, Config
 from barman.infofile import BackupInfo, LocalBackupInfo, Tablespace, WalFileInfo
 from barman.server import Server
 from barman.utils import mkpath
+from barman.wal_archiver import LocalWalStorageStrategy
 from barman.xlog import DEFAULT_XLOG_SEG_SIZE
 
 try:
@@ -133,6 +134,8 @@ def build_test_backup_info(
         server.passive_node = False
         server.backup_manager.name = "default"
         server.meta_directory = "%s/meta" % server.config.backup_directory
+        server.use_backup_cloud_storage = False
+        server.use_wal_cloud_storage = False
 
     backup_info = LocalBackupInfo(**locals())
     return backup_info
@@ -286,12 +289,15 @@ def build_config_dictionary(config_keys=None):
         "archiver_batch_size": 0,
         "autogenerate_manifest": False,
         "aws_await_snapshots_timeout": 3600,
+        "aws_encryption": None,
+        "aws_read_timeout": None,
         "aws_snapshot_lock_mode": None,
         "aws_snapshot_lock_duration": None,
         "aws_snapshot_lock_cool_off_period": None,
         "aws_snapshot_lock_expiration_date": None,
         "aws_profile": None,
         "aws_region": None,
+        "aws_sse_kms_key_id": None,
         "azure_credential": None,
         "azure_resource_group": None,
         "azure_subscription_id": None,
@@ -314,6 +320,11 @@ def build_config_dictionary(config_keys=None):
         "conninfo": "host=pg01.nowhere user=postgres port=5432",
         "backup_method": "rsync",
         "check_timeout": 30,
+        "cloud_delete_batch_size": None,
+        "cloud_staging_directory": "/tmp/barman/cloud-staging",
+        "cloud_staging_max_size": 30 * 1024 * 1024 * 1024,  # 30GiB
+        "cloud_upload_max_archive_size": 100 * 1024 * 1024 * 1024,  # 100GiB
+        "cloud_upload_min_chunk_size": None,
         "custom_compression_filter": None,
         "custom_decompression_filter": None,
         "custom_compression_magic": None,
@@ -396,6 +407,7 @@ def build_config_dictionary(config_keys=None):
         "snapshot_gcp_project": None,
         "wal_conninfo": None,
         "wal_streaming_conninfo": None,
+        "warehousepg_dbid": None,
     }
     # Check for overriding keys
     if config_keys is not None:
@@ -476,6 +488,9 @@ def build_mocked_server(
     server.systemid = "6721602258895701769"
     server.postgres.server_version = pg_version
     server.meta_directory = "%s/meta" % server.config.backup_directory
+    server.use_backup_cloud_storage = False
+    server.use_wal_cloud_storage = False
+    server.wal_storage = LocalWalStorageStrategy(server.backup_manager, server)
     return server
 
 

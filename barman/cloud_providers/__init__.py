@@ -16,6 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with Barman.  If not, see <http://www.gnu.org/licenses/>
 
+from urllib.parse import urlparse
+
 from barman.exceptions import BarmanException, ConfigurationException
 
 
@@ -29,6 +31,12 @@ class CloudProviderOptionUnsupported(BarmanException):
     """
     Exception raised when a supported cloud provider is given an unsupported
     option
+    """
+
+
+class ObjectKeyAlreadyExists(BarmanException):
+    """
+    Exception raised when trying to insert an object with a key that already exists
     """
 
 
@@ -64,6 +72,8 @@ def _make_s3_cloud_interface(config, cloud_interface_kwargs):
                 'Encryption type must be "aws:kms" if SSE KMS Key ID is specified'
             )
         cloud_interface_kwargs["sse_kms_key_id"] = config.sse_kms_key_id
+    if "addressing_style" in config:
+        cloud_interface_kwargs["addressing_style"] = config.addressing_style
     return S3CloudInterface(**cloud_interface_kwargs)
 
 
@@ -161,6 +171,56 @@ def get_cloud_interface(config):
     else:
         raise CloudProviderUnsupported(
             "Unsupported cloud provider: %s" % config.cloud_provider
+        )
+
+
+def get_cloud_interface_from_server_config(config, cloud_provider, base_url):
+    """
+    Factory function that creates a CloudInterface for the specified *cloud_provider*
+    based on the *base_url*.
+
+    :param barman.config.Config config: The barman configuration object for a
+        specific server.
+    :param str cloud_provider: The cloud provider to create the interface for.
+    :param str base_url: The base URL to use for the cloud interface.
+    :rtype: CloudInterface
+    :returns: A CloudInterface for the specified cloud_provider.
+    """
+    cloud_interface_kwargs = {
+        "url": base_url,
+        "jobs": config.parallel_jobs,
+        "delete_batch_size": config.cloud_delete_batch_size,
+    }
+
+    if cloud_provider == "aws-s3":
+        from barman.cloud_providers.aws_s3 import S3CloudInterface
+
+        if config.aws_sse_kms_key_id and config.aws_encryption != "aws:kms":
+            raise ConfigurationException(
+                'aws_encryption must be "aws:kms" if aws_sse_kms_key_id is specified'
+            )
+
+        cloud_interface_kwargs.update(
+            {
+                "profile_name": config.aws_profile,
+                "region": config.aws_region,
+                "read_timeout": config.aws_read_timeout,
+                "encryption": config.aws_encryption,
+                "sse_kms_key_id": config.aws_sse_kms_key_id,
+            }
+        )
+        return S3CloudInterface(**cloud_interface_kwargs)
+    elif cloud_provider == "azure-blob-storage":
+        from barman.cloud_providers.azure_blob_storage import AzureCloudInterface
+
+        return AzureCloudInterface(**cloud_interface_kwargs)
+    elif cloud_provider == "google-cloud-storage":
+        from barman.cloud_providers.google_cloud_storage import GoogleCloudInterface
+
+        return GoogleCloudInterface(**cloud_interface_kwargs)
+    else:
+        raise CloudProviderUnsupported(
+            "Unsupported cloud provider: %s" % cloud_provider
         )
 
 
@@ -378,3 +438,80 @@ def snapshots_info_from_dict(snapshots_info):
             "Unsupported snapshot provider in backup info: %s"
             % snapshots_info["provider"]
         )
+
+
+def validate_s3_url(url):
+    """
+    Validate an S3 or S3-compatible URL.
+
+    :param str url: The URL to validate
+    :rtype: bool
+    :return: ``True`` if the URL is valid, ``False`` otherwise
+    """
+    parsed_url = urlparse(url)
+    if parsed_url.netloc == "" or parsed_url.scheme != "s3":
+        return False
+    return True
+
+
+def validate_google_cloud_url(url):
+    """
+    Validate a Google Cloud Storage URL.
+
+    :param str url: The URL to validate
+    :rtype: bool
+    :return: ``True`` if the URL is valid, ``False`` otherwise
+    """
+    # It must start with either the console URL or the gs:// scheme
+    GOOGLE_BASE_URL = "https://console.cloud.google.com/storage/browser/"
+    if not url.startswith(GOOGLE_BASE_URL) and not url.startswith("gs://"):
+        return False
+    gs_url = url.replace(GOOGLE_BASE_URL, "gs://")
+    parsed_url = urlparse(gs_url)
+    if not parsed_url.netloc:
+        # The bucket name is missing
+        return False
+    return True
+
+
+def validate_azure_blob_storage_url(url):
+    """
+    Validate an Azure Blob Storage URL.
+
+    :param str url: The URL to validate
+    :rtype: bool
+    :return: ``True`` if the URL is valid, ``False`` otherwise
+    """
+    # The URL must point to the Azure Blob Storage domain
+    AZURE_BLOB_STORAGE_DOMAIN = "blob.core.windows.net"
+    parsed_url = urlparse(url)
+    if parsed_url.netloc.endswith(AZURE_BLOB_STORAGE_DOMAIN):
+        try:
+            # try to get the bucket name
+            parsed_url.path.split("/")[1]
+            return True
+        except IndexError:
+            pass
+    return False
+
+
+def recognize_cloud_provider(url):
+    """
+    Check if the given URL is a valid cloud storage URL and return the corresponding
+    storage provider.
+
+    :param str url: The URL to validate
+    :rtype: string|None
+    :return: The storage provider, or None if the URL is invalid
+
+    .. note::
+        The strings follow the same naming used by ``barman-cloud-backup``.
+    """
+    if validate_s3_url(url):
+        return "aws-s3"
+    elif validate_google_cloud_url(url):
+        return "azure-blob-storage"
+    elif validate_azure_blob_storage_url(url):
+        return "google-cloud-storage"
+    else:
+        return None

@@ -55,6 +55,12 @@ in square brackets. Each section can include various options.
 Models and servers must have unique identifiers, and reserved words cannot be used as
 names.
 
+.. note::
+  **Comment Handling**: Only line comments are supported (lines starting with ``#`` or ``;``).
+  Inline comments (``#`` or ``;`` appearing after configuration values on the same line) are 
+  not supported and will be parsed as part of the configuration value, which may 
+  cause unexpected behavior.
+
 **Reserved Words**
 
 The following reserved words cannot be used as server or model names:
@@ -136,7 +142,7 @@ Specifies the maximum transfer rate in kilobytes per second for backup and recov
 operations. A value of ``0`` indicates no limit (default).
 
 .. note::
-  Applies only when ``backup_method = postgres | rsync``.
+  Applies only when ``backup_method = postgres | rsync | local-to-cloud``.
 
 Scope: Global / Server / Model.
 
@@ -528,6 +534,25 @@ the standard compression behavior.
 
 Scope: Global / Server / Model.
 
+**warehousepg_dbid**
+
+Specifies the integer identifier for a WarehousePG database. When set, this value is
+passed to ``pg_basebackup`` via the ``--target-gp-dbid`` parameter for WarehousePG
+compatibility. This option is required when backing up WarehousePG segments.
+
+.. important::
+  This option is only relevant for WarehousePG databases and should not be set for
+  standard PostgreSQL databases.
+
+  Furthermore, Barman does not handle backups and restores for WarehousePG clusters.
+  The orchestration of backup and restore operations for WarehousePG clusters must be
+  managed externally by the user.
+
+.. note::
+  Only supported when ``backup_method = postgres``.
+
+Scope: Global / Server / Model.
+
 .. _configuration-options-backups-backup-directory:
 
 **backup_directory**
@@ -576,8 +601,9 @@ Scope: Global / Server / Model.
 
 **basebackups_directory**
 
-Specifies the directory where base backups are stored. Defaults to
-``<backup_directory>/base``.
+Destination for base backup files. It can be a local path if storing backups locally,
+or a cloud storage URL if streaming backups to the cloud as described in
+:ref:`backup-streaming-backup-cloud`. Defaults to ``<backup_directory>/base``.
 
 Scope: Server.
 
@@ -650,17 +676,84 @@ The name of the AWS profile to use when authenticating with AWS (e.g. ``INI`` se
 in AWS credentials file).
 
 .. note::
-  Only supported when ``backup_method = snapshot`` and ``snapshot_provider = aws``.
+  Only supported when ``backup_method = snapshot`` and ``snapshot_provider = aws``, or
+  when ``backup_method`` is ``postgres`` or ``local-to-cloud`` and
+  ``basebackups_directory`` and/or ``wals_directory`` point to S3.
 
 Scope: Global / Server / Model.
 
 **aws_region**
 
-Indicates the AWS region where the EC2 VM and storage volumes, as defined by
-``snapshot_instance`` and ``snapshot_disks``, are located.
+When using ``backup_method = snapshot``, indicates the AWS region where the EC2 VM and
+storage volumes, as defined by ``snapshot_instance`` and ``snapshot_disks``, are
+located.
+
+When using ``backup_method = postgres`` or ``local-to-cloud`` pointing to S3, indicates
+the AWS region where the S3 bucket is located.
 
 .. note::
-  Only supported when ``backup_method = snapshot`` and ``snapshot_provider = aws``.
+  Only supported when ``backup_method = snapshot`` and ``snapshot_provider = aws``, or
+  when ``backup_method`` is ``postgres`` or ``local-to-cloud`` and
+  ``basebackups_directory`` and/or ``wals_directory`` point to S3.
+
+Scope: Global / Server / Model.
+
+**aws_encryption**
+
+Specifies the server-side encryption algorithm to use when storing objects in S3.
+This value is passed to the S3 client for all upload operations to cloud object storage.
+
+Allowed options:
+
+* ``AES256``: Use S3-managed encryption keys (SSE-S3).
+* ``aws:kms``: Use AWS Key Management Service encryption keys (SSE-KMS).
+
+If not set, S3's default encryption settings for the bucket will be used.
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` and/or ``wals_directory`` point to S3.
+
+Scope: Global / Server / Model.
+
+**aws_sse_kms_key_id**
+
+Specifies the AWS Key Management Service (KMS) key ID to use for server-side
+encryption of S3 objects. This option is only valid when ``aws_encryption`` is
+set to ``aws:kms``.
+
+Can be specified using the key ID on its own or using the full ARN for the key.
+
+If not set when using ``aws_encryption = aws:kms``, S3 will use the default AWS
+managed KMS key for S3.
+
+Example::
+
+  [myserver]
+  backup_method = local-to-cloud
+  basebackups_directory = s3://my-bucket/barman/backups
+  aws_encryption = aws:kms
+  aws_sse_kms_key_id = arn:aws:kms:us-east-1:123456789012:key/abcd1234-5678-90ab-cdef-EXAMPLEKEY
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` and/or ``wals_directory`` point to S3.
+
+Scope: Global / Server / Model.
+
+**aws_read_timeout**
+
+Specifies the read timeout in seconds for S3 operations when using cloud storage.
+This value is passed to the S3 client for all commands that interact with backup
+data on cloud object storage. If not set, the default boto3 read timeout behavior
+applies.
+
+This option is useful for advanced and non-standard S3 workflows where the default
+timeout may not be sufficient.
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` and/or ``wals_directory`` point to S3.
 
 Scope: Global / Server / Model.
 
@@ -743,6 +836,79 @@ Identifies the Azure subscription that owns the instance and storage volumes def
 
 Scope: Global / Server / Model.
 
+**cloud_delete_batch_size**
+
+Specifies the number of files to delete in a single batch when performing delete
+operations on cloud storage. This option is relevant for both backup and WAL file
+deletions. The default value is ``1000`` for S3, ``256`` for Azure Blob, and ``100`` for
+GCS.
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` and/or ``wals_directory`` point to cloud storage.
+
+Scope: Global / Server / Model.
+
+**cloud_upload_max_archive_size**
+
+Specifies the maximum size in bytes for individual archive files during cloud uploads.
+When uploading backups to cloud storage, Barman splits the backup into multiple archive
+files if it exceeds this size. The default value is ``100Gi``.
+
+The accepted format is ``n{k|Ki|M|Mi|G|Gi|T|Ti}`` and case-sensitive, where ``n``
+is an integer greater than zero, with an optional SI or IEC suffix. k stands for
+kilo with k = 1000, while Ki stands for kilobytes Ki = 1024. The rest of the options
+have the same reasoning for greater units of measure.
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` points to cloud storage.
+
+Scope: Global / Server / Model.
+
+**cloud_upload_min_chunk_size**
+
+Specifies the minimum size in bytes for individual chunks during multipart uploads to
+cloud storage. This controls the size of each part when uploading large files to cloud
+object storage. When not set, defaults to the chunk size of the cloud provider: ``5Mi``
+for S3, and ``64Ki`` for Azure Blob. Not applicable for GCS.
+
+The accepted format is ``n{k|Ki|M|Mi|G|Gi|T|Ti}`` and case-sensitive, where ``n``
+is an integer greater than zero, with an optional SI or IEC suffix. k stands for
+kilo with k = 1000, while Ki stands for kilobytes Ki = 1024. The rest of the options
+have the same reasoning for greater units of measure.
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` points to cloud storage.
+
+**cloud_staging_directory**
+
+A staging directory for when sending backups to a cloud object storage using
+``backup_method = postgres``. It is used as a temporary location for storing chunks of
+the backup before they are sent to the cloud. Defaults to ``/tmp/barman/cloud-staging``.
+
+Scope: Global / Server / Model.
+
+**cloud_staging_max_size**
+
+The maximum size that ``cloud_staging_directory`` can grow to before Barman stops
+generating new backup chunks. This is used to prevent the staging directory from
+growing in case the speed of uploading chunks does not keep up with the speed of
+streaming them from Postgres. The default value is ``30Gi``.
+
+Extremely low values are discouraged as they may lead to performance degradation. We
+recommend a minimum of at least ``10Gi``. The optimal value will depend on the transfer
+speed of the backup to Barman and from Barman to the cloud, as well as the size of the
+backup.
+
+The accepted format is ``n{k|Ki|M|Mi|G|Gi|T|Ti}`` and case-sensitive, where ``n`` is
+an integer greater than zero, with an optional SI or IEC suffix. k stands for kilo with
+k = 1000, while Ki stands for kilobytes Ki = 1024. The rest of the options have the same
+reasoning for greater units of measure.
+
+Scope: Global / Server / Model.
+
 **gcp_project**
 
 Specifies the ID of the GCP project that owns the instance and storage volumes defined
@@ -789,11 +955,12 @@ Scope: Server / Model.
 
 The name of the cloud provider to use for creating snapshots. Supported value:
 ``aws``, ``azure`` and ``gcp``.
-  
+
 .. note::
   Required when ``backup_method = snapshot``.
 
 Scope: Global / Server / Model.
+
 
 .. _configuration-options-hook-scripts:
 
@@ -1187,7 +1354,9 @@ Scope: Server / Model.
 
 **wals_directory**
 
-Directory containing WAL files. Defaults to ``<backup_directory>/wals``.
+Destination for archived WAL files. It can be a local path if storing WAL files locally,
+or a cloud storage URL if storing WAL files in the cloud as described in
+:ref:`backup-streaming-backup-cloud`. Defaults to ``<backup_directory>/wals``.
 
 Scope: Server.
 
@@ -1311,7 +1480,7 @@ Scope: Global / Server / Model.
 Specifies the minimum acceptable size for the latest successful backup. If the latest
 backup is smaller than this size, the barman check command will report an error. If
 left empty (default), the latest backup is always considered valid. The accepted
-format is ``"n {k|Ki|M|Mi|G|Gi|T|Ti}"`` and case-sensitive, where ``n`` is an integer
+format is ``"n{k|Ki|M|Mi|G|Gi|T|Ti}"`` and case-sensitive, where ``n`` is an integer
 greater than zero, with an optional SI or IEC suffix. k stands for kilo with k = 1000,
 while Ki stands for kilobytes Ki = 1024. The rest of the options have the same
 reasoning for greater units of measure.

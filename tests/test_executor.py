@@ -19,6 +19,7 @@
 import datetime
 import logging
 import os
+import queue
 from functools import partial
 
 import mock
@@ -32,11 +33,14 @@ from testing_helpers import (
 )
 
 from barman.backup_executor import (
+    CloudBackupExecutor,
+    CloudPostgresBackupExecutor,
     ExclusiveBackupStrategy,
     PostgresBackupExecutor,
     PostgresBackupStrategy,
     RsyncBackupExecutor,
     SnapshotBackupExecutor,
+    _get_bandwidth_limit_in_bytes,
 )
 from barman.config import BackupOptions
 from barman.exceptions import (
@@ -51,6 +55,7 @@ from barman.exceptions import (
 from barman.infofile import BackupInfo, LocalBackupInfo, Tablespace
 from barman.postgres_plumbing import EXCLUDE_LIST, PGDATA_EXCLUDE_LIST
 from barman.server import CheckOutputStrategy, CheckStrategy
+from barman.utils import total_seconds
 
 
 # noinspection PyMethodMayBeStatic
@@ -1170,6 +1175,7 @@ class TestPostgresBackupExecutor(object):
                 err_handler=mock.ANY,
                 out_handler=mock.ANY,
                 parent_backup_manifest_path=None,
+                warehousepg_dbid=None,
             ),
             mock.call()(),
         ]
@@ -1209,6 +1215,7 @@ class TestPostgresBackupExecutor(object):
                 err_handler=mock.ANY,
                 out_handler=mock.ANY,
                 parent_backup_manifest_path=None,
+                warehousepg_dbid=None,
             ),
             mock.call()(),
         ]
@@ -1247,6 +1254,7 @@ class TestPostgresBackupExecutor(object):
                 err_handler=mock.ANY,
                 out_handler=mock.ANY,
                 parent_backup_manifest_path=None,
+                warehousepg_dbid=None,
             ),
             mock.call()(),
         ]
@@ -1280,6 +1288,7 @@ class TestPostgresBackupExecutor(object):
                 err_handler=mock.ANY,
                 out_handler=mock.ANY,
                 parent_backup_manifest_path=None,
+                warehousepg_dbid=None,
             ),
             mock.call()(),
         ]
@@ -1335,6 +1344,138 @@ class TestPostgresBackupExecutor(object):
                 err_handler=mock.ANY,
                 out_handler=mock.ANY,
                 parent_backup_manifest_path="/SOME/MANIFEST",
+                warehousepg_dbid=None,
+            ),
+            mock.call()(),
+        ]
+
+    @patch("barman.backup_executor.PgBaseBackup")
+    @patch("barman.backup_executor.PostgresBackupExecutor.fetch_remote_status")
+    def test_backup_copy_with_warehousepg_dbid(
+        self, remote_mock, pg_basebackup_mock, tmpdir, capsys
+    ):
+        """
+        Test that warehousepg_dbid is correctly passed to PgBaseBackup.
+
+        :param remote_mock: mock for the fetch_remote_status method
+        :param pg_basebackup_mock: mock for the PgBaseBackup object
+        :param tmpdir: pytest temp directory
+        :param capsys: pytest capture output
+        """
+        backup_manager = build_backup_manager(
+            global_conf={
+                "barman_home": tmpdir.mkdir("home").strpath,
+                "backup_method": "postgres",
+                "warehousepg_dbid": "42",
+            }
+        )
+        remote_mock.return_value = {
+            "pg_basebackup_version": "14",
+            "pg_basebackup_path": "/fake/path",
+            "pg_basebackup_bwlimit": True,
+        }
+        server_mock = backup_manager.server
+        streaming_mock = server_mock.streaming
+        streaming_mock.get_connection_string.return_value = "fake=connstring"
+        streaming_mock.conn_parameters = {
+            "host": "fakeHost",
+            "port": "fakePort",
+            "user": "fakeUser",
+        }
+        backup_info = build_test_backup_info(
+            server=backup_manager.server, backup_id="fake_backup_id"
+        )
+        backup_manager.executor.backup_copy(backup_info)
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert err == ""
+
+        # Verify that warehousepg_dbid was passed to PgBaseBackup
+        assert pg_basebackup_mock.mock_calls == [
+            mock.call.make_logging_handler(logging.INFO),
+            mock.call(
+                connection=mock.ANY,
+                version="14",
+                app_name="barman_streaming_backup",
+                destination=mock.ANY,
+                command="/fake/path",
+                tbs_mapping=mock.ANY,
+                bwlimit=None,
+                immediate=False,
+                retry_times=0,
+                retry_sleep=30,
+                retry_handler=mock.ANY,
+                path=mock.ANY,
+                compression=None,
+                err_handler=mock.ANY,
+                out_handler=mock.ANY,
+                parent_backup_manifest_path=None,
+                warehousepg_dbid=42,
+            ),
+            mock.call()(),
+        ]
+
+    @patch("barman.backup_executor.PgBaseBackup")
+    @patch("barman.backup_executor.PostgresBackupExecutor.fetch_remote_status")
+    def test_backup_copy_without_warehousepg_dbid(
+        self, remote_mock, pg_basebackup_mock, tmpdir, capsys
+    ):
+        """
+        Test that warehousepg_dbid is None when not configured.
+
+        :param remote_mock: mock for the fetch_remote_status method
+        :param pg_basebackup_mock: mock for the PgBaseBackup object
+        :param tmpdir: pytest temp directory
+        :param capsys: pytest capture output
+        """
+        backup_manager = build_backup_manager(
+            global_conf={
+                "barman_home": tmpdir.mkdir("home").strpath,
+                "backup_method": "postgres",
+            }
+        )
+        remote_mock.return_value = {
+            "pg_basebackup_version": "14",
+            "pg_basebackup_path": "/fake/path",
+            "pg_basebackup_bwlimit": True,
+        }
+        server_mock = backup_manager.server
+        streaming_mock = server_mock.streaming
+        streaming_mock.get_connection_string.return_value = "fake=connstring"
+        streaming_mock.conn_parameters = {
+            "host": "fakeHost",
+            "port": "fakePort",
+            "user": "fakeUser",
+        }
+        backup_info = build_test_backup_info(
+            server=backup_manager.server, backup_id="fake_backup_id"
+        )
+        backup_manager.executor.backup_copy(backup_info)
+        out, err = capsys.readouterr()
+        assert out == ""
+        assert err == ""
+
+        # Verify that warehousepg_dbid was passed as None to PgBaseBackup
+        assert pg_basebackup_mock.mock_calls == [
+            mock.call.make_logging_handler(logging.INFO),
+            mock.call(
+                connection=mock.ANY,
+                version="14",
+                app_name="barman_streaming_backup",
+                destination=mock.ANY,
+                command="/fake/path",
+                tbs_mapping=mock.ANY,
+                bwlimit=None,
+                immediate=False,
+                retry_times=0,
+                retry_sleep=30,
+                retry_handler=mock.ANY,
+                path=mock.ANY,
+                compression=None,
+                err_handler=mock.ANY,
+                out_handler=mock.ANY,
+                parent_backup_manifest_path=None,
+                warehousepg_dbid=None,
             ),
             mock.call()(),
         ]
@@ -1526,6 +1667,1359 @@ class TestPostgresBackupExecutor(object):
         # AND if we expected switch_wal to have been called it is called on the primary
         if expected_wal_switch:
             server.postgres.switch_wal.assert_called_once()
+
+    @pytest.mark.parametrize("bandwidth_limit_supported", [True, False])
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_bandwidth_limit(self, _, bandwidth_limit_supported):
+        """
+        Test that the bandwidth limit is correctly retrieved based on
+        whether the remote server supports it.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor.config = mock.Mock(bandwidth_limit="100")
+        # WHEN _get_bandwidth_limit is called with the relevant remote status
+        remote_status = {"pg_basebackup_bwlimit": bandwidth_limit_supported}
+        result = executor._get_bandwidth_limit(remote_status)
+        # THEN it returns the expected value
+        assert result == ("100" if bandwidth_limit_supported else None)
+
+
+class TestCloudPostgresBackupExecutor(object):
+    """
+    Tests for the CloudPostgresBackupExecutor class.
+    """
+
+    @patch("barman.backup_executor.CloudPostgresBackupStrategy")
+    @patch("barman.backup_executor.os.getpid", return_value=123)
+    def test__init__(self, _, mock_strategy):
+        """
+        Test the construction of a CloudPostgresBackupExecutor
+        """
+        # GIVEN a server with the following configs
+        server = build_mocked_server(
+            main_conf={
+                "backup_compression": "none",
+                "cloud_staging_directory": "/tmp/barman",
+            }
+        )
+        mock_cloud_interface = mock.Mock()
+        server.get_backup_cloud_interface.return_value = mock_cloud_interface
+        # WHEN a CloudPostgresBackupExecutor is created
+        executor = CloudPostgresBackupExecutor(server.backup_manager)
+        # THEN a CloudPostgresBackupStrategy is created with the expected parameters
+        mock_strategy.assert_called_once_with(
+            executor.server.postgres, executor.config.name, executor.backup_compression
+        )
+        assert executor.strategy == mock_strategy.return_value
+        # AND the executor attributes are correctly set
+        assert executor._cloud_staging_dir == "/tmp/barman/123"
+        assert executor._pgdata_dest == "/tmp/barman/123/plain/data"
+        assert executor._tarball_dest == "/tmp/barman/123/tarballs"
+        assert executor._plain_dest == "/tmp/barman/123/plain"
+        assert executor._cloud_interface == mock_cloud_interface
+        assert executor._upload_controller is None
+        assert isinstance(executor._ready_queue, queue.Queue)
+
+    @patch("barman.backup_executor.os.kill")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_thread_wrapper(self, _, mock_kill):
+        """
+        Assert that ``_thread_wrapper`` correctly calls the target function with the
+        provided arguments and that if an exception is raised, the exception is stored
+        in ``_thread_exec`` and the event ``_thread_exec_event`` is set.
+        """
+        # GIVEN a CloudPostgresBackupExecutor instance
+        executor = CloudPostgresBackupExecutor(None)
+        executor._thread_exc = None
+        executor._thread_exc_event = mock.Mock(is_set=lambda: False)
+        executor._thread_exc_lock = mock.Mock(
+            __enter__=mock.Mock(), __exit__=mock.Mock()
+        )
+
+        # Case 1: WHEN _thread_wrapper is called with a target that executes successfully
+        target, args, kwargs = mock.Mock(), ("arg1", "arg2"), {"kwarg1": "value1"}
+        executor._thread_wrapper(target, *args, **kwargs)
+        # THEN the target function is called with the provided arguments
+        target.assert_called_once_with("arg1", "arg2", kwarg1="value1")
+
+        # Case 2: WHEN _thread_wrapper is called with a target that raises an exception
+        exception = Exception("Thread error")
+        target = mock.Mock(side_effect=exception)
+        executor._thread_wrapper(target)
+        # THEN the exception object is set in the executor using the lock
+        executor._thread_exc_lock.__enter__.assert_called_once()
+        executor._thread_exc = exception
+        executor._thread_exc_lock.__exit__.assert_called_once()
+        # AND the _thread_exc_event is set
+        executor._thread_exc_event.set.assert_called_once()
+
+    @patch("barman.backup_executor.threading.Thread")
+    @patch("barman.backup_executor.shutil")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor._prepare_backup_destination"
+    )
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._run_pg_basebackup")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._init_upload_controller")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._upload_ready_files")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._read_backup_label")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._save_backup_manifest")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._upload_backup_info")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_backup_copy(
+        self,
+        _,
+        mock_upload_backup_info,
+        mock_save_backup_manifest,
+        mock_read_backup_label,
+        mock_upload_ready_files,
+        mock_init_upload_controller,
+        mock_run_pg_basebackup,
+        mock_prepare_backup_destination,
+        mock_shutil,
+        mock_thread,
+    ):
+        """
+        Test that the ``backup_copy`` method performs all the expected steps
+        in the correct order to properly manage the backup copy process.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._cloud_staging_dir = "/tmp/barman"
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._tarball_dest = "/tmp/barman/tarballs"
+        executor._upload_controller = mock.Mock(statistics=lambda: {}, size=12345)
+        executor._cloud_interface = mock.Mock()
+        executor._thread_exc_event = mock.Mock(is_set=lambda: False)
+        # Mock the threads
+        mock_monitoring_thread, mock_fetching_thread = mock.Mock(), mock.Mock()
+        mock_thread.side_effect = [mock_monitoring_thread, mock_fetching_thread]
+        # WHEN backup_copy is called with a BackupInfo
+        backup_info = mock.Mock()
+        executor.backup_copy(backup_info)
+        # THEN the plain and tarballs destinations are prepared correctly
+        mock_prepare_backup_destination.assert_called_once_with(
+            ["/tmp/barman/plain", "/tmp/barman/tarballs"]
+        )
+        # AND pg_basebackup is started
+        mock_run_pg_basebackup.assert_called_once_with(backup_info)
+        pg_basebackup = mock_run_pg_basebackup.return_value
+        # AND monitoring of the staging area and fetching of ready files
+        # are started in their dedicated threads
+        mock_thread.assert_has_calls(
+            [
+                mock.call(
+                    target=executor._thread_wrapper,
+                    args=(
+                        executor._monitor_staging_area,
+                        pg_basebackup,
+                    ),
+                ),
+                mock.call(
+                    target=executor._thread_wrapper,
+                    args=(
+                        executor._fetch_ready_files,
+                        pg_basebackup,
+                    ),
+                ),
+            ]
+        )
+        mock_monitoring_thread.start.assert_called_once()
+        mock_fetching_thread.start.assert_called_once()
+        # AND the upload controller is initialized
+        mock_init_upload_controller.assert_called_once_with(backup_info)
+        # AND ready files upload is started
+        mock_upload_ready_files.assert_called_once()
+        # AND pg_basebackup termination is waited and threads joined
+        mock_run_pg_basebackup.return_value.wait_exit.assert_called_once()
+        mock_run_pg_basebackup.return_value.terminate.assert_not_called()
+        mock_monitoring_thread.join.assert_called_once()
+        mock_fetching_thread.join.assert_called_once()
+        # AND the cloud_interface and upload_controller are closed
+        executor._cloud_interface.close.assert_called_once()
+        executor._upload_controller.close.assert_called_once()
+        # AND the backup label is read and the backup info is uploaded
+        mock_read_backup_label.assert_called_once_with(backup_info)
+        mock_upload_backup_info.assert_called_once_with(backup_info)
+        # AND the cloud staging directory is removed
+        mock_shutil.rmtree.assert_called_once_with(
+            executor._cloud_staging_dir, ignore_errors=True
+        )
+        # AND time and size stats are saved
+        assert backup_info.copy_stats is not None
+        assert backup_info.copy_stats["total_time"] == total_seconds(
+            executor.copy_end_time - executor.copy_start_time
+        )
+        assert backup_info.set_attribute.call_args_list == [
+            mock.call("size", executor._upload_controller.size),
+            mock.call("deduplicated_size", executor._upload_controller.size),
+        ]
+
+    @patch("barman.backup_executor.threading.Thread")
+    @patch("barman.backup_executor.shutil")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor._prepare_backup_destination"
+    )
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._run_pg_basebackup")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._init_upload_controller")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._upload_ready_files")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._read_backup_label")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._save_backup_manifest")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._upload_backup_info")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_backup_copy_exception_is_present(
+        self,
+        _,
+        mock_upload_backup_info,
+        mock_save_backup_manifest,
+        mock_read_backup_label,
+        mock_upload_ready_files,
+        mock_init_upload_controller,
+        mock_run_pg_basebackup,
+        mock_prepare_backup_destination,
+        mock_shutil,
+        mock_thread,
+    ):
+        """
+        Test that if an exception is set in the executor during the backup copy
+        process, it is re-raised by the method.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._cloud_staging_dir = "/tmp/barman"
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._tarball_dest = "/tmp/barman/tarballs"
+        executor._upload_controller = mock.Mock(statistics=lambda: {}, size=12345)
+        executor._cloud_interface = mock.Mock()
+        executor._thread_exc_event = mock.Mock(is_set=lambda: True)
+        executor._thread_exc = ValueError("Test exception")
+        # Mock the threads
+        mock_monitoring_thread, mock_fetching_thread = mock.Mock(), mock.Mock()
+        mock_thread.side_effect = [mock_monitoring_thread, mock_fetching_thread]
+        # WHEN backup_copy is called with a BackupInfo
+        # THEN the exception set in the executor is raised
+        backup_info = mock.Mock()
+        with pytest.raises(ValueError):
+            executor.backup_copy(backup_info)
+        # AND pg_basebackup termination is waited and threads joined
+        mock_run_pg_basebackup.return_value.terminate.assert_called_once()
+        mock_monitoring_thread.join.assert_called_once()
+        mock_fetching_thread.join.assert_called_once()
+
+    @patch("barman.cloud.CloudUploadController")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_init_upload_controller(self, _, mock_upload_controller):
+        """
+        Test that the upload controller is correctly initialized with
+        the expected parameters.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._tarball_dest = "/tmp/barman/tarballs"
+        executor.config = mock.Mock(
+            bandwidth_limit=None,
+            cloud_upload_max_archive_size=100 * 1024 * 1024 * 1024,  # 100GiB
+            cloud_upload_min_chunk_size=5 * 1024 * 1024,  # 5MiB
+        )
+        executor.config.name = "test_server"
+        executor._cloud_interface = mock.Mock(path="/my-bucket/backups")
+        # WHEN _init_upload_controller is called with a BackupInfo
+        key_prefix = "/my-bucket/backups/test_server/base/fake_backup_id"
+        backup_info = mock.Mock(
+            backup_id="fake_backup_id",
+            get_basebackup_directory=lambda: key_prefix,
+        )
+        executor._init_upload_controller(backup_info)
+        # THEN a CloudUploadController is created with the expected parameters
+        mock_upload_controller.assert_called_once_with(
+            cloud_interface=executor._cloud_interface,
+            max_archive_size=100 * 1024 * 1024 * 1024,  # 100GiB
+            key_prefix=key_prefix,
+            compression=None,
+            min_chunk_size=5 * 1024 * 1024,  # 5MiB
+            max_bandwidth=None,
+            staging_dir=executor._tarball_dest,
+        )
+        # AND the executor's _upload_controller attribute is set
+        assert executor._upload_controller == mock_upload_controller.return_value
+
+    @patch("barman.cloud.CloudUploadController")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_init_upload_controller_with_bandwidth_limit(
+        self, _, mock_upload_controller
+    ):
+        """
+        Test that the upload controller correctly converts and applies bandwidth_limit.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with bandwidth_limit set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._tarball_dest = "/tmp/barman/tarballs"
+        executor.config = mock.Mock(
+            bandwidth_limit=512,  # 512 kB/s
+            cloud_upload_max_archive_size=100 * 1024 * 1024 * 1024,  # 100GiB
+            cloud_upload_min_chunk_size=5 * 1024 * 1024,  # 5MiB
+        )
+        executor.config.name = "test_server"
+        executor._cloud_interface = mock.Mock(path="/my-bucket/backups")
+        # WHEN _init_upload_controller is called with a BackupInfo
+        key_prefix = "/my-bucket/backups/test_server/base/fake_backup_id"
+        backup_info = mock.Mock(
+            backup_id="fake_backup_id", get_basebackup_directory=lambda: key_prefix
+        )
+        executor._init_upload_controller(backup_info)
+        # THEN a CloudUploadController is created with converted bandwidth_limit (512 kB/s → 512000 B/s)
+        mock_upload_controller.assert_called_once_with(
+            cloud_interface=executor._cloud_interface,
+            key_prefix=key_prefix,
+            max_archive_size=100 * 1024 * 1024 * 1024,  # 100GiB
+            compression=None,
+            min_chunk_size=5 * 1024 * 1024,  # 5MiB
+            max_bandwidth=512000,  # 512 kB/s converted to 512000 B/s
+            staging_dir=executor._tarball_dest,
+        )
+        # AND the executor's _upload_controller attribute is set
+        assert executor._upload_controller == mock_upload_controller.return_value
+
+    @patch("barman.backup_executor.open")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_read_backup_label(self, _, mock_open):
+        """
+        Test that the backup label is read from the expected path and
+        its content set in the BackupInfo.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        # WHEN _read_backup_label is called
+        backup_info = mock.Mock()
+        executor._read_backup_label(backup_info)
+        # THEN the backup_label file is opened in the expected path
+        mock_open.assert_called_once_with("/tmp/barman/plain/data/backup_label", "r")
+        # AND the contents are read and set in the BackupInfo
+        backup_info.set_attribute.assert_called_once_with(
+            "backup_label",
+            mock_open.return_value.__enter__.return_value.read.return_value,
+        )
+
+    @patch("barman.backup_executor.shutil.copy2")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_save_backup_manifest(self, _, mock_copy2):
+        """
+        Test that the backup manifest is saved to the expected path.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor.server = mock.Mock(meta_directory="/path/to/meta")
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        # WHEN _save_backup_manifest is called with a BackupInfo
+        backup_info = mock.Mock(backup_id="fake_backup_id")
+        executor._save_backup_manifest(backup_info)
+        # THEN the backup manifest is saved to the expected path
+        mock_copy2.assert_called_once_with(
+            "/tmp/barman/plain/data/backup_manifest",
+            "/path/to/meta/fake_backup_id-backup_manifest",
+        )
+
+    @patch("barman.backup_executor.BytesIO")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_upload_backup_info(self, _, mock_bytes_io):
+        """
+        Test that the backup info is uploaded to the expected cloud path.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._cloud_interface = mock.Mock()
+        executor._upload_controller = mock.Mock(
+            key_prefix="my-bucket/backups/test_server/base/fake_backup_id"
+        )
+        # WHEN _upload_backup_info is called with a BackupInfo
+        backup_info = mock.Mock()
+        executor._upload_backup_info(backup_info)
+        # THEN the backup info is saved to a BytesIO object
+        backup_info.save(file_obj=mock_bytes_io.return_value.__enter__.return_value)
+        # AND the BytesIO object is uploaded to the expected cloud path
+        mock_bytes_io.return_value.__enter__.return_value.seek.assert_called_once_with(
+            0
+        )
+        executor._cloud_interface.upload_fileobj.assert_called_once_with(
+            mock_bytes_io.return_value.__enter__.return_value,
+            "my-bucket/backups/test_server/base/fake_backup_id/backup.info",
+        )
+
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._wait_copy_start")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.get_remote_status",
+        return_value={
+            "pg_basebackup_path": "/usr/pgsql-17/bin/pg_basebackup",
+            "pg_basebackup_version": "17",
+        },
+    )
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_bandwidth_limit")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_tablespace_mapping")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor._get_parent_backup_manifest_path"
+    )
+    @patch("barman.backup_executor.PgBaseBackup")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_run_pg_basebackup(
+        self,
+        mock_init,
+        mock_pg_basebackup,
+        mock_get_parent_manifest,
+        mock_get_tablespace_mapping,
+        mock_get_bandwidth_limit,
+        mock_get_remote_status,
+        mock_wait_copy_start,
+    ):
+        """
+        Test that :class:`PgBaseBackup` is correctly initialized and run.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        pgdata_dest = "/tmp/barman/plain/data"
+        executor._pgdata_dest = pgdata_dest
+        server_path, streaming_conn = "/fake/server/path", mock.Mock()
+        executor.server = mock.Mock(path=server_path, streaming=streaming_conn)
+        executor.config = mock.Mock(
+            backup_compression=None,
+            cloud_staging_directory="/tmp/barman",
+            streaming_backup_name="barman_cloud_postgres_backup",
+            immediate_checkpoint=True,
+        )
+        # WHEN _run_pg_basebackup is called with a test BackupInfo
+        backup_info = build_test_backup_info()
+        result = executor._run_pg_basebackup(backup_info)
+        # THEN it returns a PgBaseBackup instance
+        assert result == mock_pg_basebackup.return_value
+        # AND PgBaseBackup was initialized with the expected parameters
+        mock_pg_basebackup.assert_called_once_with(
+            wait=False,
+            connection=streaming_conn,
+            destination=pgdata_dest,
+            command="/usr/pgsql-17/bin/pg_basebackup",
+            version="17",
+            app_name="barman_cloud_postgres_backup",
+            no_sync=True,
+            tbs_mapping=mock_get_tablespace_mapping.return_value,
+            bwlimit=mock_get_bandwidth_limit.return_value,
+            immediate=True,
+            path=server_path,
+            parent_backup_manifest_path=mock_get_parent_manifest.return_value,
+        )
+        # AND the instance of PgBaseBackup was actually run
+        mock_pg_basebackup.return_value.assert_called_once()
+        # AND the copy start was waited for before returning
+        mock_wait_copy_start.assert_called_once_with(mock_pg_basebackup.return_value)
+
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor.get_remote_status")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_bandwidth_limit")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_tablespace_mapping")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor._get_parent_backup_manifest_path"
+    )
+    @patch("barman.backup_executor.DataTransferFailure", wraps=DataTransferFailure)
+    @patch("barman.backup_executor.PgBaseBackup")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_run_pg_basebackup_fails(
+        self,
+        mock_init,
+        mock_pg_basebackup,
+        mock_data_transfer_failure,
+        mock_get_parent_manifest,
+        mock_get_tablespace_mapping,
+        mock_get_bandwidth_limit,
+        mock_get_remote_status,
+    ):
+        """
+        Test that failures in :class:`PgBaseBackup` are correctly handled and wrapped
+        into a :exec:`DataTransferFailure`.
+        """
+        # GIVEN a CloudPostgresBackupExecutor
+        executor = CloudPostgresBackupExecutor(None)
+        # Prepare the relevant executor attributes. Since we are testing failure
+        # handling, the actual values do not matter here as the call is not checked
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        executor.config, executor.server = mock.Mock(), mock.Mock()
+        # Mock PgBaseBackup to raise a CommandFailedException when called
+        exception = CommandFailedException("Failure!")
+        mock_pg_basebackup.return_value.side_effect = exception
+        # WHEN _run_pg_basebackup is called
+        # THEN it raises a DataTransferFailure exception
+        with pytest.raises(DataTransferFailure):
+            backup_info = build_test_backup_info()
+            executor._run_pg_basebackup(backup_info)
+        # AND PgBaseBackup was initialized (again the actual parameters do not matter here)
+        mock_pg_basebackup.assert_called_once()
+        # AND the DataTransferFailure was raised by calling from_command_error with the
+        # expected parameters
+        mock_data_transfer_failure.from_command_error.assert_called_once_with(
+            "pg_basebackup",
+            exception,
+            ("data transfer failure on directory '%s'" % executor._pgdata_dest),
+        )
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_tablespace_mapping(self, _):
+        """
+        Test that tablespaces are correctly mapped inside the staging directory.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._cloud_staging_dir = "/tmp/barman"
+        executor.server = mock.Mock()
+        # AND a BackupInfo with tablespaces
+        backup_info = build_test_backup_info(
+            tablespaces=(
+                ("tbs1", 16387, "/fake/location"),
+                ("tbs2", 16405, "/another/location"),
+            )
+        )
+        # WHEN _get_tablespace_mapping is called
+        result = executor._get_tablespace_mapping(backup_info)
+        # THEN tablespaces are mapped to the staging dir inside the plain subdir
+        assert result == {
+            "/fake/location": "/tmp/barman/plain/16387",
+            "/another/location": "/tmp/barman/plain/16405",
+        }
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_parent_backup_manifest_path_with_parent(self, _):
+        """
+        Test that the parent backup's manifest path is correctly retrieved
+        when a parent backup exists.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor.server = mock.Mock(meta_directory="/path/to/meta")
+        # AND a backup_info that HAS a parent
+        mock_parent_info = mock.Mock(backup_id="20260112T114307")
+        backup_info = mock.Mock(
+            get_parent_backup_info=mock.Mock(return_value=mock_parent_info)
+        )
+        # WHEN _get_parent_backup_manifest_path is called
+        result = executor._get_parent_backup_manifest_path(backup_info)
+        # THEN it returns the expected manifest path
+        assert result == "/path/to/meta/20260112T114307-backup_manifest"
+        # AND the correct calls were made
+        backup_info.get_parent_backup_info.assert_called_once()
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_parent_backup_manifest_path_without_parent(self, _):
+        """
+        Test that ``None`` is returned when there is no parent backup.
+        """
+        # GIVEN a CloudPostgresBackupExecutor
+        executor = CloudPostgresBackupExecutor(None)
+        # AND a backup_info that HAS NO parent
+        backup_info = mock.Mock(get_parent_backup_info=mock.Mock(return_value=None))
+        # WHEN _get_parent_backup_manifest_path is called
+        result = executor._get_parent_backup_manifest_path(backup_info)
+        # THEN it returns the expected manifest path
+        assert result is None
+        # Assert the correct calsl were made
+        backup_info.get_parent_backup_info.assert_called_once()
+
+    @patch("barman.backup_executor.os.walk")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_wait_copy_start_raises_exception(self, _, mock_walk):
+        """
+        Test that ``_wait_copy_start`` correctly raises an exception when
+        ``pg_basebackup`` finishes without copying any files.
+        """
+        # Mock pg_basebackup object to simulate it errored during spawning
+        pg_basebackup = mock.Mock(
+            get_returncode=lambda: 1,
+            get_stderr=lambda: "a super bad thing just happened!",
+        )
+        # Simulate the plain staging directory created but no files present yet
+        plain_dest = "/tmp/barman/cloud-staging/34234/plain"
+        mock_walk.return_value = [(plain_dest, [], [])]
+        # GIVEN a CloudPostgresBackupExecutor
+        executor = CloudPostgresBackupExecutor(None)
+        executor._plain_dest = plain_dest
+        # WHEN _wait_copy_start is called with the mocked pg_basebackup
+        # THEN it raises DataTransferFailure as pg_basebackup finished without any copy
+        with pytest.raises(DataTransferFailure) as exc_info:
+            executor._wait_copy_start(pg_basebackup)
+        assert str(exc_info.value) == (
+            "pg_basebackup process failed to start (return code 1): "
+            "a super bad thing just happened!"
+        )
+
+    @patch("barman.backup_executor.os.walk")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_wait_copy_start_no_exception_raised(self, _, mock_walk):
+        """
+        Test that ``_wait_copy_start`` correctly returns when ``pg_basebackup`` started
+        copying files to the staging directory.
+        """
+        # Mock pg_basebackup object to simulate it still running
+        pg_basebackup = mock.Mock(get_returncode=lambda: None, get_stderr=lambda: None)
+        # Simulate the plain staging directory created and files already present
+        plain_dest = "/tmp/barman/cloud-staging/34234/plain"
+        mock_walk.return_value = [(plain_dest, [], ["data/file1", "data/file2"])]
+        # GIVEN a CloudPostgresBackupExecutor
+        executor = CloudPostgresBackupExecutor(None)
+        executor._plain_dest = plain_dest
+        # WHEN _wait_copy_start is called with the mocked pg_basebackup
+        # THEN it returns without raising an exception
+        executor._wait_copy_start(pg_basebackup)
+
+    @patch("barman.backup_executor.get_directory_size")
+    @patch("barman.backup_executor.os.path.isdir", return_value=True)
+    @patch("barman.backup_executor.time.sleep")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_monitor_staging_area(self, _, mock_sleep, mock_isdir, mock_get_dir_size):
+        """
+        Test that ``_monitor_staging_area`` correctly pauses and resumes the backup
+        according the threshold configured and the current directory size.
+        """
+        # Mock get_directory_size to simulate directory size increasing and decreasing
+        mock_get_dir_size.side_effect = [
+            35 * 1024 * 1024 * 1024,  # 35 GB
+            40 * 1024 * 1024 * 1024,  # 40 GB
+            25 * 1024 * 1024 * 1024,  # 25 GB
+        ]
+        # Mock the backup process to simulate it running then ending so that
+        # the monitoring loop does not run indefinitely
+        pg_basebackup = mock.Mock()
+        pg_basebackup.is_running.side_effect = [True, True, True, False]
+
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor.config = mock.Mock(
+            cloud_staging_max_size=30 * 1024 * 1024 * 1024  # 30 GB as threashold
+        )
+        executor._cloud_staging_dir = "/tmp/barman"
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._thread_exc_event = mock.Mock(is_set=lambda: False)
+        # WHEN _monitor_staging_area is called
+        executor._monitor_staging_area(pg_basebackup)
+        # THEN the process is paused twice (as the first two sizes are above threshold)
+        # and resumed once (as the third size is below threshold)
+        pg_basebackup.pause.call_count == 2
+        pg_basebackup.resume.call_count == 1
+        # AND os.path.isdir, get_directory_size and time.sleep were called as expected
+        mock_isdir.assert_has_calls([mock.call("/tmp/barman/plain")] * 3)
+        mock_get_dir_size.assert_has_calls([mock.call("/tmp/barman")] * 3)
+        mock_sleep.assert_has_calls([mock.call(1)] * 3)
+
+    @patch("barman.backup_executor.os.path.isdir", return_value=False)
+    @patch("barman.backup_executor.time.sleep")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_monitor_staging_area_not_created_yet(self, _, mock_sleep, mock_isdir):
+        """
+        Test that ``_monitor_staging_area`` correctly handles the case where
+        the staging directory does not yet exist. It should wait until the
+        directory is created, sleeping between checks.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor.config = mock.Mock(
+            cloud_staging_max_size=30 * 1024 * 1024 * 1024  # 30 GB
+        )
+        executor._cloud_staging_dir = "/tmp/barman"
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._thread_exc_event = mock.Mock(is_set=lambda: False)
+        # Mock the backup process to simulate it running then ending so that
+        # the monitoring loop does not run indefinitely
+        pg_basebackup = mock.Mock()
+        pg_basebackup.is_running.side_effect = [True, True, False]
+        # WHEN _monitor_staging_area is called
+        executor._monitor_staging_area(pg_basebackup)
+        # THEN os.path.isdir AND time.sleep are called as expected, meaning that
+        # the method kept checking for the directory to be created until the
+        # backup process ended
+        mock_isdir.assert_has_calls([mock.call("/tmp/barman/plain")] * 2)
+        mock_sleep.assert_has_calls([mock.call(1)] * 2)
+
+    @patch("barman.backup_executor._logger")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_monitor_staging_area_exception_is_present(self, _, mock_logger):
+        """
+        Test that ``_monitor_staging_area`` correctly exits when an exception is set
+        in the executor, meaning that the backup copy process will be stopped.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._thread_exc_event = mock.Mock(is_set=lambda: True)
+        # WHEN _monitor_staging_area is called
+        pg_basebackup = mock.Mock()
+        executor._monitor_staging_area(pg_basebackup)
+        # THEN it returns without doing anything
+        # By asserting that the logger was called only once with the thread error
+        # message we ensure that the method exited right after checking the event
+        mock_logger.debug.assert_called_once_with(
+            "An error occurred in another thread, exiting monitoring thread"
+        )
+
+    @patch("barman.backup_executor.time.sleep")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_files_from_dir")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_open_files")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._is_last_file")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._ignore_file")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_fetch_ready_files(
+        self,
+        _,
+        mock_ignore_file,
+        mock_is_last_file,
+        mock_get_open_files,
+        mock_get_files,
+        mock_sleep,
+    ):
+        """
+        Test that ``_fetch_ready_files`` correctly populates the ready queue
+        with the correct files and in the correct order.
+        """
+        # Mock the following files being in the staging directory
+        mock_get_files.return_value = [
+            "/tmp/barman/plain/data/base/4/2658",
+            "/tmp/barman/plain/data/base/4/2672",
+            "/tmp/barman/plain/data/log/postgresql-Sat.log",
+            "/tmp/barman/plain/39484/PG_17_2024/5/271",
+            "/tmp/barman/plain/data/postgresql.conf",
+        ]
+        # Mock that only the following file is still open by pg_basebackup
+        mock_get_open_files.return_value = ["/tmp/barman/plain/data/base/4/2672"]
+        # Mock that postgresql.conf should be fetched lastly
+        # and postgresql-Sat.log should be ignored
+        mock_is_last_file.side_effect = lambda f: f.endswith("postgresql.conf")
+        mock_ignore_file.side_effect = lambda f: f.endswith("postgresql-Sat.log")
+        # Mock the backup process to simulate it running then ending so that
+        # the fetch loop does not run indefinitely
+        pg_basebackup = mock.Mock()
+        pg_basebackup.is_running.side_effect = [True, True, False]
+        pg_basebackup.pid = 12345
+
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._ready_queue = queue.SimpleQueue()
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._thread_exc_event = mock.Mock(is_set=lambda: False)
+        # WHEN _fetch_ready_files is called
+        executor._fetch_ready_files(pg_basebackup)
+        # THEN the ready queue contains the expected files in the expected order
+        # First the files that are neither open nor last files
+        assert executor._ready_queue.get() == "/tmp/barman/plain/data/base/4/2658"
+        assert executor._ready_queue.get() == "/tmp/barman/plain/39484/PG_17_2024/5/271"
+        # The below file was open during the fetching, so it appears later in the queue
+        assert executor._ready_queue.get() == "/tmp/barman/plain/data/base/4/2672"
+        # The below file was marked as last file so it appears at the end of the queue
+        assert executor._ready_queue.get() == "/tmp/barman/plain/data/postgresql.conf"
+        assert executor._ready_queue.get() is None  # End marker
+        assert executor._ready_queue.empty()
+        # AND also assert that the relevant methods were called as expected
+        mock_get_files.assert_has_calls([mock.call("/tmp/barman/plain")] * 3)
+        mock_get_open_files.assert_has_calls([mock.call(pg_basebackup)] * 3)
+        mock_ignore_file.assert_called()
+        mock_is_last_file.assert_called()
+        mock_sleep.assert_has_calls([mock.call(1)] * 2)
+
+    @patch("barman.backup_executor._logger")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_fetch_ready_files_exception_is_present(self, _, mock_logger):
+        """
+        Test that ``_fetch_ready_files`` correctly exits when an exception is set
+        in the executor, meaning that the backup copy process will be stopped.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._thread_exc_event = mock.Mock(is_set=lambda: True)
+        # WHEN _fetch_ready_files is called
+        pg_basebackup = mock.Mock()
+        executor._fetch_ready_files(pg_basebackup)
+        # THEN it returns without doing anything
+        # By asserting the logger only has no calls after the thread error message
+        # we ensure that the method exited right after checking the event
+        mock_logger.debug.assert_has_calls(
+            [
+                mock.call("Starting to fetch ready files from /tmp/barman/plain"),
+                mock.call(
+                    "An error occurred in another thread, exiting fetching thread"
+                ),
+            ]
+        )
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_files_from_dir(self, _, tmpdir):
+        """
+        Test that ``_get_files_from_dir`` correctly retrieves all files
+        from the given directory and its subdirectories.
+        """
+        # Create a test directory structure with the following files:
+        # /data/base/4/2658
+        # /data/base/4/2672
+        # /data/log/postgresql-Sat.log
+        # /39484/PG_17_2024/5/271
+        data_dir = tmpdir.mkdir("data")
+        base_dir = data_dir.mkdir("base").mkdir("4")
+        base_dir.join("2658").write("")
+        base_dir.join("2672").write("")
+        data_dir.mkdir("log").join("postgresql-Sat.log").write("")
+        tmpdir.mkdir("39484").mkdir("PG_17_2024").mkdir("5").join("271").write("")
+
+        # GIVEN a CloudPostgresBackupExecutor
+        executor = CloudPostgresBackupExecutor(None)
+        result = executor._get_files_from_dir(str(tmpdir))
+        # THEN it returns the expected list of files
+        assert sorted(result) == sorted(
+            [
+                str(tmpdir.join("data/base/4/2658")),
+                str(tmpdir.join("data/base/4/2672")),
+                str(tmpdir.join("data/log/postgresql-Sat.log")),
+                str(tmpdir.join("39484/PG_17_2024/5/271")),
+            ]
+        )
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_open_files(self, _, tmpdir):
+        """
+        Test that ``_get_open_files`` correctly retrieves the list of open files
+        for the given ``pg_basebackup`` process, filtering only those that are inside
+        the plain directory and ignoring the rest.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        staging_dir = tmpdir.mkdir("staging")
+        plain_dir = staging_dir.mkdir("plain")
+        executor._plain_dest = str(plain_dir)
+        # Override the _FILE_DESCRIPTORS_DIRECTORY so we don't write to the actual /proc
+        executor._FILE_DESCRIPTORS_DIRECTORY = str(tmpdir) + "/{pid}/fd"
+
+        # Simulate a file descriptor directory with the following structure:
+        # /123/fd/1 (stdout)
+        # /123/fd/2 (stderr)
+        # /123/fd/40 -> symlink to /staging/plain/data/base/4/2672 (open file inside plain_dir)
+        # /123/fd/45 -> symlink to /other/file (open file outside plain_dir)
+        fd_dir = tmpdir.mkdir("123").mkdir("fd")
+        fd_dir.join("1").write("")  # stdout
+        fd_dir.join("2").write("")  # stderr
+
+        # File INSIFE plain_dir: /staging/plain/data/base/4/2672
+        segment_file = plain_dir.join("data/base/4/2672")
+        segment_file.ensure()  # Create the actual file/path
+        fd_40 = fd_dir.join("40")
+        fd_40.mksymlinkto(str(segment_file))  # Symlink from fd/40 to the target file
+
+        # File OUTSIDE plain_dir
+        other_file = tmpdir.join("other/file")
+        other_file.ensure()
+        fd_45 = fd_dir.join("45")
+        fd_45.mksymlinkto(str(other_file))  # Symlink from fd/45 to the other/ile
+
+        # WHEN _get_open_files is called with a mock pg_basebackup process
+        pg_basebackup = mock.Mock(pid=123, is_running=lambda: True)
+        result = executor._get_open_files(pg_basebackup)
+
+        # THEN it returns only the file inside plain_dir and ignores the one outside
+        assert result == [str(segment_file)]
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_open_files_process_exited_midway(self, _, tmp_path):
+        """
+        Test that ``_get_open_files`` correctly handles the case where the
+        ``pg_basebackup`` process exits midway through the retrieval of open files,
+        which leads to it returning an empty list.
+        """
+        # GIVEN a CloudPostgresBackupExecutor instance with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._FILE_DESCRIPTORS_DIRECTORY = str(tmp_path) + "/{pid}/fd"
+        pg_basebackup = mock.Mock(pid=999, is_running=lambda: True)  # Non-existent PID
+
+        # WHEN _get_open_files is called
+        result = executor._get_open_files(pg_basebackup)
+        # THEN it returns an empty list and does not raise an exception
+        assert result == []
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_open_files_process_not_running(self, _):
+        """
+        Test that ``_get_open_files`` correctly handles the case where the
+        ``pg_basebackup`` process is not running, which leads to it returning
+        an empty list.
+        """
+        # GIVEN a CloudPostgresBackupExecutor instance with relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        pg_basebackup = mock.Mock(
+            pid=123, is_running=lambda: False
+        )  # Process not running
+
+        # WHEN _get_open_files is called
+        result = executor._get_open_files(pg_basebackup)
+        # THEN it returns an empty list without attempting to read file descriptors
+        assert result == []
+
+    @patch("barman.backup_executor.path_allowed", return_value=False)
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_ignore_file(self, _, mock_path_allowed):
+        """
+        Test that ``_ignore_file`` correctly determines whether a file
+        should be ignored based on the exclude lists.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        # WHEN _ignore_file is called with a test file path
+        result = executor._ignore_file("/tmp/barman/plain/data/log/postgresql-Sat.log")
+        # THEN path_allowed is called with the correct parameters
+        mock_path_allowed.assert_called_once_with(
+            EXCLUDE_LIST + PGDATA_EXCLUDE_LIST, None, "log/postgresql-Sat.log", False
+        )
+        # AND the result is the opposite boolean of whatever path_allowed returned
+        assert result == (not mock_path_allowed.return_value)
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_is_last_file(self, _):
+        """
+        Test that ``_is_last_file`` correctly identifies files that should be
+        uploaded lastly, such files are defined in
+        ``CloudPostgresBackupExecutor.LAST_FILE_LIST``.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        # WHEN _is_last_file is called with a path to postgresql.conf
+        result = executor._is_last_file("/tmp/barman/plain/data/postgresql.conf")
+        # THEN the result is True as .conf files are in the last file list
+        assert result is True
+        # AND WHEN _is_last_file is called with a path to a regular data file
+        result = executor._is_last_file("/tmp/barman/plain/data/base/4/2658")
+        # THEN the result is False
+        assert result is False
+
+    @patch("barman.backup_executor.os.listdir")
+    @patch("barman.backup_executor.os.unlink")
+    @patch("barman.backup_executor.CloudPostgresBackupExecutor._get_tarball_name")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_upload_ready_files(
+        self, _, mock_get_tarball_name, mock_unlink, mock_listdir
+    ):
+        """
+        Test that ``_upload_ready_files`` correctly uploads files from the ready queue
+        using the upload controller, and unlinks them afterwards (except for backup_label).
+        Also assert that directories are uploaded to handle empty directories,
+        and that pg_control is uploaded at the end.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        executor._upload_controller = mock.Mock()
+        executor._ready_queue = queue.SimpleQueue()
+        executor._thread_exc_event = mock.Mock(is_set=lambda: False)
+        # Mock the ready queue to contain the following files
+        executor._ready_queue.put("/tmp/barman/plain/data/base/4/2658")
+        executor._ready_queue.put("/tmp/barman/plain/data/base/4/2672")
+        executor._ready_queue.put(
+            "/tmp/barman/plain/data/backup_label"
+        )  # should not be removed
+        executor._ready_queue.put("/tmp/barman/plain/2024/PG_17_2024/5/271")
+        executor._ready_queue.put(None)  # End marker
+        # Mock listdir to return the data and 2024 subdirs when called on plain dest
+        mock_listdir.return_value = ["data", "2024"]
+        # Mock get_tarball_name to return the tarball name respective to the above files
+        mock_get_tarball_name.side_effect = [
+            "data",  # when called for /tmp/barman/plain/data/base/4/2658
+            "data",  # when called for /tmp/barman/plain/data/base/4/2672
+            "data",  # when called for /tmp/barman/plain/data/backup_label
+            "2024",  # when called for /tmp/barman/plain/2024/PG_17_2024/5/271
+            "data",  # when called for the subdir /tmp/barman/plain/data
+            "2024",  # when called for the subdir /tmp/barman/plain/2024
+        ]
+        # WHEN _upload_ready_files is called
+        executor._upload_ready_files()
+        # THEN each file is uploaded correctly by using the upload controller add_file
+        executor._upload_controller.add_file.assert_has_calls(
+            [
+                mock.call(
+                    label="2658",
+                    src="/tmp/barman/plain/data/base/4/2658",
+                    dst="data",
+                    path="base/4/2658",
+                ),
+                mock.call(
+                    label="2672",
+                    src="/tmp/barman/plain/data/base/4/2672",
+                    dst="data",
+                    path="base/4/2672",
+                ),
+                mock.call(
+                    label="backup_label",
+                    src="/tmp/barman/plain/data/backup_label",
+                    dst="data",
+                    path="backup_label",
+                ),
+                mock.call(
+                    label="271",
+                    src="/tmp/barman/plain/2024/PG_17_2024/5/271",
+                    dst="2024",
+                    path="PG_17_2024/5/271",
+                ),
+            ]
+        )
+        # AND all uploaded files are unlinked, except the backup_label
+        mock_unlink.assert_has_calls(
+            [
+                mock.call("/tmp/barman/plain/data/base/4/2658"),
+                mock.call("/tmp/barman/plain/data/base/4/2672"),
+                mock.call("/tmp/barman/plain/2024/PG_17_2024/5/271"),
+            ]
+        )
+        # AND the data and tablespaces directories are uploaded so that empty dirs are handled
+        executor._upload_controller.upload_directory.assert_has_calls(
+            [
+                mock.call(
+                    label="data",
+                    src="/tmp/barman/plain/data",
+                    dst="data",
+                    exclude=EXCLUDE_LIST + PGDATA_EXCLUDE_LIST,
+                ),
+                mock.call(
+                    label="2024",
+                    src="/tmp/barman/plain/2024",
+                    dst="2024",
+                    exclude=EXCLUDE_LIST + PGDATA_EXCLUDE_LIST,
+                ),
+            ]
+        )
+        # AND lastly, pg_control is uploaded
+        executor._upload_controller.add_file.assert_called_with(
+            label="pg_control",
+            src="/tmp/barman/plain/data/global/pg_control",
+            dst="data",
+            path="global/pg_control",
+        )
+
+    @patch("barman.backup_executor._logger")
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_upload_ready_files_exception_is_present(self, _, mock_logger):
+        """
+        Test that ``_upload_ready_files`` correctly exits when an exception is set
+        in the executor, meaning that the backup copy process will be stopped.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._thread_exc_event = mock.Mock(is_set=lambda: True)
+        # WHEN _upload_ready_files is called
+        executor._upload_ready_files()
+        # THEN it returns without doing anything
+        # By asserting that the logger was called only once with the expected message,
+        # we ensure that the method exited right after checking the event
+        mock_logger.debug.assert_called_once_with(
+            "An error occurred in a thread, stopping upload of ready files"
+        )
+
+    @patch(
+        "barman.backup_executor.CloudPostgresBackupExecutor.__init__", return_value=None
+    )
+    def test_get_tarball_name(self, _):
+        """
+        Test that ``_get_tarball_name`` correctly determines the tarball name
+        for data files and tablespace files. It should return "data" for files
+        within the pgdata directory, and the tablespace OID for files within
+        tablespace directories.
+        """
+        # GIVEN a CloudPostgresBackupExecutor with all relevant attributes set
+        executor = CloudPostgresBackupExecutor(None)
+        executor._plain_dest = "/tmp/barman/plain"
+        executor._pgdata_dest = "/tmp/barman/plain/data"
+        # WHEN _get_tarball_name is called with a data file path
+        data_file = "/tmp/barman/plain/data/base/4/2658"
+        # THEN it returns "data"
+        assert executor._get_tarball_name(data_file) == "data"
+        # WHEN _get_tarball_name is called with a tablespace file path
+        tablespace_file = "/tmp/barman/plain/39484/PG_17_2024/5/271"
+        # THEN it returns the tablespace its OID
+        assert executor._get_tarball_name(tablespace_file) == "39484"
+
+
+class TestGetBandwidthLimitInBytes(object):
+    """
+    Tests for the _get_bandwidth_limit_in_bytes helper function.
+    """
+
+    @pytest.mark.parametrize(
+        "input_kb, expected_bytes",
+        [
+            (None, None),  # Returns None when input is None
+            (100, 100000),  # Converts 100 kB/s to 100000 B/s
+            (1024, 1024000),  # Converts 1024 kB/s to 1024000 B/s
+            (1000000000, 1000000000000),  # Handles large values correctly
+        ],
+    )
+    def test_bandwidth_limit_conversion(self, input_kb, expected_bytes):
+        """
+        Test that _get_bandwidth_limit_in_bytes correctly converts kB/s to B/s
+        """
+        # WHEN _get_bandwidth_limit_in_bytes is called
+        result = _get_bandwidth_limit_in_bytes(input_kb)
+
+        # THEN it returns the expected result
+        assert result == expected_bytes
+
+
+class TestCloudBackupExecutor(object):
+    """
+    Tests for the CloudBackupExecutor class.
+    """
+
+    @patch("barman.backup_executor.ConcurrentBackupStrategy")
+    def test__init__(self, mock_strategy):
+        """
+        Test the construction of a CloudBackupExecutor
+        """
+        # GIVEN a server with cloud configuration
+        server = build_mocked_server(
+            main_conf={
+                "backup_method": "local-to-cloud",
+                "basebackups_directory": "s3://bucket/path",
+            }
+        )
+        # Set the strategy mode to None for testing
+        mock_strategy.return_value.mode = None
+        # WHEN a CloudBackupExecutor is created
+        executor = CloudBackupExecutor(server.backup_manager)
+        # THEN a ConcurrentBackupStrategy is created
+        mock_strategy.assert_called_once_with(
+            executor.server.postgres, executor.config.name
+        )
+        assert executor.strategy == mock_strategy.return_value
+        # AND the executor mode is set to "local-to-cloud"
+        assert executor.mode == "local-to-cloud"
+
+    @patch("barman.cloud.CloudBackupUploader")
+    @patch("barman.backup_executor.CloudBackupExecutor.__init__", return_value=None)
+    def test_backup(self, _, mock_uploader_class):
+        """
+        Test that the backup method properly delegates to CloudBackupUploader
+        """
+        # GIVEN a CloudBackupExecutor with necessary attributes
+        executor = CloudBackupExecutor(None)
+        executor.server = mock.Mock()
+        mock_config = mock.Mock()
+        mock_config.name = "test_server"
+        mock_config.cloud_upload_max_archive_size = 100 * 1024 * 1024 * 1024  # 100 GiB
+        mock_config.cloud_upload_min_chunk_size = 5 * 1024 * 1024  # 5 MiB
+        mock_config.bandwidth_limit = None
+        executor.config = mock_config
+
+        # Mock the postgres connection and cloud interface
+        mock_postgres = mock.Mock()
+        mock_cloud_interface = mock.Mock()
+        executor.server.postgres = mock_postgres
+        executor.server.get_backup_cloud_interface.return_value = mock_cloud_interface
+
+        # Mock the uploader instance
+        mock_uploader = mock.Mock()
+        mock_uploader.copy_start_time = "2026-02-09 12:00:00"
+        mock_uploader.copy_end_time = "2026-02-09 13:00:00"
+        mock_uploader_class.return_value = mock_uploader
+
+        # Mock the upload controller
+        mock_controller = mock.Mock()
+        mock_controller.size = 1024000
+        mock_uploader.create_upload_controller.return_value = mock_controller
+
+        # Create a mock backup_info
+        backup_info = mock.Mock()
+        backup_info.backup_name = "test_backup"
+        backup_info.backup_id = "20260209T120000"
+
+        # Mock _purge_unused_wal_files method
+        executor._purge_unused_wal_files = mock.Mock()
+
+        # WHEN backup is called
+        executor.backup(backup_info)
+
+        # THEN CloudBackupUploader is instantiated with correct parameters
+        mock_uploader_class.assert_called_once_with(
+            server_name="test_server",
+            cloud_interface=mock_cloud_interface,
+            max_archive_size=100 * 1024 * 1024 * 1024,  # 100 GiB
+            postgres=mock_postgres,
+            backup_name="test_backup",
+            min_chunk_size=5 * 1024 * 1024,  # 5 MiB
+            max_bandwidth=None,
+        )
+
+        # AND the backup_info is set on the uploader
+        assert mock_uploader.backup_info == backup_info
+
+        # AND the upload controller is created
+        mock_uploader.create_upload_controller.assert_called_once_with(
+            "20260209T120000"
+        )
+        assert mock_uploader.controller == mock_controller
+
+        # AND the backup is coordinated
+        mock_uploader.coordinate_backup.assert_called_once()
+
+        # AND timing info is copied back
+        assert executor.copy_start_time == "2026-02-09 12:00:00"
+        assert executor.copy_end_time == "2026-02-09 13:00:00"
+
+        # AND size information is set on backup_info
+        backup_info.set_attribute.assert_any_call("size", 1024000)
+        backup_info.set_attribute.assert_any_call("deduplicated_size", 1024000)
+
+        # AND cloud interface and postgres are closed
+        mock_cloud_interface.close.assert_called_once()
+        mock_postgres.close.assert_called_once()
+
+        # AND unused WAL files are purged
+        executor._purge_unused_wal_files.assert_called_once_with(backup_info)
+
+    @patch("barman.cloud.CloudBackupUploader")
+    @patch("barman.backup_executor.CloudBackupExecutor.__init__", return_value=None)
+    def test_backup_handles_exception(self, _, mock_uploader_class):
+        """
+        Test that the backup method properly handles SystemExit exceptions
+        """
+        # GIVEN a CloudBackupExecutor
+        executor = CloudBackupExecutor(None)
+        executor.server = mock.Mock()
+        mock_config = mock.Mock()
+        mock_config.name = "test_server"
+        mock_config.cloud_upload_max_archive_size = 100 * 1024 * 1024 * 1024  # 100 GiB
+        mock_config.cloud_upload_min_chunk_size = 5 * 1024 * 1024  # 5 MiB
+        mock_config.bandwidth_limit = None
+        executor.config = mock_config
+
+        # Mock the postgres connection and cloud interface
+        mock_postgres = mock.Mock()
+        mock_cloud_interface = mock.Mock()
+        executor.server.postgres = mock_postgres
+        executor.server.get_backup_cloud_interface.return_value = mock_cloud_interface
+
+        # Mock the uploader to raise SystemExit
+        mock_uploader = mock.Mock()
+        mock_uploader.coordinate_backup.side_effect = SystemExit("Test error")
+        mock_uploader_class.return_value = mock_uploader
+        mock_uploader.create_upload_controller.return_value = mock.Mock()
+
+        backup_info = mock.Mock(backup_name="test_backup", backup_id="20260209T120000")
+
+        # WHEN backup is called and an exception occurs
+        # THEN a BackupException is raised
+        with pytest.raises(BackupException) as exc_info:
+            executor.backup(backup_info)
+
+        assert "Cloud backup failed with error" in str(exc_info.value)
+
+    @patch("barman.cloud.CloudBackupUploader")
+    @patch("barman.backup_executor.CloudBackupExecutor.__init__", return_value=None)
+    def test_backup_with_bandwidth_limit(self, _, mock_uploader_class):
+        """
+        Test that bandwidth_limit is correctly converted and passed to CloudBackupUploader
+        """
+        # GIVEN a CloudBackupExecutor with bandwidth_limit set
+        executor = CloudBackupExecutor(None)
+        executor.server = mock.Mock()
+        mock_config = mock.Mock()
+        mock_config.name = "test_server"
+        mock_config.cloud_upload_max_archive_size = 100 * 1024 * 1024 * 1024  # 100 GiB
+        mock_config.cloud_upload_min_chunk_size = 5 * 1024 * 1024  # 5 MiB
+        mock_config.bandwidth_limit = 100  # 100 kB/s
+        executor.config = mock_config
+
+        # Mock the postgres connection and cloud interface
+        mock_postgres = mock.Mock()
+        mock_cloud_interface = mock.Mock()
+        executor.server.postgres = mock_postgres
+        executor.server.get_backup_cloud_interface.return_value = mock_cloud_interface
+
+        # Mock the uploader instance
+        mock_uploader = mock.Mock()
+        mock_uploader.copy_start_time = "2026-02-09 12:00:00"
+        mock_uploader.copy_end_time = "2026-02-09 13:00:00"
+        mock_uploader_class.return_value = mock_uploader
+
+        # Mock the upload controller
+        mock_controller = mock.Mock()
+        mock_controller.size = 1024000
+        mock_uploader.create_upload_controller.return_value = mock_controller
+
+        # Create a mock backup_info
+        backup_info = mock.Mock()
+        backup_info.backup_name = "test_backup"
+        backup_info.backup_id = "20260209T120000"
+
+        # Mock _purge_unused_wal_files method
+        executor._purge_unused_wal_files = mock.Mock()
+
+        # WHEN backup is called
+        executor.backup(backup_info)
+
+        # THEN CloudBackupUploader is instantiated with converted bandwidth_limit (100 kB/s → 100000 B/s)
+        mock_uploader_class.assert_called_once_with(
+            server_name="test_server",
+            cloud_interface=mock_cloud_interface,
+            max_archive_size=100 * 1024 * 1024 * 1024,  # 100 GiB
+            postgres=mock_postgres,
+            backup_name="test_backup",
+            min_chunk_size=5 * 1024 * 1024,  # 5 MiB
+            max_bandwidth=100000,  # 100 kB/s converted to 100000 B/s
+        )
 
 
 class TestSnapshotBackupExecutor(object):

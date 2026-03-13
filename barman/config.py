@@ -74,7 +74,13 @@ _SI_SUFFIX_RE = re.compile(r"""(\d+)\s*(k|Ki|M|Mi|G|Gi|T|Ti)?\s*$""")
 REUSE_BACKUP_VALUES = ("copy", "link", "off")
 
 # Possible copy methods for backups (must be all lowercase)
-BACKUP_METHOD_VALUES = ["rsync", "postgres", "local-rsync", "snapshot"]
+BACKUP_METHOD_VALUES = [
+    "rsync",
+    "postgres",
+    "local-rsync",
+    "snapshot",
+    "local-to-cloud",
+]
 
 CREATE_SLOT_VALUES = ["manual", "auto"]
 
@@ -94,6 +100,8 @@ ENCRYPTION_VALUES = ["none", "gpg"]
 STAGING_LOCATIONS = ["local", "remote"]
 
 COMBINE_MODES = ["copy", "link", "clone", "copy-file-range"]
+
+AWS_ENCRYPTIONS = ["AES256", "aws:kms"]
 
 
 class CsvOption(set):
@@ -550,6 +558,40 @@ def parse_combine_mode(value):
     return value
 
 
+def parse_directory_or_cloud_provider(value):
+    """
+    Parse a string to a valid directory or cloud provider URL.
+
+    :param string|None value: value to validate
+    :raises ValueError: if the value is invalid
+    """
+    if value and "://" in value:
+        from barman.cloud_providers import recognize_cloud_provider
+
+        if recognize_cloud_provider(value) is None:
+            raise ValueError(
+                "The URL is not compatible with any of the supported cloud providers"
+            )
+
+    return value
+
+
+def parse_aws_encryption(value):
+    """
+    Parse a string to a valid ``aws_encryption`` value.
+
+    :param str value: aws_encryption value
+    :raises ValueError: if the *value* is invalid
+    """
+    if value is None:
+        return None
+    if value in AWS_ENCRYPTIONS:
+        return value
+    raise ValueError(
+        "Invalid value '%s' (must be one in: %s)" % (value, AWS_ENCRYPTIONS)
+    )
+
+
 class BaseConfig(object):
     """
     Contains basic methods for handling configuration of Servers and Models.
@@ -617,6 +659,8 @@ class ServerConfig(BaseConfig):
         "archiver",
         "archiver_batch_size",
         "autogenerate_manifest",
+        "aws_encryption",
+        "aws_read_timeout",
         "aws_await_snapshots_timeout",
         "aws_snapshot_lock_mode",
         "aws_snapshot_lock_duration",
@@ -624,6 +668,7 @@ class ServerConfig(BaseConfig):
         "aws_snapshot_lock_expiration_date",
         "aws_profile",
         "aws_region",
+        "aws_sse_kms_key_id",
         "azure_credential",
         "azure_resource_group",
         "azure_subscription_id",
@@ -640,6 +685,11 @@ class ServerConfig(BaseConfig):
         "basebackup_retry_times",
         "basebackups_directory",
         "check_timeout",
+        "cloud_delete_batch_size",
+        "cloud_staging_directory",
+        "cloud_staging_max_size",
+        "cloud_upload_max_archive_size",
+        "cloud_upload_min_chunk_size",
         "cluster",
         "compression",
         "compression_level",
@@ -720,6 +770,7 @@ class ServerConfig(BaseConfig):
         "wal_retention_policy",
         "wal_streaming_conninfo",
         "wals_directory",
+        "warehousepg_dbid",
         "worm_mode",
         "xlogdb_directory",
     ]
@@ -728,6 +779,8 @@ class ServerConfig(BaseConfig):
         "archiver",
         "archiver_batch_size",
         "autogenerate_manifest",
+        "aws_encryption",
+        "aws_read_timeout",
         "aws_await_snapshots_timeout",
         "aws_snapshot_lock_mode",
         "aws_snapshot_lock_duration",
@@ -735,6 +788,7 @@ class ServerConfig(BaseConfig):
         "aws_snapshot_lock_expiration_date",
         "aws_profile",
         "aws_region",
+        "aws_sse_kms_key_id",
         "azure_credential",
         "azure_resource_group",
         "azure_subscription_id",
@@ -749,6 +803,9 @@ class ServerConfig(BaseConfig):
         "basebackup_retry_sleep",
         "basebackup_retry_times",
         "check_timeout",
+        "cloud_delete_batch_size",
+        "cloud_staging_directory",
+        "cloud_staging_max_size",
         "compression",
         "compression_level",
         "configuration_files_directory",
@@ -812,6 +869,7 @@ class ServerConfig(BaseConfig):
         "streaming_backup_name",
         "tablespace_bandwidth_limit",
         "wal_retention_policy",
+        "warehousepg_dbid",
         "worm_mode",
         "xlogdb_directory",
     ]
@@ -829,6 +887,9 @@ class ServerConfig(BaseConfig):
         "basebackup_retry_times": "0",
         "basebackups_directory": "%(backup_directory)s/base",
         "check_timeout": "30",
+        "cloud_staging_directory": "/tmp/barman/cloud-staging",
+        "cloud_staging_max_size": "30Gi",
+        "cloud_upload_max_archive_size": "100Gi",
         "cluster": "%(name)s",
         "compression_level": "medium",
         "disabled": "false",
@@ -876,6 +937,8 @@ class ServerConfig(BaseConfig):
         "archiver": parse_boolean,
         "archiver_batch_size": int,
         "autogenerate_manifest": parse_boolean,
+        "aws_encryption": parse_aws_encryption,
+        "aws_read_timeout": int,
         "aws_await_snapshots_timeout": int,
         "aws_snapshot_lock_duration": int,
         "aws_snapshot_lock_cool_off_period": int,
@@ -886,9 +949,15 @@ class ServerConfig(BaseConfig):
         "backup_compression_workers": int,
         "backup_method": parse_backup_method,
         "backup_options": BackupOptions,
+        "basebackups_directory": parse_directory_or_cloud_provider,
         "basebackup_retry_sleep": int,
         "basebackup_retry_times": int,
         "check_timeout": int,
+        "cloud_delete_batch_size": int,
+        "cloud_staging_directory": parse_staging_path,
+        "cloud_staging_max_size": parse_si_suffix,
+        "cloud_upload_max_archive_size": parse_si_suffix,
+        "cloud_upload_min_chunk_size": parse_si_suffix,
         "compression": parse_compression,
         "compression_level": parse_compression_level,
         "disabled": parse_boolean,
@@ -917,6 +986,8 @@ class ServerConfig(BaseConfig):
         "streaming_archiver": parse_boolean,
         "streaming_archiver_batch_size": int,
         "slot_name": parse_slot_name,
+        "wals_directory": parse_directory_or_cloud_provider,
+        "warehousepg_dbid": int,
         "worm_mode": parse_boolean,
     }
 
@@ -1637,13 +1708,16 @@ class Config(object):
         """
         Look for conflicting paths intra-server and inter-server
         """
-
         # All paths in configuration
         servers_paths = {}
         # Global errors list
         self.servers_msg_list = []
 
         # Cycle all the available configurations sections
+        # TODO: server_names() calls _populate_servers_and_models(), which calls
+        # _check_conflicting_paths() again, so we are doing this check twice, making
+        # errors appear twice in the output. We should refactor this to avoid doing
+        # this check twice
         for section in sorted(self.server_names()):
             # Paths map
             section_conf = self._servers[section]
@@ -1658,6 +1732,12 @@ class Config(object):
 
             # Check for path errors
             for label, path in sorted(config_paths.items()):
+                # Skip cloud paths, as basebackups_directory and wals_directory can be
+                # set to a cloud provider URL since Barman 3.18, and in that case it's
+                # recommended to be the same value for both given they are only prefixes
+                # instead of full paths.
+                if "://" in path:
+                    continue
                 # If the path does not conflict with the others, add it to the
                 # paths map
                 real_path = os.path.realpath(path)

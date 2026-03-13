@@ -41,6 +41,7 @@ from barman.cli import (
     check,
     check_target_action,
     check_wal_archive,
+    cloud_wal_archive,
     command,
     config_switch,
     generate_manifest,
@@ -661,6 +662,8 @@ class TestCli(object):
         monkeypatch,
         capsys,
     ):
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
         parse_backup_id_mock.return_value = mock_backup_info
 
         monkeypatch.setattr(
@@ -701,6 +704,8 @@ class TestCli(object):
         monkeypatch,
         capsys,
     ):
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
         parse_backup_id_mock.return_value = mock_backup_info
 
         monkeypatch.setattr(
@@ -737,6 +742,8 @@ class TestCli(object):
         monkeypatch,
         capsys,
     ):
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
         parse_backup_id_mock.return_value = mock_backup_info
 
         monkeypatch.setattr(
@@ -823,6 +830,9 @@ class TestCli(object):
             "__config__",
             (config,),
         )
+        # AND the server is NOT configured for cloud storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
 
         # WHEN the specified --get-wal / --no-get-wal combinations are used
         if get_wal_arg:
@@ -907,6 +917,9 @@ class TestCli(object):
             "__config__",
             (config,),
         )
+        # AND the server is NOT configured for cloud storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
 
         # WHEN the specified --delta-restore / --no-delta-restore combinations are used
         if delta_restore_arg:
@@ -961,6 +974,10 @@ class TestCli(object):
             "__config__",
             (config,),
         )
+        # AND the server is NOT configured for cloud storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
+
         # 1. Local restore with incremental backup
         mock_backup_info.is_incremental = True
         mock_restore_args.remote_ssh_command = False
@@ -1038,6 +1055,9 @@ class TestCli(object):
             "__config__",
             (config,),
         )
+        # AND the server is NOT configured for cloud storage
+        mock_get_server.return_value.use_backup_cloud_storage = False
+        mock_get_server.return_value.use_wal_cloud_storage = False
 
         mock_restore_args.staging_path = "/some/staging/path"
 
@@ -1077,6 +1097,9 @@ class TestCli(object):
             "__config__",
             (config,),
         )
+        # AND the server is NOT configured for cloud storage
+        mock_get_server.return_value.use_backup_cloud_storage = False
+        mock_get_server.return_value.use_wal_cloud_storage = False
 
         # Case 1: When remote-ssh-command is not set
         mock_restore_args.staging_location = "remote"
@@ -1172,6 +1195,9 @@ class TestCli(object):
             "__config__",
             (config,),
         )
+        # AND the server is NOT configured for cloud storage
+        mock_get_server.return_value.use_backup_cloud_storage = False
+        mock_get_server.return_value.use_wal_cloud_storage = False
 
         # Set the staging path options
         mock_restore_args.staging_path = staging_path
@@ -1239,6 +1265,8 @@ class TestCli(object):
         server = build_mocked_server(name="test_server")
 
         get_server_mock.return_value = server
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
 
         backup_info = build_test_backup_info(
             server=server,
@@ -1347,6 +1375,9 @@ class TestCli(object):
         extra_recovery_args.update(snapshot_recovery_args)
         for k, v in extra_recovery_args.items():
             setattr(mock_restore_args, k, v)
+        # AND the server is NOT configured for cloud storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
 
         # WHEN barman recover is called
         with pytest.raises(SystemExit):
@@ -1385,6 +1416,9 @@ class TestCli(object):
         # AND the args do not specify any other snapshot provider options
         mock_restore_args.azure_resource_group = None
         mock_restore_args.gcp_zone = None
+        # AND the server is NOT configured for cloud storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
 
         # WHEN barman recover is called
         with pytest.raises(SystemExit):
@@ -1428,6 +1462,9 @@ class TestCli(object):
         # AND the backup being recovered is a snapshot backup
         mock_backup_info.snapshots_info = Mock(snapshots=[])
         parse_backup_id_mock.return_value = mock_backup_info
+        # AND the server is NOT configured for cloud storage
+        get_server_mock.return_value.use_backup_cloud_storage = False
+        get_server_mock.return_value.use_wal_cloud_storage = False
 
         # WHEN recover is called without overriding the config
         setattr(mock_restore_args, arg, None)
@@ -1484,6 +1521,8 @@ class TestCli(object):
         """
         server = build_mocked_server(name="test_server")
         mock_get_server.return_value = server
+        mock_get_server.return_value.use_backup_cloud_storage = False
+        mock_get_server.return_value.use_wal_cloud_storage = False
         # Testing mutual exclusiveness of target options
         args = mock_restore_args
         setattr(args, "backup_id", "auto")
@@ -1546,6 +1585,8 @@ class TestCli(object):
         """
         server = build_mocked_server(name="test_server")
         mock_get_server.return_value = server
+        mock_get_server.return_value.use_backup_cloud_storage = False
+        mock_get_server.return_value.use_wal_cloud_storage = False
         # Testing mutual exclusiveness of target options
         args = mock_restore_args
         setattr(args, "backup_id", "auto")
@@ -1582,6 +1623,8 @@ class TestCli(object):
         """
         server = build_mocked_server(name="test_server")
         mock_get_server.return_value = server
+        mock_get_server.return_value.use_backup_cloud_storage = False
+        mock_get_server.return_value.use_wal_cloud_storage = False
         args = mock_restore_args
         target_option = "target_lsn"
         target = "3/5F000000"
@@ -1645,6 +1688,8 @@ class TestCli(object):
             primary_ssh_command=None,
             disabled=False,
             barman_lock_directory="/path/to/lockdir",
+            basebackups_directory="/path/to/basebackups",
+            wals_directory="/path/to/wals",
             backup_compression=None,
         )
         server = Server(mock_config)
@@ -1670,13 +1715,14 @@ class TestCli(object):
     @patch("barman.cli.parse_backup_id")
     @patch("barman.cli.get_server")
     def test_generate_manifest(
-        self, _mock_get_server, _mock_parse_backup_id, _mock_backup_manifest, capsys
+        self, mock_get_server, _mock_parse_backup_id, _mock_backup_manifest, capsys
     ):
         """Verify expected log message is received on success."""
         # GIVEN a backup for a server
         args = Mock()
         args.server_name = "test_server"
         args.backup_id = "test_backup_id"
+        mock_get_server.return_value = Mock(use_backup_cloud_storage=False)
 
         # WHEN a backup manifest is successfully created
         with pytest.raises(SystemExit):
@@ -1688,6 +1734,35 @@ class TestCli(object):
             "Backup manifest for backup '%s' successfully generated for server %s"
             % (args.backup_id, args.server_name)
             in out
+        )
+
+    @patch("barman.cli.output", wraps=output)
+    @patch(
+        "barman.cli.get_server",
+    )
+    @patch("barman.cli.parse_backup_id")
+    def test_generate_manifest_not_supported_in_cloud(
+        self, _, mock_get_server, mock_output
+    ):
+        """Verify appropriate error is raised when trying to generate a manifest in cloud."""
+        # GIVEN a server with a cloud storage as backup
+        mock_get_server.return_value = Mock(use_backup_cloud_storage=True)
+        # AND the following args
+        args = Mock()
+        args.server_name = "test_server"
+        args.backup_id = "test_backup_id"
+
+        # WHEN generate_manifest is called
+        with pytest.raises(SystemExit):
+            generate_manifest(args)
+
+        # THEN the expected error message is logged
+        mock_output.error.assert_called_once_with(
+            "Cannot generate backup manifest for backup '%s' of server '%s' because "
+            "a cloud backup storage is configured. The manifest generation is only "
+            "supported for local backup storage.",
+            args.backup_id,
+            args.server_name,
         )
 
     @pytest.mark.parametrize(
@@ -2496,6 +2571,8 @@ class TestShowServersCli(object):
         mock_config.name = self.test_server_name
         mock_config.retention_policy = None
         mock_config.last_backup_maximum_age = None
+        mock_config.basebackups_directory = "/path/to/basebackups"
+        mock_config.wals_directory = "/path/to/wals"
         yield mock_config
 
     @pytest.mark.parametrize(
@@ -2714,3 +2791,91 @@ class TestConfigSwitchCli:
         )
         mock_apply_model.assert_not_called()
         mock_reset_model.assert_called_once_with()
+
+
+class TestCloudWalArchiveCli:
+    """Test ``barman cloud_wal_archive`` outcomes."""
+
+    @pytest.fixture
+    def mock_args(self):
+        return MagicMock(
+            server_name="SOME_SERVER", wal_path="/pg_wal/000000010000000000000001"
+        )
+
+    @patch("barman.cli.output")
+    def test_cloud_wal_archive_wal_path_is_dir(self, mock_output, mock_args):
+        """
+        Test :func:`cloud_wal_archive`.
+
+        It should error out if the provided WAL path is a directory.
+        """
+        mock_output.close_and_exit.side_effect = SystemExit(1)
+
+        with patch("os.path.isdir", return_value=True):
+            with pytest.raises(SystemExit):
+                cloud_wal_archive(mock_args)
+
+        mock_output.error.assert_called_once_with(
+            "wal_path cannot be a directory: /pg_wal/000000010000000000000001"
+        )
+        mock_output.close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output")
+    def test_cloud_wal_archive_wal_path_does_not_exist(self, mock_output, mock_args):
+        """
+        Test :func:`cloud_wal_archive`.
+
+        It should error out if the provided WAL path does not exist.
+        """
+        mock_output.close_and_exit.side_effect = SystemExit(1)
+
+        with patch("os.path.isdir", return_value=False), patch(
+            "os.path.exists", return_value=False
+        ):
+            with pytest.raises(SystemExit):
+                cloud_wal_archive(mock_args)
+
+        mock_output.error.assert_called_once_with(
+            "WAL file does not exist: /pg_wal/000000010000000000000001"
+        )
+        mock_output.close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.output")
+    def test_cloud_wal_archive_wal_path_not_valid_wal_file(
+        self, mock_output, mock_args
+    ):
+        """
+        Test :func:`cloud_wal_archive`.
+
+        It should error out if the provided WAL path is not a valid WAL file.
+        """
+        mock_output.close_and_exit.side_effect = SystemExit(1)
+
+        with patch("os.path.isdir", return_value=False), patch(
+            "os.path.exists", return_value=True
+        ), patch("barman.cli.is_any_xlog_file", return_value=False):
+            with pytest.raises(SystemExit):
+                cloud_wal_archive(mock_args)
+
+        mock_output.error.assert_called_once_with(
+            "File is not a valid WAL file: /pg_wal/000000010000000000000001"
+        )
+        mock_output.close_and_exit.assert_called_once_with()
+
+    @patch("barman.cli.get_server")
+    def test_cloud_wal_archive_success(self, mock_get_server, mock_args):
+        """
+        Test :func:`cloud_wal_archive`.
+
+        It should call cloud_wal_archive on the server with the provided WAL path if
+        all validations pass.
+        """
+        with patch("os.path.isdir", return_value=False), patch(
+            "os.path.exists", return_value=True
+        ), patch("barman.cli.is_any_xlog_file", return_value=True):
+            with pytest.raises(SystemExit):
+                cloud_wal_archive(mock_args)
+
+        mock_get_server.return_value.cloud_wal_archive.assert_called_once_with(
+            "/pg_wal/000000010000000000000001"
+        )

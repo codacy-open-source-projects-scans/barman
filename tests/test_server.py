@@ -59,6 +59,7 @@ from barman.lockfile import (
 from barman.postgres import PostgreSQLConnection, StandbyPostgreSQLConnection
 from barman.process import ProcessInfo
 from barman.server import CheckOutputStrategy, CheckStrategy, Server
+from barman.wal_archiver import CloudWalStorageStrategy, LocalWalStorageStrategy
 
 
 class ExceptionTest(Exception):
@@ -213,6 +214,20 @@ class TestServer(object):
             assert isinstance(server.postgres, StandbyPostgreSQLConnection)
             assert server.postgres.primary is not None
 
+    @pytest.mark.parametrize("use_wal_cloud_storage", [True, False])
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=PropertyMock)
+    def test_init_wal_storages(self, mock_use_wal_storage, use_wal_cloud_storage):
+        """
+        Verify that the ``wal_storage`` attribute is set correctly based on
+        ``use_wal_cloud_storage`` property.
+        """
+        mock_use_wal_storage.return_value = use_wal_cloud_storage
+        server = build_real_server()
+        if use_wal_cloud_storage:
+            assert isinstance(server.wal_storage, CloudWalStorageStrategy)
+        else:
+            assert isinstance(server.wal_storage, LocalWalStorageStrategy)
+
     def test_check_config_missing(self, tmpdir):
         """
         Verify the check method can be called on an empty configuration
@@ -234,6 +249,25 @@ class TestServer(object):
         check_strategy = CheckOutputStrategy()
         server.check(check_strategy)
         assert check_strategy.has_error
+
+    @patch("barman.server.os.makedirs", wraps=os.makedirs)
+    def test_make_directories(self, mock_makedirs, tmpdir):
+        # GIVEN a server with wals_directory and basebackups_directory config options
+        server = build_real_server()
+        wals_dir = tmpdir.mkdir("wals").strpath  # existing dir
+        incoming_dir = tmpdir.join("incoming").strpath  # non-existing dir
+        basebackups_dir = "s3://mybucket/basebackups"  # URL, should be ignored
+        server.config = mock.MagicMock(
+            KEYS=["wals_directory", "basebackups_directory", "incoming_wals_directory"],
+            wals_directory=wals_dir,
+            incoming_wals_directory=incoming_dir,
+            basebackups_directory=basebackups_dir,
+        )
+        # WHEN _make_directories is called
+        server._make_directories()
+        # THEN only the non-existing path is created, the existing and URL are skipped
+        assert os.path.exists(incoming_dir)
+        mock_makedirs.assert_called_once_with(incoming_dir)
 
     @patch("barman.server.os")
     def test_xlogdb_with_exception(self, os_mock, tmpdir):
@@ -415,18 +449,18 @@ class TestServer(object):
             assert xlogdb_file.readline() == expected_line
             assert xlogdb_file.readline() == ""
 
-    def test_get_wal_full_path(self, tmpdir):
-        """
-        Testing Server.get_wal_full_path() method
-        """
-        wal_name = "0000000B00000A36000000FF"
-        wal_hash = wal_name[:16]
-        server = build_real_server(
-            global_conf={"barman_lock_directory": tmpdir.mkdir("lock").strpath},
-            main_conf={"wals_directory": tmpdir.mkdir("wals").strpath},
+    @patch("barman.server.os.path.exists", return_value=True)
+    @patch("barman.server.output")
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    def test_rebuild_xlogdb_not_supported_using_cloud(
+        self, _mock_wal_cloud, mock_output, mock_exists
+    ):
+        """Test rebuilding the xlogdb when compression is enabled"""
+        server = build_real_server()
+        server.rebuild_xlogdb()
+        mock_output.error.assert_called_once_with(
+            "Rebuilding xlogdb is not supported for servers using cloud storage"
         )
-        full_path = server.get_wal_full_path(wal_name)
-        assert full_path == str(tmpdir.join("wals").join(wal_hash).join(wal_name))
 
     @pytest.mark.parametrize(
         [
@@ -813,7 +847,7 @@ class TestServer(object):
         server.show()
 
         # Parse the output
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         result = dict(
             item.strip("\t\n\r").split(": ") for item in out.split("\n") if item != ""
         )
@@ -868,7 +902,7 @@ class TestServer(object):
         # Failures of WAL archiver:
         #   <failed_count> (<last_failed wal>, at <last_failed_time>)
         server.status()
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
 
         # Parse the output
         result = dict(
@@ -912,7 +946,7 @@ class TestServer(object):
 
         # Call the status method
         server_no_active.status()
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
 
         # Verify output.result is called with the correct parameters
         mock_output_result.assert_any_call(
@@ -943,7 +977,7 @@ class TestServer(object):
 
         # Call the status method
         server.status()
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
 
         # Verify output.result is called with the correct parameters
         mock_output_result.assert_any_call(
@@ -982,7 +1016,7 @@ class TestServer(object):
 
         # Call the show method
         server_no_active.show()
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
 
         # Verify output.result is called with the correct parameters
         result_call_args = mock_output_result.call_args[0]
@@ -1012,7 +1046,7 @@ class TestServer(object):
 
         # Call the show method
         server.show()
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
 
         # Verify output.result is called with the correct parameters
         result_call_args = mock_output_result.call_args[0]
@@ -1030,7 +1064,7 @@ class TestServer(object):
         server = build_real_server()
         strategy = CheckOutputStrategy()
         server.check_postgres(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert (
             out
             == "	PostgreSQL: FAILED (unsupported version: PostgreSQL server is too old (x.y.z < 9.6.0))\n"
@@ -1051,7 +1085,7 @@ class TestServer(object):
         # Expect out: PostgreSQL: FAILED
         strategy = CheckOutputStrategy()
         server.check_postgres(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "	PostgreSQL: FAILED\n"
         # Case: correct configuration
         postgres_mock.return_value = {
@@ -1068,7 +1102,7 @@ class TestServer(object):
         # Postgres version >= 9.0 - check wal_level
         server = build_real_server()
         server.check_postgres(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tPostgreSQL: OK\n\twal_level: OK\n"
 
         # Postgres version < 9.0 - avoid wal_level check
@@ -1076,7 +1110,7 @@ class TestServer(object):
 
         server = build_real_server()
         server.check_postgres(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tPostgreSQL: OK\n"
 
         # Case: wal_level and archive_command values are not acceptable
@@ -1091,7 +1125,7 @@ class TestServer(object):
         # Expect out: some parameters: FAILED
         strategy = CheckOutputStrategy()
         server.check_postgres(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert (
             out == "\tPostgreSQL: OK\n"
             "\twal_level: FAILED (please set it to a higher level "
@@ -1373,7 +1407,7 @@ class TestServer(object):
         # Case: Postgres version < 9.4
         strategy = CheckOutputStrategy()
         server._check_replication_slot(strategy, mock_remote_status)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert "\treplication slot:" not in out
 
         # Case: correct configuration
@@ -1391,7 +1425,7 @@ class TestServer(object):
         server.config.streaming_archiver = True
         server.config.slot_name = "test"
         server._check_replication_slot(strategy, mock_remote_status)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
 
         # Everything is ok
         assert "\treplication slot: OK\n" in out
@@ -1409,7 +1443,7 @@ class TestServer(object):
         server.config.slot_name = "test"
         server.config.streaming_archiver = True
         server._check_replication_slot(strategy, mock_remote_status)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         # Everything is ok
         assert (
             "\treplication slot: FAILED (slot '%s' not initialised: "
@@ -1430,7 +1464,7 @@ class TestServer(object):
         server.config.slot_name = "test"
         server.config.streaming_archiver = True
         server._check_replication_slot(strategy, mock_remote_status)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         # Everything is ok
         assert (
             "\treplication slot: FAILED (slot '%s' not active: "
@@ -1451,7 +1485,7 @@ class TestServer(object):
         server.config.slot_name = "test"
         server.config.streaming_archiver = False
         server._check_replication_slot(strategy, mock_remote_status)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         # Everything is ok
         assert (
             "\treplication slot: OK (WARNING: slot '%s' is initialised "
@@ -1472,7 +1506,7 @@ class TestServer(object):
         server.config.slot_name = "test"
         server.config.streaming_archiver = False
         server._check_replication_slot(strategy, mock_remote_status)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         # Everything is ok
         assert (
             "\treplication slot: OK (WARNING: slot '%s' is active "
@@ -2233,7 +2267,7 @@ class TestServer(object):
         # Execute the test (ALL)
         server.postgres.reset_mock()
         server.replication_status("all")
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert err == ""
         server.postgres.get_replication_stats.assert_called_once_with(
             PostgreSQLConnection.ANY_STREAMING_CLIENT
@@ -2242,7 +2276,7 @@ class TestServer(object):
         # Execute the test (WALSTREAMER)
         server.postgres.reset_mock()
         server.replication_status("wal-streamer")
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert err == ""
         server.postgres.get_replication_stats.assert_called_once_with(
             PostgreSQLConnection.WALSTREAMER
@@ -2254,7 +2288,7 @@ class TestServer(object):
             "9.1"
         )
         server.replication_status("all")
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert "Requires PostgreSQL 9.1 or higher" in out
         assert err == ""
         server.postgres.get_replication_stats.assert_called_once_with(
@@ -2265,7 +2299,7 @@ class TestServer(object):
         server.postgres.reset_mock()
         server.postgres.get_replication_stats.side_effect = PostgresSuperuserRequired
         server.replication_status("all")
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert "Requires superuser rights" in out
         assert err == ""
         server.postgres.get_replication_stats.assert_called_once_with(
@@ -2276,7 +2310,7 @@ class TestServer(object):
         del replication_stats_data["slot_name"]
         server.postgres.reset_mock()
         server.replication_status("all")
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert "Replication slot" not in out
 
     def test_timeline_has_children(self, tmpdir):
@@ -2287,15 +2321,15 @@ class TestServer(object):
         tmpdir.join("main/wals").ensure(dir=True)
 
         # Write two history files
-        history_2 = server.get_wal_full_path("00000002.history")
+        history_2 = server.wal_storage.get_full_path("00000002.history")
         with open(history_2, "w") as fp:
             fp.write('1\t2/83000168\tat restore point "myrp"\n')
 
-        history_3 = server.get_wal_full_path("00000003.history")
+        history_3 = server.wal_storage.get_full_path("00000003.history")
         with open(history_3, "w") as fp:
             fp.write('1\t2/83000168\tat restore point "myrp"\n')
 
-        history_4 = server.get_wal_full_path("00000004.history")
+        history_4 = server.wal_storage.get_full_path("00000004.history")
         with open(history_4, "w") as fp:
             fp.write('1\t2/83000168\tat restore point "myrp"\n')
             fp.write("2\t2/84000268\tunknown\n")
@@ -2307,13 +2341,49 @@ class TestServer(object):
         assert len(server.get_children_timelines(3)) == 0
         assert len(server.get_children_timelines(4)) == 0
 
-    def test_xlogdb_directory(self):
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: False)
+    def test_xlogdb_directory_no_cloud_storage(self, mock_use_wal_cloud_storage):
         """
-        Test the xlogdb_directory server property
+        Test the xlogdb_directory server property when not using cloud storage
         """
-        # It's just a shortcut to config.xlogdb_directory
+        # When not using cloud storage, it should return config.xlogdb_directory
         server = build_real_server()
         assert server.xlogdb_directory == server.config.xlogdb_directory
+
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    def test_xlogdb_directory_cloud_storage_custom_path(
+        self, mock_use_wal_cloud_storage, tmpdir
+    ):
+        """
+        Test the xlogdb_directory server property when using cloud storage with custom xlogdb_directory
+        """
+        # When using cloud storage but xlogdb_directory is custom (not under wals_directory)
+        custom_xlogdb = tmpdir.mkdir("custom_xlogdb").strpath
+        server = build_real_server(
+            main_conf={
+                "wals_directory": tmpdir.mkdir("wals").strpath,
+                "xlogdb_directory": custom_xlogdb,
+            }
+        )
+        assert server.xlogdb_directory == custom_xlogdb
+
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    def test_xlogdb_directory_cloud_storage_default_path(
+        self, mock_use_wal_cloud_storage, tmpdir
+    ):
+        """
+        Test the xlogdb_directory server property when using cloud storage with default xlogdb_directory
+        """
+        # When using cloud storage and xlogdb_directory is under wals_directory
+        # it should return meta_directory instead
+        wals_dir = tmpdir.mkdir("wals").strpath
+        server = build_real_server(
+            main_conf={
+                "wals_directory": wals_dir,
+                "xlogdb_directory": wals_dir + "/xlogdb",
+            }
+        )
+        assert server.xlogdb_directory == server.meta_directory
 
     def test_xlogdb_file_name(self):
         """
@@ -2576,16 +2646,24 @@ class TestServer(object):
 
         # Case 3.1: we have all the files until this moment, nothing should
         # happen
-        available_wals.append(server.get_wal_full_path("000000010000000000000002"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000003"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000004"))
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000002")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000003")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000004")
+        )
         server.check_backup(backup_info)
         assert backup_info_save.called
         assert backup_info.status == BackupInfo.WAITING_FOR_WALS
 
         # Case 3.2: we miss two WAL files
         del available_wals[:]
-        available_wals.append(server.get_wal_full_path("000000010000000000000002"))
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000002")
+        )
         server.check_backup(backup_info)
         assert backup_info_save.called
         assert backup_info.status == BackupInfo.FAILED
@@ -2605,13 +2683,27 @@ class TestServer(object):
         # Case 4.1: we have all the files, so the backup should be marked as
         # done
         del available_wals[:]
-        available_wals.append(server.get_wal_full_path("000000010000000000000002"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000003"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000004"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000005"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000006"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000007"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000008"))
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000002")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000003")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000004")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000005")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000006")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000007")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000008")
+        )
         backup_info.status = BackupInfo.WAITING_FOR_WALS
         server.check_backup(backup_info)
         assert backup_info_save.called
@@ -2620,12 +2712,24 @@ class TestServer(object):
 
         # Case 4.2: a WAL file is missing
         del available_wals[:]
-        available_wals.append(server.get_wal_full_path("000000010000000000000002"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000003"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000005"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000006"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000007"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000008"))
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000002")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000003")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000005")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000006")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000007")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000008")
+        )
         backup_info.status = BackupInfo.WAITING_FOR_WALS
         server.check_backup(backup_info)
         assert backup_info_save.called
@@ -2643,13 +2747,27 @@ class TestServer(object):
         # FAILED (i.e. the rsync copy failed). The backup should still be
         # kept as failed
         del available_wals[:]
-        available_wals.append(server.get_wal_full_path("000000010000000000000002"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000003"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000004"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000005"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000006"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000007"))
-        available_wals.append(server.get_wal_full_path("000000010000000000000008"))
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000002")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000003")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000004")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000005")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000006")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000007")
+        )
+        available_wals.append(
+            server.wal_storage.get_full_path("000000010000000000000008")
+        )
         backup_info.status = BackupInfo.FAILED
         server.check_backup(backup_info)
         assert not backup_info_save.called
@@ -3467,6 +3585,92 @@ class TestServer(object):
         # Use a round(2) comparison because float is not precise in Python 2.x
         assert round(wal.mtime(), 2) == round(dest_file.mtime(), 2)
 
+    @patch("barman.server.output")
+    def test_cloud_wal_archive_wrong_backup_method(self, mock_output):
+        """
+        Test that the cloud_wal_archive method logs an error and aborts when backup_method
+        is not as expected.
+        """
+        # GIVEN a server configured for without local-to-cloud backup method
+        server = build_real_server(
+            main_conf={
+                "backup_method": "postgres",
+            },
+        )
+        server.backup_manager = Mock()
+
+        # WHEN cloud_wal_archive is called
+        server.cloud_wal_archive("some_wal_file")
+
+        # THEN expected error is logged
+        mock_output.error.assert_called_once_with(
+            "cloud-wal-archive is only supported for servers with 'backup_method' set "
+            "to 'local-to-cloud'. Please check the configuration of server %s.",
+            server.config.name,
+        )
+
+        # AND the manager is not called to archive the WAL file
+        server.backup_manager.cloud_wal_archive.assert_not_called()
+
+    @patch("barman.server.output")
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=PropertyMock)
+    def test_cloud_wal_archive_no_cloud_storage(
+        self, mock_use_wal_cloud_storage, mock_output
+    ):
+        """
+        Test that the cloud_wal_archive method logs an error and aborts when no cloud storage
+        is configured for the server.
+        """
+        # GIVEN a server configured for local-to-cloud backup method but without cloud
+        # storage
+        server = build_real_server(
+            main_conf={
+                "backup_method": "local-to-cloud",
+            },
+        )
+        server.backup_manager = Mock()
+        mock_use_wal_cloud_storage.return_value = False
+
+        # WHEN cloud_wal_archive is called
+        server.cloud_wal_archive("some_wal_file")
+
+        # THEN expected error is logged
+        mock_output.error.assert_called_once_with(
+            "cloud-wal-archive is not supported for server %s because no cloud storage "
+            "configuration is set in 'wals_directory'. Please check the "
+            "configuration of server %s.",
+            server.config.name,
+            server.config.name,
+        )
+
+        # AND the manager is not called to archive the WAL file
+        server.backup_manager.cloud_wal_archive.assert_not_called()
+
+    @patch("barman.server.output")
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=PropertyMock)
+    def test_cloud_wal_archive_success(self, mock_use_wal_cloud_storage, mock_output):
+        """
+        Test that the cloud_wal_archive method successfully archives the WAL file when the
+        server is properly configured.
+        """
+        # GIVEN a server configured for local-to-cloud backup method with cloud storage
+        server = build_real_server(
+            main_conf={
+                "backup_method": "local-to-cloud",
+            },
+        )
+        server.backup_manager = Mock()
+        mock_use_wal_cloud_storage.return_value = True
+
+        # WHEN cloud_wal_archive is called
+        server.cloud_wal_archive("some_wal_file")
+
+        # THEN the manager's cloud_wal_archive method is called with the correct file name
+        server.backup_manager.cloud_wal_archive.assert_called_once_with("some_wal_file")
+
+        # AND no error is logged
+        mock_output.error.assert_not_called()
+
     def test_get_systemid_file_path(self):
         # Basic test for the get_systemid_file_path function
         server = build_real_server()
@@ -3544,7 +3748,7 @@ class TestServer(object):
         }
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tsystemid coherence: OK (no system Id available)\n"
         assert not os.path.exists(server.get_identity_file_path())
 
@@ -3556,7 +3760,7 @@ class TestServer(object):
         }
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tsystemid coherence: OK (no system Id stored on disk)\n"
         assert not os.path.exists(server.get_identity_file_path())
 
@@ -3569,7 +3773,7 @@ class TestServer(object):
         }
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tsystemid coherence: OK (no system Id stored on disk)\n"
         assert not os.path.exists(server.get_identity_file_path())
 
@@ -3581,7 +3785,7 @@ class TestServer(object):
         }
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tsystemid coherence: OK (no system Id stored on disk)\n"
         assert not os.path.exists(server.get_identity_file_path())
 
@@ -3593,7 +3797,7 @@ class TestServer(object):
         }
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert (
             out == "\tsystemid coherence: FAILED (is the streaming "
             "DSN targeting the same server of the PostgreSQL "
@@ -3611,7 +3815,7 @@ class TestServer(object):
             fp.write('{"systemid": "test"}')
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert (
             out == "\tsystemid coherence: FAILED "
             "(the system Id of the connected PostgreSQL "
@@ -3630,7 +3834,7 @@ class TestServer(object):
             fp.write('{"systemid": "1234567890"}')
         strategy = CheckOutputStrategy()
         server.check_identity(strategy)
-        (out, err) = capsys.readouterr()
+        out, err = capsys.readouterr()
         assert out == "\tsystemid coherence: OK\n"
 
     @pytest.fixture
@@ -3898,6 +4102,190 @@ class TestServer(object):
             hint="encryption test succeeded",
         )
 
+    @pytest.mark.parametrize(
+        "backup_compression, compression, encryption, backup_method, worm_mode, hint",
+        [
+            (
+                "gzip",
+                None,
+                None,
+                "postgres",
+                "off",
+                "compression is not supported when the backup destination is a cloud storage",
+            ),
+            (
+                None,
+                "gzip",
+                None,
+                "postgres",
+                "off",
+                None,
+            ),
+            (
+                None,
+                "pigz",
+                None,
+                "postgres",
+                "off",
+                "cloud WAL storage only supports in-memory compression "
+                "algorithms (gzip, bzip2, xz, zstd, lz4, snappy). "
+                "'pigz' is not supported",
+            ),
+            (
+                None,
+                "custom",
+                None,
+                "postgres",
+                "off",
+                "cloud WAL storage only supports in-memory compression "
+                "algorithms (gzip, bzip2, xz, zstd, lz4, snappy). "
+                "'custom' is not supported",
+            ),
+            (
+                None,
+                None,
+                "gpg",
+                "postgres",
+                "off",
+                "encryption is not supported when the backup destination is a cloud storage",
+            ),
+            (
+                None,
+                None,
+                None,
+                "rsync",
+                "off",
+                "cloud backup destination is only supported with 'backup_method = postgres' or 'backup_method = local-to-cloud'",
+            ),
+            (
+                None,
+                None,
+                None,
+                "postgres",
+                True,
+                "WORM mode is not supported when the backup or WAL destination is a cloud storage",
+            ),
+            (
+                None,
+                None,
+                None,
+                "postgres",
+                "off",
+                None,
+            ),
+            (
+                None,
+                None,
+                None,
+                "local-to-cloud",
+                "off",
+                None,
+            ),
+        ],
+    )
+    @patch("barman.server.Server.get_wal_cloud_interface", new_callable=lambda: Mock())
+    @patch(
+        "barman.server.Server.get_backup_cloud_interface", new_callable=lambda: Mock()
+    )
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    @patch("barman.server.Server.use_backup_cloud_storage", new_callable=lambda: True)
+    def test_check_cloud_storage_configuration(
+        self,
+        _mock_use_backup_cloud,
+        _mock_use_wal_cloud,
+        _mock_get_backup_cloud_interface,
+        _mock_get_wal_cloud_interface,
+        backup_compression,
+        compression,
+        encryption,
+        backup_method,
+        worm_mode,
+        hint,
+    ):
+        mock_strategy = Mock()
+        server = build_real_server(
+            main_conf={
+                "backup_compression": backup_compression,
+                "compression": compression,
+                "encryption": encryption,
+                "backup_method": backup_method,
+                "worm_mode": worm_mode,
+            }
+        )
+        server.check_cloud_storage_configuration(mock_strategy)
+        mock_strategy.init_check.assert_called_once_with("cloud storage configuration")
+        if hint:
+            mock_strategy.result.assert_called_once_with(
+                server.config.name, False, hint=hint
+            )
+        else:
+            mock_strategy.result.assert_called_once_with(server.config.name, True)
+
+    @pytest.mark.parametrize("wal_cloud_connectivity", [False, True])
+    @pytest.mark.parametrize("backup_cloud_connectivity", [False, True])
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: True)
+    @patch("barman.server.Server.use_backup_cloud_storage", new_callable=lambda: True)
+    def test_check_cloud_storage_configuration_cloud_connectivity(
+        self,
+        _mock_use_backup_cloud,
+        _mock_use_wal_cloud,
+        backup_cloud_connectivity,
+        wal_cloud_connectivity,
+    ):
+        """
+        Test check_cloud_storage_configuration and make sure it fails when the
+        respective cloud provider for backup or WAL is not reachable.
+        """
+        # Mock a strategy and a server with no problematic configuration
+        mock_strategy = Mock()
+        server = build_real_server(
+            main_conf={
+                "backup_compression": "none",
+                "compression": None,
+                "encryption": None,
+                "backup_method": "postgres",
+                "worm_mode": "off",
+            }
+        )
+        # Mock the cloud interfaces to return the desired connectivity status
+        server.get_backup_cloud_interface = Mock(
+            return_value=Mock(test_connectivity=lambda: backup_cloud_connectivity)
+        )
+        server.get_wal_cloud_interface = Mock(
+            return_value=Mock(test_connectivity=lambda: wal_cloud_connectivity)
+        )
+        # WHEN the check is performed
+        server.check_cloud_storage_configuration(mock_strategy)
+        # THEN the check is initialized
+        mock_strategy.init_check.assert_called_once_with("cloud storage configuration")
+        # AND the result and hint messages are as expected
+        if not backup_cloud_connectivity:
+            mock_strategy.result.assert_any_call(
+                server.config.name,
+                False,
+                hint="Could not connect to the cloud provider for backup storage. "
+                "Check your credentials and configuration",
+            )
+        elif not wal_cloud_connectivity:
+            mock_strategy.result.assert_any_call(
+                server.config.name,
+                False,
+                hint="Could not connect to the cloud provider for WAL storage. Check "
+                "your credentials and configuration",
+            )
+        else:
+            mock_strategy.result.assert_called_once_with(server.config.name, True)
+
+    @patch("barman.server.Server.use_wal_cloud_storage", new_callable=lambda: False)
+    @patch("barman.server.Server.use_backup_cloud_storage", new_callable=lambda: False)
+    def test_check_cloud_storage_configuration_no_url_configured(
+        self, _mock_use_backup_cloud, use_wal_cloud
+    ):
+        mock_strategy = Mock()
+        server = build_real_server()
+        server.check_cloud_storage_configuration(mock_strategy)
+        mock_strategy.init_check.assert_not_called()
+
     def test_check_backup_validity_exceeds_minimum_size(self, server, capsys):
         backup = build_test_backup_info(
             server=server,
@@ -4044,8 +4432,44 @@ class TestServer(object):
         "suffix",
         ["duplicate", "unknown"],
     )
+    @patch("barman.server.datetime")
+    def test_get_errors_dst(self, mock_datetime, suffix):
+        """
+        Test the _get_errors_dst method generates correct destination paths
+        """
+        errors_dir = "path/to/errors"
+        server = build_real_server(
+            main_conf={
+                "backup_options": "concurrent_backup",
+                "errors_directory": errors_dir,
+            }
+        )
+
+        # Mock datetime to return a fixed timestamp
+        mock_now = Mock()
+        mock_now.strftime.return_value = "20260212T093045Z"
+        mock_datetime.datetime.now.return_value = mock_now
+
+        filename = "000000010000000000000001"
+        result = server._get_errors_dst(filename, suffix)
+
+        # Verify datetime.now was called with timezone.utc
+        mock_datetime.datetime.now.assert_called_once_with(mock_datetime.timezone.utc)
+
+        # Verify the returned path has the correct format
+        expected = "%s/%s.%s.%s" % (errors_dir, filename, "20260212T093045Z", suffix)
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["duplicate", "unknown"],
+    )
     @patch("barman.server.shutil")
     def test_move_wal_file_to_errors_directory(self, mock_shutil, suffix):
+        """
+        Test the move_wal_file_to_errors_directory method generates correct destination
+        paths and moves the file to the errors directory.
+        """
         errors_dir = "path/to/errors"
         server = build_real_server(
             main_conf={
@@ -4060,6 +4484,33 @@ class TestServer(object):
         error_dst = "%s/%s.%s.%s" % (errors_dir, filename, stamp, suffix)
         server.move_wal_file_to_errors_directory(src, filename, suffix)
         mock_shutil.move.assert_called_once_with(src, error_dst)
+        mock_shutil.copy.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "suffix",
+        ["duplicate", "unknown"],
+    )
+    @patch("barman.server.shutil")
+    def test_copy_wal_file_to_errors_directory(self, mock_shutil, suffix):
+        """
+        Test the copy_wal_file_to_errors_directory method generates correct destination
+        paths and copies the file to the errors directory.
+        """
+        errors_dir = "path/to/errors"
+        server = build_real_server(
+            main_conf={
+                "backup_options": "concurrent_backup",
+                "errors_directory": errors_dir,
+            }
+        )
+
+        src = "original_file"
+        filename = "filename"
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        error_dst = "%s/%s.%s.%s" % (errors_dir, filename, stamp, suffix)
+        server.copy_wal_file_to_errors_directory(src, filename, suffix)
+        mock_shutil.copy.assert_called_once_with(src, error_dst)
+        mock_shutil.move.assert_not_called()
 
 
 class TestCheckStrategy(object):
@@ -4187,3 +4638,9 @@ class TestCheckStrategy(object):
         record = records.pop()
         assert record.levelname == "ERROR"
         assert record.msg == "Check 'wal_level' failed for server 'test_server_one'"
+
+    def test_get_wal_cloud_interface(self):
+        pass
+
+    def test_get_backup_cloud_interface(self):
+        pass

@@ -39,6 +39,7 @@ from barman.config import (
     ConfigChangesProcessor,
     RecoveryOptions,
     parse_combine_mode,
+    parse_si_suffix,
     parse_staging_path,
 )
 from barman.exceptions import (
@@ -69,7 +70,7 @@ from barman.utils import (
     parse_log_level,
     parse_target_tli,
 )
-from barman.xlog import check_archive_usable
+from barman.xlog import check_archive_usable, is_any_xlog_file
 
 if sys.version_info.major < 3:
     from argparse import Action, _ActionsContainer, _SubParsersAction
@@ -559,6 +560,18 @@ def backup_completer(prefix, parsed_args, **kwargs):
             default=None,
             type=check_non_negative,
         ),
+        argument(
+            "--cloud-staging-directory",
+            help="A staging directory for when sending backups to a cloud destination",
+            type=parse_staging_path,
+        ),
+        argument(
+            "--cloud-staging-max-size",
+            help="Max size that `--cloud-staging-directory` can reach. "
+            "If this value is ever surparsed then the backup process is paused and "
+            "only resumed when enough space is available. Default is 30Gi.",
+            type=parse_si_suffix,
+        ),
     ]
 )
 def backup(args):
@@ -610,6 +623,11 @@ def backup(args):
             server.config.bandwidth_limit = args.bwlimit
         if args.check_timeout is not None:
             server.config.check_timeout = args.check_timeout
+        if args.cloud_staging_directory is not None:
+            server.config.cloud_staging_directory = args.cloud_staging_directory
+        if args.cloud_staging_max_size is not None:
+            server.config.cloud_staging_max_size = args.cloud_staging_max_size
+
         with closing(server):
             server.backup(
                 wait=args.wait,
@@ -988,6 +1006,15 @@ def rebuild_xlogdb(args):
             ),
         ),
         argument(
+            "--restore-command",
+            dest="restore_command",
+            default=None,
+            help=(
+                "Custom restore command to override Barman's default restore_command. "
+                "It requires get-wal to be enabled and will be ignored otherwise."
+            ),
+        ),
+        argument(
             "--delta-restore",
             dest="delta_restore",
             help="Enable delta restore mode.",
@@ -1040,6 +1067,16 @@ def restore(args):
         inactive_is_error=False,
         disabled_is_error=True,
     )
+
+    if server.use_backup_cloud_storage or server.use_wal_cloud_storage:
+        output.error(
+            "Cannot restore backup %s of server '%s' because it is configured with a "
+            "cloud storage. Restoring a backup stored in a cloud environment is "
+            "currently not supported",
+            args.backup_id,
+            server.config.name,
+        )
+        output.close_and_exit()
 
     # PostgreSQL supports multiple parameters to specify when the recovery
     # process will end, and in that case the last entry in recovery
@@ -1405,6 +1442,7 @@ def restore(args):
                 standby_mode=getattr(args, "standby_mode", None),
                 recovery_conf_filename=args.recovery_conf_filename,
                 recovery_option_port=args.recovery_option_port,
+                custom_restore_command=args.restore_command,
                 **snapshot_kwargs,
             )
         except RecoveryException as exc:
@@ -1885,6 +1923,14 @@ def get_wal(args):
         disabled_is_error=True,
     )
 
+    if server.use_wal_cloud_storage:
+        output.error(
+            "Cannot retrieve WAL file for server '%s' because it is configured with a "
+            "cloud object storage. WAL retrieval is only supported for local storages.",
+            args.server_name,
+        )
+        output.close_and_exit()
+
     if getattr(args, "test", None):
         output.info(
             "Ready to retrieve WAL files from the server %s", server.config.name
@@ -2125,9 +2171,20 @@ def generate_manifest(args):
     Generate a manifest-backup for the given server and backup id
     """
     server = get_server(args)
+
     # Raises an error if wrong backup
     backup_info = parse_backup_id(server, args)
     # know context (remote backup? local?)
+
+    if server.use_backup_cloud_storage:
+        output.error(
+            "Cannot generate backup manifest for backup '%s' of server '%s' because "
+            "a cloud backup storage is configured. The manifest generation is only "
+            "supported for local backup storage.",
+            args.backup_id,
+            args.server_name,
+        )
+        output.close_and_exit()
 
     local_file_manager = LocalFileManager()
     backup_manifest = BackupManifest(
@@ -2330,6 +2387,50 @@ def config_update(args):
             )
             if server:
                 server.restart_processes()
+
+
+@command(
+    [
+        argument(
+            "server_name",
+            completer=server_completer,
+            help="specifies the server name for the command",
+        ),
+        argument(
+            "wal_path",
+            help="the value of the '%%p' keyword (according to 'archive_command').",
+        ),
+    ]
+)
+def cloud_wal_archive(args):
+    """
+    Push a WAL file from the local disk to a configured cloud object storage.
+
+    This command is intended to be used as 'archive_command' in Postgres when using the
+    'local-to-cloud' backup method for taking base backups.
+    """
+    if os.path.isdir(args.wal_path):
+        output.error(f"wal_path cannot be a directory: {args.wal_path}")
+        output.close_and_exit()
+
+    if not os.path.exists(args.wal_path):
+        output.error(f"WAL file does not exist: {args.wal_path}")
+        output.close_and_exit()
+
+    if not is_any_xlog_file(args.wal_path):
+        output.error(f"File is not a valid WAL file: {args.wal_path}")
+        output.close_and_exit()
+
+    server = get_server(
+        args,
+        skip_inactive=True,
+        skip_passive=True,
+    )
+
+    with closing(server):
+        server.cloud_wal_archive(args.wal_path)
+
+    output.close_and_exit()
 
 
 def pretty_args(args):

@@ -20,6 +20,7 @@
 This module represents a Server.
 Barman is able to manage multiple servers.
 """
+
 import datetime
 import errno
 import json
@@ -41,8 +42,16 @@ import dateutil.tz
 import barman
 from barman import fs, output, xlog
 from barman.backup import BackupManager
+from barman.cloud_providers import (
+    get_cloud_interface_from_server_config,
+    recognize_cloud_provider,
+)
 from barman.command_wrappers import BarmanSubProcess, Command, Rsync
-from barman.compression import CustomCompressor
+from barman.compression import (
+    CustomCompressor,
+    InternalCompressor,
+    compression_registry,
+)
 from barman.copy_controller import RsyncCopyController
 from barman.encryption import get_passphrase_from_command
 from barman.exceptions import (
@@ -105,7 +114,13 @@ from barman.utils import (
     pretty_size,
     timeout,
 )
-from barman.wal_archiver import FileWalArchiver, StreamingWalArchiver, WalArchiver
+from barman.wal_archiver import (
+    CloudWalStorageStrategy,
+    FileWalArchiver,
+    LocalWalStorageStrategy,
+    StreamingWalArchiver,
+    WalArchiver,
+)
 
 PARTIAL_EXTENSION = ".partial"
 PRIMARY_INFO_FILE = "primary.info"
@@ -267,6 +282,8 @@ class Server(RemoteStatusMixin):
         self.enforce_retention_policies = False
         self.postgres = None
         self.streaming = None
+        self.wal_storage = None
+        self.backup_storage = None
         self.archivers = []
 
         # Postgres configuration is available only if node is not passive
@@ -275,6 +292,8 @@ class Server(RemoteStatusMixin):
 
         # Initialize the backup manager
         self.backup_manager = BackupManager(self)
+
+        self._init_wal_storage()
 
         if not self.passive_node:
             self._init_archivers()
@@ -341,6 +360,12 @@ class Server(RemoteStatusMixin):
                 self.config.update_msg_list_and_disable_server(
                     "Streaming connection: " + force_str(e).strip()
                 )
+
+    def _init_wal_storage(self):
+        if self.use_wal_cloud_storage:
+            self.wal_storage = CloudWalStorageStrategy(self.backup_manager, self)
+        else:
+            self.wal_storage = LocalWalStorageStrategy(self.backup_manager, self)
 
     def _init_archivers(self):
         # Initialize the StreamingWalArchiver
@@ -597,6 +622,58 @@ class Server(RemoteStatusMixin):
         if self.streaming:
             self.streaming.close()
 
+    @property
+    def backup_cloud_provider(self):
+        if getattr(self, "_backup_cloud_provider", None) is None:
+            self._backup_cloud_provider = recognize_cloud_provider(
+                self.config.basebackups_directory
+            )
+        return self._backup_cloud_provider
+
+    @property
+    def wal_cloud_provider(self):
+        if getattr(self, "_wal_cloud_provider", None) is None:
+            self._wal_cloud_provider = recognize_cloud_provider(
+                self.config.wals_directory
+            )
+        return self._wal_cloud_provider
+
+    @property
+    def use_backup_cloud_storage(self):
+        """Whether the server is using cloud storage for backups"""
+        return bool(self.backup_cloud_provider)
+
+    @property
+    def use_wal_cloud_storage(self):
+        """Whether the server is using cloud storage for WALs"""
+        return bool(self.wal_cloud_provider)
+
+    def get_wal_cloud_interface(self):
+        """
+        Get the cloud interface for WAL storage.
+
+        :returns CloudInterface|None: the cloud interface object, if configured
+        """
+        cloud_provider = self.wal_cloud_provider
+        if not cloud_provider:
+            return None
+        return get_cloud_interface_from_server_config(
+            self.config, cloud_provider, self.config.wals_directory
+        )
+
+    def get_backup_cloud_interface(self):
+        """
+        Get the cloud interface for backup storage.
+
+        :returns CloudInterface|None: the cloud interface object, if configured
+        """
+        cloud_provider = self.backup_cloud_provider
+        if not cloud_provider:
+            return None
+        return get_cloud_interface_from_server_config(
+            self.config, cloud_provider, self.config.basebackups_directory
+        )
+
     def check(self, check_strategy=__default_check_strategy):
         """
         Implements the 'server check' command and makes sure SSH and PostgreSQL
@@ -625,6 +702,8 @@ class Server(RemoteStatusMixin):
                 self.check_backup_validity(check_strategy)
                 # Check if encryption works
                 self.check_encryption(check_strategy)
+                # Check cloud storage configuration
+                self.check_cloud_storage_configuration(check_strategy)
                 # Check WAL archiving is happening
                 self.check_wal_validity(check_strategy)
                 # Executes the backup manager set of checks
@@ -1111,6 +1190,115 @@ class Server(RemoteStatusMixin):
                 ),
             )
 
+    def check_cloud_storage_configuration(self, check_strategy):
+        """
+        Checks cloud storage configuration in case the backup destination
+        is a cloud storage.
+
+        :param CheckStrategy check_strategy: The strategy for the management
+            of the results of the various checks.
+        """
+        if not self.use_backup_cloud_storage and not self.use_wal_cloud_storage:
+            return
+
+        check_strategy.init_check("cloud storage configuration")
+
+        if self.use_backup_cloud_storage and self.config.backup_compression not in (
+            None,
+            "none",
+        ):
+            check_strategy.result(
+                self.config.name,
+                False,
+                hint="compression is not supported when the backup destination is a "
+                "cloud storage",
+            )
+            return
+        if self.use_wal_cloud_storage and self.config.compression:
+            compressor_cls = compression_registry.get(self.config.compression)
+            if compressor_cls is None or not issubclass(
+                compressor_cls, InternalCompressor
+            ):
+                check_strategy.result(
+                    self.config.name,
+                    False,
+                    hint="cloud WAL storage only supports in-memory compression "
+                    "algorithms (gzip, bzip2, xz, zstd, lz4, snappy). "
+                    "'%s' is not supported" % self.config.compression,
+                )
+                return
+        if self.use_backup_cloud_storage and self.config.encryption:
+            check_strategy.result(
+                self.config.name,
+                False,
+                hint="encryption is not supported when the backup destination is a "
+                "cloud storage",
+            )
+            return
+        if self.use_backup_cloud_storage and self.config.backup_method not in {
+            "local-to-cloud",
+            "postgres",
+        }:
+            check_strategy.result(
+                self.config.name,
+                False,
+                hint="cloud backup destination is only supported with "
+                "'backup_method = postgres' or 'backup_method = local-to-cloud'",
+            )
+            return
+        if (
+            self.use_backup_cloud_storage or self.use_wal_cloud_storage
+        ) and self.config.worm_mode:
+            check_strategy.result(
+                self.config.name,
+                False,
+                hint="WORM mode is not supported when the backup or WAL destination is "
+                "a cloud storage",
+            )
+            return
+        if self.use_backup_cloud_storage:
+            cloud_interface = self.get_backup_cloud_interface()
+            # Use a try-except block here because sometimes it might fail with another
+            # exception other than the one catched in test_connectivity()
+            try:
+                can_connect = cloud_interface.test_connectivity()
+            except Exception as ex:
+                can_connect = False
+                _logger.error(
+                    "Exception occurred while testing cloud connectivity for backup storage: %s",
+                    ex,
+                )
+            if not can_connect:
+                check_strategy.result(
+                    self.config.name,
+                    False,
+                    hint="Could not connect to the cloud provider for backup storage. Check your "
+                    "credentials and configuration",
+                )
+                return
+        if self.use_wal_cloud_storage:
+            cloud_interface = self.get_wal_cloud_interface()
+            # Use a try-except block here because sometimes it might fail with another
+            # exception other than the one catched in test_connectivity()
+            try:
+                can_connect = cloud_interface.test_connectivity()
+            except Exception as ex:
+                can_connect = False
+                _logger.error(
+                    "Exception occurred while testing cloud connectivity for WAL storage: %s",
+                    ex,
+                )
+            if not can_connect:
+                check_strategy.result(
+                    self.config.name,
+                    False,
+                    hint="Could not connect to the cloud provider for WAL storage. Check your "
+                    "credentials and configuration",
+                )
+                return
+
+        check_strategy.result(self.config.name, True)
+
     def _make_directories(self):
         """
         Make backup directories in case they do not exist
@@ -1118,7 +1306,8 @@ class Server(RemoteStatusMixin):
         for key in self.config.KEYS:
             if key.endswith("_directory") and hasattr(self.config, key):
                 val = getattr(self.config, key)
-                if val is not None and not os.path.isdir(val):
+                # Create the directory only if it does not exist and is not a URL
+                if val is not None and not os.path.isdir(val) and "://" not in val:
                     # noinspection PyTypeChecker
                     os.makedirs(val)
 
@@ -2150,18 +2339,6 @@ class Server(RemoteStatusMixin):
                     break
                 yield wal_info
 
-    def get_wal_full_path(self, wal_name):
-        """
-        Build the full path of a WAL for a server given the name
-
-        :param wal_name: WAL file name
-        """
-        # Build the path which contains the file
-        hash_dir = os.path.join(self.config.wals_directory, xlog.hash_dir(wal_name))
-        # Build the WAL file full path
-        full_path = os.path.join(hash_dir, wal_name)
-        return full_path
-
     def get_wal_possible_paths(self, wal_name, partial=False):
         """
         Build a list of possible positions of a WAL file
@@ -2328,6 +2505,8 @@ class Server(RemoteStatusMixin):
             configurations
         :kwparam str|None recovery_option_port: port to set in restore command
             when invoking ``barman-wal-restore``
+        :kwparam str|None custom_restore_command: Custom restore command
+            to override Barman's default (only used with get-wal mode)
         """
         return self.backup_manager.recover(
             backup_info, dest, wal_dest, tablespaces, remote_command, **kwargs
@@ -2867,6 +3046,44 @@ class Server(RemoteStatusMixin):
                 if os.path.exists(item.tmp_path):
                     os.unlink(item.tmp_path)
 
+    def cloud_wal_archive(self, wal_path):
+        """
+        Archive a WAL file to a cloud object storage.
+
+        :param str wal_path: the path of the WAL file to archive
+        """
+        output.debug(
+            "Starting cloud-wal-archive for WAL file %s on server %s",
+            wal_path,
+            self.config.name,
+        )
+
+        if self.config.backup_method != "local-to-cloud":
+            output.error(
+                "cloud-wal-archive is only supported for servers with 'backup_method' set to "
+                "'local-to-cloud'. Please check the configuration of server %s.",
+                self.config.name,
+            )
+            return
+
+        if not self.use_wal_cloud_storage:
+            output.error(
+                "cloud-wal-archive is not supported for server %s because no cloud storage "
+                "configuration is set in 'wals_directory'. Please check the "
+                "configuration of server %s.",
+                self.config.name,
+                self.config.name,
+            )
+            return
+
+        self.backup_manager.cloud_wal_archive(wal_path)
+
+        output.debug(
+            "Finished cloud-wal-archive for WAL file %s on server %s",
+            wal_path,
+            self.config.name,
+        )
+
     def cron(self, wals=True, retention_policies=True, keep_descriptors=False):
         """
         Maintenance operations
@@ -3297,7 +3514,21 @@ class Server(RemoteStatusMixin):
 
         :return str: the directory that contains the xlogdb file
         """
-        return self.config.xlogdb_directory
+        # If using a local storage for WALs, use the xlogdb_directory location as is
+        if not self.use_wal_cloud_storage:
+            return self.config.xlogdb_directory
+
+        # By default xlogdb_directory is the same as wals_directory. When storing WALs
+        # in the cloud however, the wals_directory will be a cloud URL (e.g., s3://...),
+        # so we need to provide a different local path for the xlogdb file:
+
+        # 1. If there is a custom xlogdb_directory configured
+        # (i.e. it is not the same as wals_directory), then honor it
+        if not self.config.xlogdb_directory.startswith(self.config.wals_directory):
+            return self.config.xlogdb_directory
+
+        # 2. Otherwise, store the xlogdb in the meta directory as a safe fallback
+        return self.meta_directory
 
     @property
     def xlogdb_file_name(self):
@@ -3383,6 +3614,12 @@ class Server(RemoteStatusMixin):
                 os.unlink(os.path.join(self.config.wals_directory, "xlog.db"))
             except FileNotFoundError:
                 pass
+
+        if self.use_wal_cloud_storage:
+            output.error(
+                "Rebuilding xlogdb is not supported for servers using cloud storage"
+            )
+            return
 
         root = self.config.wals_directory
         wal_count = label_count = history_count = 0
@@ -3699,7 +3936,7 @@ class Server(RemoteStatusMixin):
 
             # Finish if the closed wal file is in the archive.
             if wal_file:
-                if os.path.exists(self.get_wal_full_path(wal_file)):
+                if self.wal_storage.exists(self.wal_storage.get_full_path(wal_file)):
                     break
             else:
                 # Check if any new file has been archived, on any timeline
@@ -4763,6 +5000,25 @@ class Server(RemoteStatusMixin):
             # Spawn the receive-wal sub-process
             self.background_receive_wal(keep_descriptors=False)
 
+    def _get_errors_dst(self, file_name, suffix):
+        """
+        Get the destination path for an unknown or (mismatching) duplicate WAL file in
+        the ``errors`` directory.
+
+        :param str file_name: Name of the incoming file.
+        :param str suffix: String which identifies the kind of the issue.
+
+            * ``duplicate``: if *src* is a (mismatching) duplicate WAL file.
+            * ``unknown``: if *src* is not an WAL file.
+
+        :return str: The destination path for the incoming file in the ``errors`` directory.
+        """
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return os.path.join(
+            self.config.errors_directory,
+            "%s.%s.%s" % (file_name, stamp, suffix),
+        )
+
     def move_wal_file_to_errors_directory(self, src, file_name, suffix):
         """
         Move an unknown or (mismatching) duplicate WAL file to the ``errors`` directory.
@@ -4790,15 +5046,31 @@ class Server(RemoteStatusMixin):
             * ``duplicate``: if *src* is a (mismatching) duplicate WAL file.
             * ``unknown``: if *src* is not an WAL file.
         """
-        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        error_dst = os.path.join(
-            self.config.errors_directory,
-            "%s.%s.%s" % (file_name, stamp, suffix),
-        )
+        error_dst = self._get_errors_dst(file_name, suffix)
         # TODO: cover corner case of duplication (unlikely,
         # but theoretically possible)
         try:
             shutil.move(src, error_dst)
+        except IOError as e:
+            if e.errno == errno.ENOENT:
+                _logger.warning("%s not found" % src)
+
+    def copy_wal_file_to_errors_directory(self, src, file_name, suffix):
+        """
+        Copy an unknown or (mismatching) duplicate WAL file to the ``errors`` directory.
+
+        .. note:
+            We aim to solve the same issue as :meth:`move_wal_file_to_errors_directory`,
+            but we want to keep the original file in place.
+
+            This is useful when running WAL archiving directly from ``pg_wal``, like we
+            do when using ``barman cloud-wal-archive``. Given the WAL file is inside
+            ``pg_wal``, we shouldn't move it to a different directory, but rather copy
+            it.
+        """
+        error_dst = self._get_errors_dst(file_name, suffix)
+        try:
+            shutil.copy(src, error_dst)
         except IOError as e:
             if e.errno == errno.ENOENT:
                 _logger.warning("%s not found" % src)

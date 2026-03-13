@@ -70,7 +70,7 @@ from barman.exceptions import (
     SnapshotBackupException,
     UnsupportedCompressionFormat,
 )
-from barman.infofile import BackupInfo, LocalBackupInfo, VolatileBackupInfo
+from barman.infofile import BackupInfo, BackupInfoFactory, VolatileBackupInfo
 from barman.utils import (
     force_str,
     get_major_version,
@@ -127,6 +127,7 @@ class RecoveryExecutor(object):
         standby_mode=None,
         recovery_conf_filename=None,
         recovery_option_port=None,
+        custom_restore_command=None,
     ):
         """
         Performs a recovery of a backup
@@ -157,6 +158,8 @@ class RecoveryExecutor(object):
             configurations
         :kwparam str|None recovery_option_port: port to set in restore command
             when invoking ``barman-wal-restore``
+        :param str|None custom_restore_command: Custom restore command
+            to override Barman's default (only used with get-wal mode)
         """
 
         # Run the cron to be sure the wal catalog is up to date
@@ -167,6 +170,7 @@ class RecoveryExecutor(object):
             dest,
             recovery_conf_filename,
             recovery_option_port,
+            custom_restore_command,
         )
 
         output.info(
@@ -255,7 +259,9 @@ class RecoveryExecutor(object):
             # backup info again and check whether it has been validated.
             # Notify the user if it is still not DONE.
             if backup_info.status == BackupInfo.WAITING_FOR_WALS:
-                data = LocalBackupInfo(self.server, backup_info.filename)
+                data = BackupInfoFactory.build_backup_info(
+                    self.server, backup_info.filename
+                )
                 if data.status == BackupInfo.WAITING_FOR_WALS:
                     output.warning(
                         "IMPORTANT: The backup we have restored IS NOT "
@@ -381,6 +387,7 @@ class RecoveryExecutor(object):
         dest,
         recovery_conf_filename,
         recovery_option_port,
+        custom_restore_command,
     ):
         """
         Prepare the recovery_info dictionary for the recovery, as well
@@ -392,6 +399,8 @@ class RecoveryExecutor(object):
         :param str|None recovery_conf_filename: filename for storing recovery configurations
         :kwparam str|None recovery_option_port: port to set in restore command
             when invoking ``barman-wal-restore``
+        :param str|None custom_restore_command: Custom restore command
+            to override Barman's default (only used with get-wal mode)
         :return dict: recovery_info dictionary, holding the basic values for a
             recovery
         """
@@ -416,6 +425,7 @@ class RecoveryExecutor(object):
             "wal_dest": wal_dest,
             "get_wal": RecoveryOptions.GET_WAL in self.config.recovery_options,
             "recovery_option_port": recovery_option_port,
+            "custom_restore_command": custom_restore_command,
         }
         # A map that will keep track of the results of the recovery.
         # Used for output generation
@@ -645,7 +655,7 @@ class RecoveryExecutor(object):
             dest_info_txt = recovery_info["cmd"].get_file_content(
                 os.path.join(dest, ".barman-recover.info")
             )
-            dest_info = LocalBackupInfo(
+            dest_info = BackupInfoFactory.build_backup_info(
                 self.server, info_file=BytesIO(dest_info_txt.encode("utf-8"))
             )
             dest_begin_time = dest_info.begin_time
@@ -1098,57 +1108,83 @@ class RecoveryExecutor(object):
         # required wal files. Otherwise use the unix command "cp" to copy
         # them from the wal_dest directory
         if recovery_info["get_wal"]:
-            port_option = ""
-            if recovery_info["recovery_option_port"] is not None:
-                port_option = "--port %s" % recovery_info["recovery_option_port"]
-            partial_option = ""
-            if not standby_mode:
-                partial_option = "-P"
-
-            # We need to create the right restore command.
-            # If we are doing a remote recovery,
-            # the barman-cli package is REQUIRED on the server that is hosting
-            # the PostgreSQL server.
-            # We use the machine FQDN and the barman_user
-            # setting to call the barman-wal-restore correctly.
-            # If local recovery, we use barman directly, assuming
-            # the postgres process will be executed with the barman user.
-            # It MUST to be reviewed by the user in any case.
-            if remote_command:
-                fqdn = socket.getfqdn()
+            # Check for custom restore command
+            if recovery_info["custom_restore_command"]:
+                # Use custom command if provided
+                # Escape single quotes in custom command for PostgreSQL config syntax
+                escaped_custom_command = recovery_info[
+                    "custom_restore_command"
+                ].replace("'", "''")
                 recovery_conf_lines.append(
-                    "# The 'barman-wal-restore' command "
-                    "is provided in the 'barman-cli' package"
+                    f"restore_command = '{escaped_custom_command}'"
                 )
-                restore_command = (
-                    "restore_command = 'barman-wal-restore %s -U %s %s %s %s %%f %%p'"
-                    % (
-                        partial_option,
-                        self.config.config.user,
-                        port_option,
-                        fqdn,
-                        self.config.name,
-                    )
+                output.info(
+                    "Custom restore command override: restore_command = '%s'",
+                    escaped_custom_command,
                 )
-                if self.config.parallel_jobs > 1:
-                    # Remove the last 'tick' if we are appending a `-p jobs'`.
-                    restore_command = (
-                        restore_command[:-1] + " -p %s'" % self.config.parallel_jobs
-                    )
-                # Normalize spaces
-                restore_command = re.sub(r"\s+", " ", restore_command)
-                recovery_conf_lines.append(restore_command)
             else:
-                recovery_conf_lines.append(
-                    "# The 'barman get-wal' command "
-                    "must run as '%s' user" % self.config.config.user
-                )
-                recovery_conf_lines.append(
-                    "restore_command = 'barman get-wal %s %s %%f > %%p'"
-                    % (partial_option, self.config.name)
-                )
+                # No custom command, generate default restore command for get_wal
+                port_option = ""
+                if recovery_info["recovery_option_port"] is not None:
+                    port_option = "--port %s" % recovery_info["recovery_option_port"]
+                partial_option = ""
+                if not standby_mode:
+                    partial_option = "-P"
+
+                output.debug("Using default Barman restore command for get-wal mode")
+                # We need to create the right restore command.
+                # If we are doing a remote recovery,
+                # the barman-cli package is REQUIRED on the server that is hosting
+                # the PostgreSQL server.
+                # We use the machine FQDN and the barman_user
+                # setting to call the barman-wal-restore correctly.
+                # If local recovery, we use barman directly, assuming
+                # the postgres process will be executed with the barman user.
+                # It MUST to be reviewed by the user in any case.
+                if remote_command:
+                    fqdn = socket.getfqdn()
+                    recovery_conf_lines.append(
+                        "# The 'barman-wal-restore' command "
+                        "is provided in the 'barman-cli' package"
+                    )
+                    restore_command = (
+                        "restore_command = 'barman-wal-restore %s -U %s %s %s %s "
+                        "%%f %%p'"
+                        % (
+                            partial_option,
+                            self.config.config.user,
+                            port_option,
+                            fqdn,
+                            self.config.name,
+                        )
+                    )
+                    if self.config.parallel_jobs > 1:
+                        # Remove the last 'tick' if we are appending a `-p jobs'`.
+                        restore_command = (
+                            restore_command[:-1] + " -p %s'" % self.config.parallel_jobs
+                        )
+                    # Normalize spaces
+                    restore_command = re.sub(r"\s+", " ", restore_command)
+                    recovery_conf_lines.append(restore_command)
+                else:
+                    # Local recovery with get_wal
+                    recovery_conf_lines.append(
+                        "# The 'barman get-wal' command "
+                        "must run as '%s' user" % self.config.config.user
+                    )
+                    recovery_conf_lines.append(
+                        "restore_command = 'barman get-wal %s %s %%f > %%p'"
+                        % (partial_option, self.config.name)
+                    )
+            # Set get_wal result for both custom and default restore commands
             recovery_info["results"]["get_wal"] = True
         elif not standby_mode:
+            # Check if custom command was provided when get-wal is not enabled
+            if recovery_info["custom_restore_command"]:
+                output.warning(
+                    "The provided custom restore command was ignored as it only "
+                    "works with get-wal mode."
+                )
             # We copy all the needed WAL files to the wal_dest directory when get-wal
             # is not requested, except when we are in standby mode. In the case of
             # standby mode, the server will not exit recovery, so the
@@ -1653,6 +1689,7 @@ class SnapshotRecoveryExecutor(RemoteConfigRecoveryExecutor):
         standby_mode=None,
         recovery_conf_filename=None,
         recovery_option_port=None,
+        custom_restore_command=None,
         recovery_instance=None,
     ):
         """
@@ -1684,6 +1721,8 @@ class SnapshotRecoveryExecutor(RemoteConfigRecoveryExecutor):
             configurations
         :kwparam str|None recovery_option_port: port to set in restore command
             when invoking ``barman-wal-restore``
+        :param str|None custom_restore_command: Custom command to use for the
+            restore command (only works when get-wal is enabled)
         :param str|None recovery_instance: The name of the recovery node as it
             is known by the cloud provider
         """
@@ -1720,6 +1759,7 @@ class SnapshotRecoveryExecutor(RemoteConfigRecoveryExecutor):
             standby_mode=standby_mode,
             recovery_conf_filename=recovery_conf_filename,
             recovery_option_port=recovery_option_port,
+            custom_restore_command=custom_restore_command,
         )
 
     def _start_backup_copy_message(self):

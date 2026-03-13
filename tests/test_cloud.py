@@ -28,7 +28,7 @@ from functools import partial
 from io import BytesIO
 from tarfile import TarFile, TarInfo
 from tarfile import open as open_tar
-from tempfile import NamedTemporaryFile
+from tempfile import NamedTemporaryFile, _TemporaryFileWrapper
 from unittest import TestCase
 
 import botocore
@@ -64,12 +64,17 @@ from barman.cloud import (
 from barman.cloud_providers import (
     CloudProviderOptionUnsupported,
     CloudProviderUnsupported,
+    ObjectKeyAlreadyExists,
     get_cloud_interface,
+    get_cloud_interface_from_server_config,
+    validate_azure_blob_storage_url,
+    validate_google_cloud_url,
+    validate_s3_url,
 )
 from barman.cloud_providers.aws_s3 import S3CloudInterface
 from barman.cloud_providers.azure_blob_storage import AzureCloudInterface
 from barman.cloud_providers.google_cloud_storage import GoogleCloudInterface
-from barman.exceptions import BackupPreconditionException
+from barman.exceptions import BackupPreconditionException, ConfigurationException
 from barman.infofile import BackupInfo, WalFileInfo
 
 if sys.version_info.major > 2:
@@ -104,6 +109,10 @@ def _compression_helper(src, compression):
     if compression == "snappy":
         dest = BytesIO()
         snappy.stream_compress(src, dest)
+    elif compression == "lz4":
+        import lz4.frame
+
+        dest = BytesIO(lz4.frame.compress(src.read()))
     elif compression == "gzip":
         dest = BytesIO()
         with gzip.GzipFile(fileobj=dest, mode="wb") as gz:
@@ -538,6 +547,7 @@ class TestS3CloudInterface(object):
         session_mock.resource.assert_called_once_with(
             "s3",
             endpoint_url=None,
+            region_name=None,
             config=config_mock.return_value,
         )
         # AND the s3 property of the cloud interface is set to the boto3
@@ -567,6 +577,108 @@ class TestS3CloudInterface(object):
         session_mock.resource.assert_called_once_with(
             "s3",
             endpoint_url=None,
+            region_name=None,
+            config=config_mock.return_value,
+        )
+
+    @mock.patch("barman.cloud_providers.aws_s3.Config")
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_uploader_region(self, boto_mock, config_mock):
+        # GIVEN an s3 bucket url
+        bucket_url = "s3://bucket/path/to/dir"
+
+        # WHEN an S3CloudInterface is created with a specified region
+        cloud_interface = S3CloudInterface(
+            url=bucket_url, encryption=None, region="us-west-2"
+        )
+
+        # THEN the cloud interface region property is set to the specified value
+        assert cloud_interface.region == "us-west-2"
+        # AND the boto3 resource is created with the specified region_name
+        session_mock = boto_mock.Session.return_value
+        session_mock.resource.assert_called_once_with(
+            "s3",
+            endpoint_url=None,
+            region_name="us-west-2",
+            config=config_mock.return_value,
+        )
+
+    @pytest.mark.parametrize(
+        "addressing_style, endpoint_url, expected_config_call",
+        [
+            # Test with None (default behavior)
+            (None, None, mock.call()),
+            # Test with 'auto' addressing style
+            ("auto", None, mock.call(s3={"addressing_style": "auto"})),
+            # Test with 'virtual' addressing style
+            ("virtual", None, mock.call(s3={"addressing_style": "virtual"})),
+            # Test with 'path' addressing style (original test case)
+            ("path", None, mock.call(s3={"addressing_style": "path"})),
+            # Test with virtual addressing + S3-compatible endpoint (primary use case)
+            (
+                "virtual",
+                "https://minio.example.com",
+                mock.call(s3={"addressing_style": "virtual"}),
+            ),
+            # Test with path addressing + S3-compatible endpoint
+            (
+                "path",
+                "https://s3-compatible.example.com",
+                mock.call(s3={"addressing_style": "path"}),
+            ),
+        ],
+    )
+    @mock.patch("barman.cloud_providers.aws_s3.Config")
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_uploader_addressing_style(
+        self,
+        boto_mock,
+        config_mock,
+        addressing_style,
+        endpoint_url,
+        expected_config_call,
+    ):
+        """
+        Test S3CloudInterface creation with various addressing_style configurations.
+
+        This test verifies that the addressing_style parameter is correctly passed to
+        boto3's Config object when creating an S3CloudInterface. The addressing_style
+        parameter allows users to override boto3's default behavior, which is particularly
+        important for S3-compatible storage providers (e.g., MinIO) that may require
+        virtual-hosted-style addressing even when using non-amazonaws.com endpoints.
+
+        Test scenarios:
+        - Default behavior (addressing_style=None)
+        - All three valid addressing styles: 'auto', 'virtual', 'path'
+        - Combinations with custom endpoint_url for S3-compatible storage
+        """
+        # GIVEN an s3 bucket url
+        bucket_url = "s3://bucket/path/to/dir"
+
+        # WHEN an S3CloudInterface is created with the specified addressing_style
+        # and endpoint_url
+        cloud_interface = S3CloudInterface(
+            url=bucket_url,
+            encryption=None,
+            addressing_style=addressing_style,
+            endpoint_url=endpoint_url,
+        )
+
+        # THEN the cloud interface addressing_style property is set correctly
+        assert cloud_interface.addressing_style == addressing_style
+        # AND the endpoint_url property is set correctly
+        assert cloud_interface.endpoint_url == endpoint_url
+        # AND a Config is created with the expected arguments
+        config_mock.assert_called_once_with(
+            **expected_config_call.kwargs if addressing_style else {}
+        )
+        # AND the boto3 resource is created with the specified endpoint_url
+        # and the created Config object
+        session_mock = boto_mock.Session.return_value
+        session_mock.resource.assert_called_once_with(
+            "s3",
+            endpoint_url=endpoint_url,
+            region_name=None,
             config=config_mock.return_value,
         )
 
@@ -755,6 +867,247 @@ class TestS3CloudInterface(object):
                 "Tagging": expected_tagging,
             },
             Config=cloud_interface.config,
+        )
+
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface._put_object")
+    def test_upload_fileobj_fail_if_exists(self, mock_put_object):
+        """
+        Test :meth:`upload_fileobj` with ``fail_if_exists=True`` defers to
+        :meth:`_put_object`.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir")
+        mock_fileobj = mock.MagicMock()
+        cloud_interface.upload_fileobj(
+            fileobj=mock_fileobj,
+            key="path/to/dir",
+            override_tags=None,
+            fail_if_exists=True,
+        )
+        mock_put_object.assert_called_once_with(
+            fileobj=mock_fileobj,
+            key="path/to/dir",
+            override_tags=None,
+            fail_if_exists=True,
+        )
+
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_put_object(self, boto_mock):
+        """
+        Tests synchronous file upload with boto3 using _put_object
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir", encryption=None)
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+
+        mock_fileobj = mock.MagicMock()
+        mock_key = "path/to/dir"
+        cloud_interface._put_object(mock_fileobj, mock_key)
+
+        s3_client.put_object.assert_called_once_with(
+            Body=mock_fileobj, Bucket="bucket", Key=mock_key
+        )
+
+    @pytest.mark.parametrize(
+        ("encryption_args", "expected_extra_args"),
+        [
+            (
+                {"encryption": "AES256", "sse_kms_key_id": None},
+                {"ServerSideEncryption": "AES256"},
+            ),
+            (
+                {"encryption": "aws:kms", "sse_kms_key_id": None},
+                {"ServerSideEncryption": "aws:kms"},
+            ),
+            (
+                {"encryption": "aws:kms", "sse_kms_key_id": "somekeyid"},
+                {"ServerSideEncryption": "aws:kms", "SSEKMSKeyId": "somekeyid"},
+            ),
+        ],
+    )
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_put_object_with_encryption(
+        self, boto_mock, encryption_args, expected_extra_args
+    ):
+        """
+        Tests the ServerSideEncryption and SSEKMSKeyId arguments are provided to boto3
+        when uploading a file if encryption args are set on the S3CloudInterface
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir", **encryption_args)
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+
+        mock_fileobj = mock.MagicMock()
+        mock_key = "path/to/dir"
+        cloud_interface._put_object(mock_fileobj, mock_key)
+
+        s3_client.put_object.assert_called_once_with(
+            Body=mock_fileobj, Bucket="bucket", Key=mock_key, **expected_extra_args
+        )
+
+    @pytest.mark.parametrize(
+        "cloud_interface_tags, override_tags, expected_tagging",
+        [
+            # Cloud interface tags are used if no override tags
+            (
+                [("foo", "bar"), ("baz $%", "qux -/")],
+                None,
+                "foo=bar&baz+%24%25=qux+-%2F",
+            ),
+            # Override tags are used in place of cloud interface tags
+            (
+                [("foo", "bar")],
+                [("$+ a", "///"), ("()", "[]")],
+                "%24%2B+a=%2F%2F%2F&%28%29=%5B%5D",
+            ),
+        ],
+    )
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_put_object_with_tags(
+        self, boto_mock, cloud_interface_tags, override_tags, expected_tagging
+    ):
+        """
+        Tests the Tagging argument is provided to boto3 when uploading
+        a file if tags are provided when creating S3CloudInterface.
+        """
+        cloud_interface = S3CloudInterface(
+            "s3://bucket/path/to/dir",
+            # Tags must be urlencoded so include quotable characters
+            tags=cloud_interface_tags,
+        )
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+
+        mock_fileobj = mock.MagicMock()
+        mock_key = "path/to/dir"
+        cloud_interface._put_object(mock_fileobj, mock_key, override_tags=override_tags)
+
+        s3_client.put_object.assert_called_once_with(
+            Body=mock_fileobj, Bucket="bucket", Key=mock_key, Tagging=expected_tagging
+        )
+
+    @pytest.mark.parametrize("object_exists", [True, False])
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface.check_object_existence")
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_put_object_fail_if_exists_old_boto_version(
+        self, boto_mock, mock_check, object_exists
+    ):
+        """
+        Test _put_object with fail_if_exists=True using boto3 versions
+        older than 1.35.2, which do not support the IfNoneMatch parameter
+        on put_object.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir")
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+        boto_mock.__version__ = "1.29.0"
+
+        mock_check.return_value = object_exists
+
+        mock_fileobj = mock.MagicMock()
+        mock_key = "path/to/dir"
+
+        if object_exists:
+            with pytest.raises(ObjectKeyAlreadyExists) as excinfo:
+                cloud_interface._put_object(mock_fileobj, mock_key, fail_if_exists=True)
+                mock_check.assert_called_once_with(mock_key)
+            assert str(excinfo.value) == (
+                "Object %s already exists in bucket %s"
+                % (mock_key, cloud_interface.bucket_name)
+            )
+        else:
+            cloud_interface._put_object(mock_fileobj, mock_key, fail_if_exists=True)
+            mock_check.assert_called_once_with(mock_key)
+            s3_client.put_object.assert_called_once_with(
+                Body=mock_fileobj, Bucket="bucket", Key=mock_key
+            )
+
+    @pytest.mark.parametrize("object_exists", [True, False])
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface.check_object_existence")
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_put_object_fail_if_exists_new_boto_version(
+        self, boto_mock, mock_check, object_exists
+    ):
+        """
+        Test _put_object with fail_if_exists=True using boto3 versions
+        1.35.2 and newer, which support the IfNoneMatch parameter
+        on put_object.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir")
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+        boto_mock.__version__ = "1.35.2"
+
+        s3_client.put_object.side_effect = (
+            ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "PreconditionFailed",
+                        "Message": "At least one of the pre-conditions you specified did not hold",
+                    }
+                },
+                operation_name="PutObject",
+            )
+            if object_exists
+            else None
+        )
+
+        mock_fileobj = mock.MagicMock()
+        mock_key = "path/to/dir"
+
+        if object_exists:
+            with pytest.raises(ObjectKeyAlreadyExists) as excinfo:
+                cloud_interface._put_object(mock_fileobj, mock_key, fail_if_exists=True)
+                mock_check.assert_not_called()
+                s3_client.put_object.assert_called_once_with(
+                    Body=mock_fileobj, Bucket="bucket", Key=mock_key, IfNoneMatch="*"
+                )
+            assert str(excinfo.value) == (
+                "Object %s already exists in bucket %s"
+                % (mock_key, cloud_interface.bucket_name)
+            )
+        else:
+            cloud_interface._put_object(mock_fileobj, mock_key, fail_if_exists=True)
+            s3_client.put_object.assert_called_once_with(
+                Body=mock_fileobj, Bucket="bucket", Key=mock_key, IfNoneMatch="*"
+            )
+
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_put_object_fails_with_conditional_failire(self, mock_boto):
+        """
+        Test that _put_object retries sending the file again when a
+        ConditionalRequestConflict error code is received from S3.
+        """
+        cloud_interface = S3CloudInterface("s3://bucket/path/to/dir")
+        session_mock = mock_boto.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+
+        mock_fileobj = mock.MagicMock()
+        mock_key = "path/to/dir"
+
+        # Simulate ConditionalRequestConflict error on first call, success on second call
+        s3_client.put_object.side_effect = [
+            ClientError(
+                error_response={
+                    "Error": {
+                        "Code": "ConditionalRequestConflict",
+                        "Message": "Some error message",
+                    }
+                },
+                operation_name="PutObject",
+            ),
+            None,
+        ]
+
+        cloud_interface._put_object(mock_fileobj, mock_key)
+
+        s3_client.put_object.assert_has_calls(
+            [mock.call(Body=mock_fileobj, Bucket="bucket", Key=mock_key)] * 2
         )
 
     @mock.patch("barman.cloud_providers.aws_s3.boto3")
@@ -1396,7 +1749,7 @@ class TestS3CloudInterface(object):
         mock_delete_obj.assert_not_called()
 
     @pytest.mark.skipif(sys.version_info < (3, 0), reason="Requires Python 3 or higher")
-    @pytest.mark.parametrize("compression", (None, "bzip2", "gzip", "snappy"))
+    @pytest.mark.parametrize("compression", (None, "bzip2", "gzip", "snappy", "lz4"))
     @mock.patch("barman.cloud_providers.aws_s3.boto3")
     def test_download_file(self, boto_mock, compression, tmpdir):
         """Verifies that cloud_interface.download_file decompresses correctly."""
@@ -1428,7 +1781,13 @@ class TestS3CloudInterface(object):
 
     @pytest.mark.parametrize(
         ("compression", "file_ext"),
-        ((None, ""), ("bzip2", ".bz2"), ("gzip", ".gz"), ("snappy", ".snappy")),
+        (
+            (None, ""),
+            ("bzip2", ".bz2"),
+            ("gzip", ".gz"),
+            ("snappy", ".snappy"),
+            ("lz4", ".lz4"),
+        ),
     )
     @mock.patch("barman.cloud_providers.aws_s3.boto3")
     def test_extract_tar(self, boto_mock, compression, file_ext, tmpdir):
@@ -1674,6 +2033,37 @@ class TestS3CloudInterface(object):
         # THEN a ValueError is raised
         with pytest.raises(ValueError):
             cloud_interface.delete_under_prefix(prefix)
+
+    @pytest.mark.parametrize("object_exists", [False, True])
+    @mock.patch("barman.cloud_providers.aws_s3.boto3")
+    def test_check_object_existence(self, boto_mock, object_exists):
+        """
+        Test ``S3CloudInterface._check_object_existence`` method.
+        Verifies that the method correctly checks for the existence of an object
+        in an S3 bucket using the ``head_object`` method of the S3 client.
+        """
+        # Mock the S3 client to raise a ClientError if the object does not exist
+        session_mock = boto_mock.Session.return_value
+        s3_mock = session_mock.resource.return_value
+        s3_client = s3_mock.meta.client
+        if not object_exists:
+            s3_client.head_object.side_effect = ClientError(
+                {"Error": {"Code": "404", "Message": "Not Found"}},
+                "HeadObject",
+            )
+
+        # GIVEN an S3CloudInterface
+        cloud_interface = S3CloudInterface("s3://bucket/test", encryption=None)
+
+        # WHEN _check_object_existence is called with a given object path
+        result = cloud_interface.check_object_existence("path/to/object")
+
+        # THEN head_object is called with the expected parameters
+        s3_client.head_object.assert_called_once_with(
+            Bucket="bucket", Key="path/to/object"
+        )
+        # AND the return value is as expected
+        assert result is object_exists
 
 
 class TestAzureCloudInterface(object):
@@ -2473,7 +2863,7 @@ class TestAzureCloudInterface(object):
         ) in caplog.text
 
     @pytest.mark.skipif(sys.version_info < (3, 0), reason="Requires Python 3 or higher")
-    @pytest.mark.parametrize("compression", (None, "bzip2", "gzip", "snappy"))
+    @pytest.mark.parametrize("compression", (None, "bzip2", "gzip", "snappy", "lz4"))
     @mock.patch.dict(
         os.environ, {"AZURE_STORAGE_CONNECTION_STRING": "connection_string"}
     )
@@ -2522,7 +2912,13 @@ class TestAzureCloudInterface(object):
 
     @pytest.mark.parametrize(
         ("compression", "file_ext"),
-        ((None, ""), ("bzip2", ".bz2"), ("gzip", ".gz"), ("snappy", ".snappy")),
+        (
+            (None, ""),
+            ("bzip2", ".bz2"),
+            ("gzip", ".gz"),
+            ("snappy", ".snappy"),
+            ("lz4", ".lz4"),
+        ),
     )
     @mock.patch.dict(
         os.environ, {"AZURE_STORAGE_CONNECTION_STRING": "connection_string"}
@@ -3319,6 +3715,126 @@ class TestGetCloudInterface(object):
         # AND the exception has the expected message
         assert expected_error == str(exc.value)
 
+    @pytest.mark.parametrize(
+        "cloud_provider",
+        [
+            "aws-s3",
+            "azure-blob-storage",
+            "google-cloud-storage",
+        ],
+    )
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface")
+    @mock.patch("barman.cloud_providers.azure_blob_storage.AzureCloudInterface")
+    @mock.patch("barman.cloud_providers.google_cloud_storage.GoogleCloudInterface")
+    def test_get_cloud_interface_from_server_config(
+        self,
+        mock_gcs_cloud_interface,
+        mock_azure_cloud_interface,
+        mock_s3_cloud_interface,
+        cloud_provider,
+    ):
+        """Test creating a CloudInterface from a server config"""
+        url = "http://some-bucket/some/path"
+        mock_config = MagicMock(
+            url=url,
+            parallel_jobs=8,
+            aws_profile="some-profile",
+            aws_region="us-east-1",
+            aws_encryption="AES256",
+            aws_sse_kms_key_id=None,
+            aws_read_timeout=60,
+            cloud_delete_batch_size=20,
+        )
+        ret = get_cloud_interface_from_server_config(mock_config, cloud_provider, url)
+        if cloud_provider == "aws-s3":
+            mock_s3_cloud_interface.assert_called_once_with(
+                url=url,
+                jobs=8,
+                profile_name="some-profile",
+                region="us-east-1",
+                encryption="AES256",
+                sse_kms_key_id=None,
+                read_timeout=60,
+                delete_batch_size=20,
+            )
+            assert ret == mock_s3_cloud_interface.return_value
+        elif cloud_provider == "azure-blob-storage":
+            mock_azure_cloud_interface.assert_called_once_with(
+                url=url,
+                jobs=8,
+                delete_batch_size=20,
+            )
+            assert ret == mock_azure_cloud_interface.return_value
+        elif cloud_provider == "google-cloud-storage":
+            mock_gcs_cloud_interface.assert_called_once_with(
+                url=url,
+                jobs=8,
+                delete_batch_size=20,
+            )
+            assert ret == mock_gcs_cloud_interface.return_value
+
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface")
+    def test_get_cloud_interface_from_server_config_with_aws_sse_kms_key_id(
+        self, mock_s3_cloud_interface
+    ):
+        """Test that aws_sse_kms_key_id is passed to S3CloudInterface when aws_encryption is aws:kms"""
+        url = "http://some-bucket/some/path"
+        mock_config = MagicMock(
+            url=url,
+            parallel_jobs=8,
+            aws_profile="some-profile",
+            aws_region="us-east-1",
+            aws_encryption="aws:kms",
+            aws_sse_kms_key_id="arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
+            aws_read_timeout=60,
+            cloud_delete_batch_size=20,
+        )
+        ret = get_cloud_interface_from_server_config(mock_config, "aws-s3", url)
+        mock_s3_cloud_interface.assert_called_once_with(
+            url=url,
+            jobs=8,
+            profile_name="some-profile",
+            region="us-east-1",
+            encryption="aws:kms",
+            sse_kms_key_id="arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
+            read_timeout=60,
+            delete_batch_size=20,
+        )
+        assert ret == mock_s3_cloud_interface.return_value
+
+    @pytest.mark.parametrize(
+        ("aws_encryption", "expected_error"),
+        [
+            (
+                None,
+                'aws_encryption must be "aws:kms" if aws_sse_kms_key_id is specified',
+            ),
+            (
+                "AES256",
+                'aws_encryption must be "aws:kms" if aws_sse_kms_key_id is specified',
+            ),
+        ],
+    )
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface")
+    def test_get_cloud_interface_from_server_config_invalid_aws_sse_kms_key_id(
+        self, mock_s3_cloud_interface, aws_encryption, expected_error
+    ):
+        """Test that ConfigurationException is raised when aws_sse_kms_key_id is set without aws:kms encryption"""
+        url = "http://some-bucket/some/path"
+        mock_config = MagicMock(
+            url=url,
+            parallel_jobs=8,
+            aws_profile="some-profile",
+            aws_region="us-east-1",
+            aws_encryption=aws_encryption,
+            aws_sse_kms_key_id="arn:aws:kms:us-east-1:123456789012:key/12345678-1234-1234-1234-123456789012",
+            aws_read_timeout=60,
+            cloud_delete_batch_size=20,
+        )
+        with pytest.raises(ConfigurationException) as exc:
+            get_cloud_interface_from_server_config(mock_config, "aws-s3", url)
+        assert expected_error == str(exc.value)
+
 
 class TestCloudBackupCatalog(object):
     """
@@ -3327,12 +3843,10 @@ class TestCloudBackupCatalog(object):
 
     def get_backup_info_file_object(self):
         """Minimal backup info"""
-        return BytesIO(
-            b"""
+        return BytesIO(b"""
 backup_label=None
 end_time=2014-12-22 09:25:27.410470+01:00
-"""
-        )
+""")
 
     def raise_exception(self):
         raise Exception("something went wrong reading backup.info")
@@ -3454,7 +3968,7 @@ end_time=2014-12-22 09:25:27.410470+01:00
                         suffix,
                     ),
                 ]
-                for suffix in ("", ".gz", ".bz2", ".snappy")
+                for suffix in ("", ".gz", ".bz2", ".snappy", ".lz4")
             ]
             for spec in spec_group
         ],
@@ -3721,17 +4235,13 @@ end_time=2014-12-22 09:25:27.410470+01:00
     @pytest.fixture
     def catalog_with_named_backup(self, in_memory_cloud_interface):
         backup_infos = {
-            "20221107T120000": BytesIO(
-                b"""backup_label=None
+            "20221107T120000": BytesIO(b"""backup_label=None
 end_time=2022-11-07 12:05:00
 backup_name=named backup
-"""
-            ),
-            "20221109T120000": BytesIO(
-                b"""backup_label=None
+"""),
+            "20221109T120000": BytesIO(b"""backup_label=None
 end_time=2022-11-09 12:05:00
-"""
-            ),
+"""),
         }
         in_memory_cloud_interface.path = ""
         for id, backup_info in backup_infos.items():
@@ -3882,7 +4392,7 @@ class TestCloudTarUploader(object):
         "compression",
         # The CloudTarUploader expects the short form compression args set by the
         # cloud_backup argument parser
-        (None, "bz2", "gz", "snappy"),
+        (None, "bz2", "gz", "snappy", "lz4"),
     )
     @mock.patch("barman.cloud.CloudInterface")
     def test_add(self, mock_cloud_interface, compression, tmpdir):
@@ -3928,6 +4438,14 @@ class TestCloudTarUploader(object):
                 tar_fileobj = BytesIO()
                 snappy.stream_decompress(uploaded_data, tar_fileobj)
                 tar_fileobj.seek(0)
+            elif compression == "lz4":
+                tar_mode = "r|"
+                # We must manually decompress the lz4 bytes before extracting
+                import lz4.frame
+
+                tar_fileobj = BytesIO()
+                tar_fileobj.write(lz4.frame.decompress(uploaded_data.read()))
+                tar_fileobj.seek(0)
             else:
                 tar_mode = "r|%s" % compression
             with open_tar(fileobj=tar_fileobj, mode=tar_mode) as tf:
@@ -3937,6 +4455,38 @@ class TestCloudTarUploader(object):
                     assert result.read() == content
         # AND the supplied chunk_size was set
         assert uploader.chunk_size == chunk_size
+
+    @mock.patch("barman.cloud.CloudInterface")
+    def test_buffer_method(self, mock_cloud_interface):
+        """
+        Verifies that the _buffer method returns a NamedTemporaryFile with the
+        expected properties. This test ensures Python 3.14 compatibility after
+        the change from staticmethod(partial(...)) to instance method.
+        """
+        # GIVEN a CloudTarUploader instance
+        uploader = CloudTarUploader(
+            mock_cloud_interface,
+            key="test/key",
+            chunk_size=1024,
+            compression=None,
+        )
+
+        # WHEN _buffer is called
+        buffer_file = uploader._buffer()
+
+        # THEN it returns a NamedTemporaryFile
+        assert isinstance(buffer_file, _TemporaryFileWrapper)
+
+        # AND the file has the expected prefix and suffix
+        assert buffer_file.name.find("barman-upload-") != -1
+        assert buffer_file.name.endswith(".part")
+
+        # AND the file exists (delete=False was set)
+        assert os.path.exists(buffer_file.name)
+
+        # Cleanup
+        buffer_file.close()
+        os.unlink(buffer_file.name)
 
     @pytest.mark.parametrize(
         (
@@ -4295,7 +4845,7 @@ class TestCloudBackupUploader(object):
         )
 
     @pytest.mark.parametrize("backup_should_fail", (False, True))
-    @mock.patch("barman.cloud.CloudBackupUploader._create_upload_controller")
+    @mock.patch("barman.cloud.CloudBackupUploader.create_upload_controller")
     @mock.patch("barman.cloud.CloudBackupUploader._backup_data_files")
     @mock.patch("barman.cloud.ConcurrentBackupStrategy")
     @mock.patch("barman.cloud.BackupInfo")
@@ -4304,7 +4854,7 @@ class TestCloudBackupUploader(object):
         mock_backup_info,
         _mock_backup_strategy,
         _mock_backup_data_files,
-        _mock_create_upload_controller,
+        _mockcreate_upload_controller,
         backup_should_fail,
     ):
         """Verifies backup name is added to backup info if it is set."""
@@ -4336,7 +4886,7 @@ class TestCloudBackupUploader(object):
         )
 
     @pytest.mark.parametrize("backup_should_fail", (False, True))
-    @mock.patch("barman.cloud.CloudBackupUploader._create_upload_controller")
+    @mock.patch("barman.cloud.CloudBackupUploader.create_upload_controller")
     @mock.patch("barman.cloud.CloudBackupUploader._backup_data_files")
     @mock.patch("barman.cloud.ConcurrentBackupStrategy")
     @mock.patch("barman.cloud.BackupInfo")
@@ -4345,7 +4895,7 @@ class TestCloudBackupUploader(object):
         mock_backup_info,
         _mock_backup_strategy,
         _mock_backup_data_files,
-        _mock_create_upload_controller,
+        _mockcreate_upload_controller,
         backup_should_fail,
     ):
         """Verifies backup name is added to backup info if it is set."""
@@ -5010,3 +5560,51 @@ class TestS3ObjectLock(object):
         )
         # Verify datetime.now was called with the correct timezone
         mock_datetime.now.assert_called_once_with(retain_date.tzinfo)
+
+
+@pytest.mark.parametrize(
+    ("url", "is_valid"),
+    (
+        ("s3://my-bucket/my-object", True),
+        ("s3://another-bucket/path/to/object", True),
+        ("http://my-bucket/my-object", False),
+        ("s3:/my-bucket/my-object", False),
+        ("s3://", False),
+        ("s3://my-bucket", True),
+    ),
+)
+def test_validate_s3_url(url, is_valid):
+    """Test the ``validate_s3_url`` function."""
+    assert validate_s3_url(url) == is_valid
+
+
+@pytest.mark.parametrize(
+    ("url", "is_valid"),
+    (
+        ("https://console.cloud.google.com/storage/browser/my-bucket/my-object", True),
+        ("gs://my-bucket/my-object", True),
+        ("http://my-bucket/my-object", False),
+        ("gss://my-bucket/my-object", False),
+        ("gs:/my-bucket/my-object", False),
+        ("gs://", False),
+        ("gs://my-bucket", True),
+    ),
+)
+def test_validate_google_cloud_url(url, is_valid):
+    """Test the ``validate_google_cloud_url`` function."""
+    assert validate_google_cloud_url(url) == is_valid
+
+
+@pytest.mark.parametrize(
+    ("url", "is_valid"),
+    (
+        ("https://myaccount.blob.core.windows.net/mycontainer/myblob", True),
+        ("https://anotheraccount.blob.core.windows.net/container/blob", True),
+        ("https://myaccount.blob.core.windows.com/mycontainer/myblob", False),
+        ("https://myaccount.windows.core.net/", False),
+        ("https://myaccount.azure.com/container/blob", False),
+    ),
+)
+def test_validate_azure_blob_storage_url(url, is_valid):
+    """Test the ``validate_azure_blob_storage_url`` function."""
+    assert validate_azure_blob_storage_url(url) == is_valid

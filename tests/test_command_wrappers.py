@@ -19,6 +19,7 @@
 import errno
 import os
 import select
+import signal
 import sys
 from logging import DEBUG, INFO, WARNING
 from subprocess import PIPE
@@ -90,7 +91,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -118,7 +119,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -146,7 +147,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -174,7 +175,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -206,7 +207,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -233,7 +234,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -261,7 +262,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -289,7 +290,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -317,7 +318,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -348,7 +349,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -377,7 +378,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -415,7 +416,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -447,7 +448,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         pipe.stdin.write.assert_called_with(stdin)
@@ -512,7 +513,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         pipe.stdin.write.assert_called_with(stdin)
@@ -549,7 +550,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         pipe.stdin.write.assert_called_with(stdin)
@@ -592,7 +593,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -630,7 +631,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         pipe.stdin.write.assert_called_with(stdin)
@@ -671,7 +672,7 @@ class TestCommand(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         pipe.stdin.write.assert_called_with(stdin)
@@ -684,7 +685,7 @@ class TestCommand(object):
         assert ("Command", WARNING, "err: " + err) in caplog.record_tuples
 
     @mock.patch("time.sleep")
-    @mock.patch("barman.command_wrappers.Command._get_output_once")
+    @mock.patch("barman.command_wrappers.Command._get_result")
     def test_retry(
         self, get_output_no_retry_mock, sleep_mock, popen, pipe_processor_loop
     ):
@@ -692,7 +693,7 @@ class TestCommand(object):
         Test the retry method
 
         :param mock.Mock get_output_no_retry_mock: simulate a
-            Command._get_output_once() call
+            Command._get_result() call
         :param mock.Mock sleep_mock: mimic the sleep timer
         :param mock.Mock popen: unused, mocked from the whole test class
         :param mock.Mock pipe_processor_loop: unused, mocked from the whole
@@ -732,6 +733,183 @@ class TestCommand(object):
         assert exc_info.value.args == e.args
         assert sleep_mock.call_count == 5
         assert get_output_no_retry_mock.call_count == 6
+
+    def test_pid(self, popen, pipe_processor_loop):
+        """
+        Test the pid property returns the subprocess pid
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+
+        # Test when pipe is None
+        command.pipe = None
+        assert command.pid is None
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+        command._pipe_lock.reset_mock()
+
+        # Test when pipe exists
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        pipe_mock.pid = 12345
+        command.pipe = pipe_mock
+        assert command.pid == 12345
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_pause(self, popen, pipe_processor_loop):
+        """
+        Test the pause method sends SIGSTOP to the subprocess
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        pipe_mock.poll.return_value = None
+        command.pipe = pipe_mock
+
+        command.pause()
+
+        pipe_mock.send_signal.assert_called_once_with(signal.SIGSTOP)
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_resume(self, popen, pipe_processor_loop):
+        """
+        Test the resume method sends SIGCONT to the subprocess
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        pipe_mock.poll.return_value = None
+        command.pipe = pipe_mock
+
+        command.resume()
+
+        pipe_mock.send_signal.assert_called_once_with(signal.SIGCONT)
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_is_running(self, popen, pipe_processor_loop):
+        """
+        Test that ``is_running`` returns ``False`` when pipe is
+        ``None`` or process has terminated and ``True`` otherwise.
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+
+        # Test when pipe is None
+        command.pipe = None
+        assert command.is_running() is False
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+        command._pipe_lock.reset_mock()
+
+        # Test when pipe exists but process has terminated
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        pipe_mock.poll.return_value = 0
+        command.pipe = pipe_mock
+        assert command.is_running() is False
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+        command._pipe_lock.reset_mock()
+
+        # Test when pipe exists and process is still running
+        pipe_mock.poll.return_value = None
+        assert command.is_running() is True
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_wait_exit(self, popen, pipe_processor_loop):
+        """
+        Test that ``wait_exit`` waits for the process to exit.
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        command.pipe = pipe_mock
+
+        ret = command.wait_exit()
+
+        assert ret == pipe_mock.returncode
+        pipe_mock.wait.assert_called_once()
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_get_returncode(self, popen, pipe_processor_loop):
+        """
+        Test that ``get_returncode`` returns the subprocess return code correctly.
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        command.pipe = pipe_mock
+
+        ret = command.get_returncode()
+
+        assert ret == pipe_mock.returncode
+        pipe_mock.poll.assert_called_once()
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_get_stderr(self, popen, pipe_processor_loop):
+        """
+        Test that ``get_stderr`` returns the subprocess stderr output correctly.
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        pipe_mock.stderr = mock.Mock(read=lambda: b"error output")
+        command.pipe = pipe_mock
+
+        err = command.get_stderr()
+
+        assert err == "error output"
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_get_stderr_running_process(self, popen, pipe_processor_loop):
+        """
+        Test that ``get_stderr`` returns None while the subprocess is still running.
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        # Simulate a running process: poll() returns None
+        pipe_mock.poll.return_value = None
+        pipe_mock.stderr = mock.Mock(read=mock.Mock(return_value=b"error output"))
+        command.pipe = pipe_mock
+
+        err = command.get_stderr()
+
+        # While the process is running, no stderr should be returned or read
+        assert err is None
+        pipe_mock.poll.assert_called_once()
+        pipe_mock.stderr.read.assert_not_called()
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
+
+    def test_terminate(self, popen, pipe_processor_loop):
+        """
+        Test that ``get_stderr`` returns None while the subprocess is still running.
+        """
+        command = command_wrappers.Command("command")
+        command._pipe_lock = mock.Mock(__enter__=mock.Mock(), __exit__=mock.Mock())
+        pipe_mock = _mock_pipe(popen, pipe_processor_loop)
+        # Simulate a running process: poll() returns None
+        pipe_mock.poll.return_value = None
+        pipe_mock.stderr = mock.Mock(read=mock.Mock(return_value=b"error output"))
+        command.pipe = pipe_mock
+
+        err = command.get_stderr()
+
+        # While the process is running, no stderr should be returned or read
+        assert err is None
+        pipe_mock.poll.assert_called_once()
+        pipe_mock.stderr.read.assert_not_called()
+        command._pipe_lock.__enter__.assert_called_once()
+        command._pipe_lock.__exit__.assert_called_once()
 
 
 # noinspection PyMethodMayBeStatic
@@ -817,7 +995,7 @@ class TestRsync(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -844,7 +1022,7 @@ class TestRsync(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -873,7 +1051,7 @@ class TestRsync(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -926,7 +1104,7 @@ class TestRsync(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -953,7 +1131,7 @@ class TestRsync(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -980,7 +1158,7 @@ class TestRsync(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         pipe.stdin.write.assert_called_with("a\nb\nc\n".encode("UTF-8"))
@@ -1012,7 +1190,7 @@ class TestRsyncPgdata(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -1048,7 +1226,7 @@ class TestRsyncPgdata(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
         assert not pipe.stdin.write.called
@@ -1216,7 +1394,7 @@ class TestPgBaseBackup(object):
             ],
             close_fds=True,
             env=None,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             shell=False,
             stdout=mock.ANY,
             stderr=mock.ANY,
@@ -1498,6 +1676,72 @@ class TestPgBaseBackup(object):
         for expected_arg in unexpected_args:
             assert not any(expected_arg == arg.split("=")[0] for arg in cmd.args)
 
+    def test_warehousepg_dbid_parameter_not_set(self):
+        """
+        Test that warehousepg_dbid parameter is not added when not provided.
+        """
+        connection_mock = mock.MagicMock()
+        connection_mock.get_connection_string.return_value = "fake_connstring"
+        cmd = command_wrappers.PgBaseBackup(
+            destination="/fake/target",
+            command=self.pg_basebackup_path,
+            connection=connection_mock,
+            version="14",
+            app_name="test_app_name",
+            warehousepg_dbid=None,
+        )
+
+        # Assert that the --target-gp-dbid argument is not present
+        assert not any(arg.startswith("--target-gp-dbid=") for arg in cmd.args)
+
+    def test_warehousepg_dbid_parameter_set(self):
+        """
+        Test that warehousepg_dbid parameter is correctly added when provided.
+        """
+        connection_mock = mock.MagicMock()
+        connection_mock.get_connection_string.return_value = "fake_connstring"
+        warehousepg_dbid = 42
+        cmd = command_wrappers.PgBaseBackup(
+            destination="/fake/target",
+            command=self.pg_basebackup_path,
+            connection=connection_mock,
+            version="14",
+            app_name="test_app_name",
+            warehousepg_dbid=warehousepg_dbid,
+        )
+
+        # Assert that the --target-gp-dbid argument is present with correct value
+        assert "--target-gp-dbid=42" in cmd.args
+
+    def test_warehousepg_dbid_parameter_with_different_values(self):
+        """
+        Test that warehousepg_dbid parameter works with different integer values.
+        """
+        connection_mock = mock.MagicMock()
+        connection_mock.get_connection_string.return_value = "fake_connstring"
+
+        # Test with value 0
+        cmd = command_wrappers.PgBaseBackup(
+            destination="/fake/target",
+            command=self.pg_basebackup_path,
+            connection=connection_mock,
+            version="14",
+            app_name="test_app_name",
+            warehousepg_dbid=0,
+        )
+        assert "--target-gp-dbid=0" in cmd.args
+
+        # Test with large value
+        cmd = command_wrappers.PgBaseBackup(
+            destination="/fake/target",
+            command=self.pg_basebackup_path,
+            connection=connection_mock,
+            version="14",
+            app_name="test_app_name",
+            warehousepg_dbid=999999,
+        )
+        assert "--target-gp-dbid=999999" in cmd.args
+
 
 # noinspection PyMethodMayBeStatic
 class TestReceiveXlog(object):
@@ -1620,7 +1864,7 @@ class TestReceiveXlog(object):
             stdout=PIPE,
             stderr=PIPE,
             stdin=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
         )
         assert not pipe.stdin.write.called
         pipe.stdin.close.assert_called_once_with()
@@ -1877,7 +2121,7 @@ class TestPgCombineBackup(object):
             ],
             close_fds=True,
             env=None,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             shell=False,
             stdout=mock.ANY,
             stderr=mock.ANY,
@@ -2161,7 +2405,7 @@ class TestGPG:
             stdin=PIPE,
             stdout=PIPE,
             stderr=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
 
@@ -2202,7 +2446,7 @@ class TestGPG:
             stdin=PIPE,
             stdout=PIPE,
             stderr=PIPE,
-            preexec_fn=mock.ANY,
+            restore_signals=True,
             close_fds=True,
         )
 

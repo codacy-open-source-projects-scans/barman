@@ -46,6 +46,7 @@ from barman.cloud_providers.google_cloud_storage import (
 )
 from barman.infofile import (
     BackupInfo,
+    CloudLocalBackupInfo,
     Field,
     FieldListFile,
     LocalBackupInfo,
@@ -1197,7 +1198,7 @@ class TestLocalBackupInfo:
         mock_is_incremental.return_value = True
         backup_info.parent_backup_id = "SOME_ID"
 
-        with patch("barman.infofile.LocalBackupInfo") as mock:
+        with patch("barman.infofile.BackupInfoFactory.build_backup_info") as mock:
             mock.return_value.status = BackupInfo.EMPTY
             assert backup_info.get_parent_backup_info() is None
             mock.assert_called_once_with(backup_info.server, backup_id="SOME_ID")
@@ -1211,7 +1212,7 @@ class TestLocalBackupInfo:
         mock_is_incremental.return_value = True
         backup_info.parent_backup_id = "SOME_ID"
 
-        with patch("barman.infofile.LocalBackupInfo") as mock:
+        with patch("barman.infofile.BackupInfoFactory.build_backup_info") as mock:
             mock.return_value.status = BackupInfo.DONE
             assert backup_info.get_parent_backup_info() is mock.return_value
             mock.assert_called_once_with(backup_info.server, backup_id="SOME_ID")
@@ -1239,7 +1240,7 @@ class TestLocalBackupInfo:
         """
         backup_info.children_backup_ids = ["SOME_CHILD_ID_1", "SOME_CHILD_ID_2"]
 
-        with patch("barman.infofile.LocalBackupInfo") as mock:
+        with patch("barman.infofile.BackupInfoFactory.build_backup_info") as mock:
             mock.return_value.status = BackupInfo.EMPTY
             assert backup_info.get_child_backup_info("SOME_CHILD_ID_1") is None
             mock.assert_called_once_with(
@@ -1254,7 +1255,7 @@ class TestLocalBackupInfo:
         """
         backup_info.children_backup_ids = ["SOME_CHILD_ID_1", "SOME_CHILD_ID_2"]
 
-        with patch("barman.infofile.LocalBackupInfo") as mock:
+        with patch("barman.infofile.BackupInfoFactory.build_backup_info") as mock:
             mock.return_value.status = BackupInfo.DONE
             assert (
                 backup_info.get_child_backup_info("SOME_CHILD_ID_1")
@@ -1299,7 +1300,7 @@ class TestLocalBackupInfo:
         # Create parent backup info objects
         backup_info.parent_backup_id = "parent_backup_id1"
         with mock.patch(
-            "barman.infofile.LocalBackupInfo",
+            "barman.infofile.BackupInfoFactory.build_backup_info",
             side_effect=provide_parent_backup_info,
         ):
             # Call the walk_to_root method
@@ -1315,7 +1316,7 @@ class TestLocalBackupInfo:
         # Test case for when the method is set to also return the current backup
         backup_info.backup_id = "incremental_backup_id"
         with mock.patch(
-            "barman.infofile.LocalBackupInfo",
+            "barman.infofile.BackupInfoFactory.build_backup_info",
             side_effect=provide_parent_backup_info,
         ):
             # Call the walk_to_root method with include_self=True
@@ -1379,7 +1380,7 @@ class TestLocalBackupInfo:
 
         # Mock the `LocalBackupInfo` constructor to return the corresponding backup info objects
         with patch(
-            "barman.infofile.LocalBackupInfo",
+            "barman.infofile.BackupInfoFactory.build_backup_info",
             side_effect=provide_child_backup_info,
         ):
             # Call the `walk_backups_tree` method on the root backup info
@@ -1540,10 +1541,12 @@ class TestLocalBackupInfo:
         mock_base_backup_dir.return_value = backup_dir
         segment_name = "%08X%08X%08X" % (1, 1, 0)
         mock_required_wal_segments.return_value = [segment_name]
-        server.get_wal_full_path.side_effect = lambda x: os.path.join(
-            wals_dir,
-            xlog.hash_dir(x),
-            x,
+        server.wal_storage.get_full_path = mock.Mock(
+            side_effect=lambda x: os.path.join(
+                wals_dir,
+                xlog.hash_dir(x),
+                x,
+            )
         )
         wal1_file_path = os.path.join(
             wals_dir,
@@ -1677,3 +1680,188 @@ class TestVolatileBackupInfo:
 
         # Case 3: passing to file-like object works
         volatile_backup_info.save(file_object=io.BytesIO())
+
+
+class TestCloudLocalBackupInfo:
+    """
+    Unit tests for the :class:`CloudLocalBackupInfo` class.
+    """
+
+    @patch("barman.infofile.LocalBackupInfo.__init__", return_value=None)
+    def test__init__(self, mock_parent_init):
+        # Mock the server and its methods to return mock cloud interfaces
+        backup_cloud_interface, wal_cloud_interface = mock.Mock(), mock.Mock()
+        server = mock.Mock(
+            get_backup_cloud_interface=lambda: backup_cloud_interface,
+            get_wal_cloud_interface=lambda: wal_cloud_interface,
+        )
+        # WHEN initializing CloudLocalBackupInfo
+        backup_info = CloudLocalBackupInfo(server)
+        # THEN the backup and wal cloud interfaces are set from the server
+        assert backup_info._backup_cloud_interface == backup_cloud_interface
+        assert backup_info._wal_cloud_interface == wal_cloud_interface
+        # AND the parent __init__ method is called
+        mock_parent_init.assert_called_once_with(server)
+
+    @patch("barman.infofile.LocalBackupInfo.__init__", return_value=None)
+    def test_get_base_directory(self, _):
+        # Initialize CloudLocalBackupInfo with a mock server and backup_id
+        backup_info = CloudLocalBackupInfo(server=mock.Mock(), backup_id="fake_id")
+        # Set the backup cloud interface path and config name
+        backup_info._backup_cloud_interface = mock.Mock(path="barman-backups")
+        backup_info.config = mock.Mock()
+        backup_info.config.name = "my-server"
+        # Assert that the base directory is correctly constructed
+        # It should be <cloud_interface_path>/<server_name>/base
+        assert backup_info.get_base_directory() == "barman-backups/my-server/base"
+
+    @patch(
+        "barman.infofile.LocalBackupInfo.get_basebackup_directory",
+        return_value="/fake/base/directory",
+    )
+    @patch("barman.infofile.LocalBackupInfo.__init__", return_value=None)
+    def test_get_data_directory(self, _, __):
+        # Initialize CloudLocalBackupInfo with a mock server and backup_id
+        backup_info = CloudLocalBackupInfo(server=mock.Mock(), backup_id="fake_id")
+        # Assert that the data directory is the same as the base backup directory
+        assert backup_info.get_data_directory() == "/fake/base/directory"
+
+    @patch("barman.infofile.LocalBackupInfo.__init__", return_value=None)
+    def test_get_manifest_path(self, _):
+        # Mock the server and its meta_directory attribute
+        server = mock.Mock(meta_directory="/fake/meta/directory")
+        # Initialize CloudLocalBackupInfo. We need to set the server and backup_id
+        # attributes manually since we mocked the parent __init__ method
+        backup_info = CloudLocalBackupInfo(server=server, backup_id="fake_id")
+        backup_info.server = server
+        backup_info.backup_id = "fake_id"
+        # Assert that the manifest path is correctly constructed
+        # It should be <meta_directory>/<backup_id>-backup_manifest
+        expected_manifest_path = "/fake/meta/directory/fake_id-backup_manifest"
+        assert backup_info.get_backup_manifest_path() == expected_manifest_path
+
+    def test_is_orphan_cloud(self, tmpdir):
+        """
+        Ensure cloud orphan backups are correctly identified.
+        """
+        server = build_mocked_server(
+            main_conf={
+                "basebackups_directory": tmpdir.strpath,
+                "backup_directory": tmpdir.join("main"),
+            },
+        )
+        server.use_backup_cloud_storage = True
+        server.get_backup_cloud_interface = mock.Mock(
+            return_value=mock.Mock(path="barman-backups")
+        )
+
+        # Case 1: Not orphan (status is empty)
+        backup_info = CloudLocalBackupInfo(server, backup_id="not_orphan_backup")
+        backup_info.status = BackupInfo.EMPTY
+        assert backup_info.is_orphan is False
+
+        # Case 2: Orphan backup (only the backup.info file exists)
+        server_dir = tmpdir.mkdir("main")
+        meta_dir = server_dir.mkdir("meta")
+        backup_info_path = meta_dir.join("orphan_backup-backup.info")
+        backup_info_path.write("status = DONE\n")
+        backup_info = CloudLocalBackupInfo(server, backup_id="orphan_backup")
+        backup_info.status = BackupInfo.DONE
+        # Mock the cloud interface to return no file on the backup path
+        server.get_backup_cloud_interface.return_value.list_bucket.return_value = []
+        assert backup_info.is_orphan is True
+        server.get_backup_cloud_interface.return_value.list_bucket.assert_called_with(
+            prefix="barman-backups/main/base/orphan_backup/"
+        )
+
+        server.get_backup_cloud_interface.reset_mock()
+
+        # Case 3: Not orphan (backup.info and other files exists)
+        backup_info = CloudLocalBackupInfo(server, backup_id="not_orphan_backup2")
+        backup_info.status = BackupInfo.DONE
+        # Mock the cloud interface to return some file on the backup path
+        server.get_backup_cloud_interface.return_value.list_bucket.return_value = [
+            "barman-backups/fake_backup_id/random_file",
+        ]
+        assert backup_info.is_orphan is False
+        server.get_backup_cloud_interface.return_value.list_bucket.assert_called_with(
+            prefix="barman-backups/main/base/not_orphan_backup2/"
+        )
+
+    @pytest.mark.parametrize("target", ["full", "standalone", "data", "wal"])
+    @patch("barman.infofile.LocalBackupInfo.__init__", return_value=None)
+    def test_get_directory_entries(self, _, target):
+        """
+        Assert that `get_directory_entries` yields the correct files for all targets
+        (full, standalone, data, wal).
+        """
+        # Initialize a CloudLocalBackupInfo
+        backup_info = CloudLocalBackupInfo(server=mock.Mock(), backup_id="fake_id")
+        # Set a mocked backup cloud interface with a list_bucket method that simulates
+        # the presence of backup files in the cloud storage
+        backup_path = "barman-backups/my-server/base/fake_id"
+        backup_info.get_basebackup_directory = lambda: backup_path
+        backup_info._backup_cloud_interface = mock.Mock(
+            list_bucket=lambda prefix: [
+                f"{backup_path}/data.tar",
+                f"{backup_path}/1234.tar",
+                f"{backup_path}/backup.info",
+            ],
+        )
+        # Set a mocked server which simulates the presence of WAL files until the next
+        # backup (by mocking get_wal_until_next_backup) and wal storage which correctly
+        # constructs the full path for a given WAL segment (by mocking wal_storage.get_full_path)
+        wal1, wal2, wal3 = mock.Mock(), mock.Mock(), mock.Mock()
+        wal1.name, wal2.name, wal3.name = (
+            "000000000000000000000001",
+            "000000000000000000000002",
+            "000000000000000000000003",
+        )
+        backup_info.server = mock.Mock(
+            get_wal_until_next_backup=lambda *args, **kwargs: [wal1, wal2, wal3],
+            wal_storage=mock.Mock(
+                get_full_path=lambda x: "barman-backups/my-server/wals/0000000100000001/%s"
+                % x
+            ),
+        )
+        # Mock get_required_wal_segments to return only wal1 and wal2 as required WAL
+        # segments for the backup i.e. wal3 is not required and only used for PITR
+        backup_info.get_required_wal_segments = lambda: [wal1.name, wal2.name]
+
+        # WHEN get_directory_entries is called with the current target
+        entries = list(backup_info.get_directory_entries(target))
+
+        # THEN if
+        # the target is "full", all files and WALs should be included
+        if target == "full":
+            assert entries == [
+                "barman-backups/my-server/base/fake_id/data.tar",
+                "barman-backups/my-server/base/fake_id/1234.tar",
+                "barman-backups/my-server/base/fake_id/backup.info",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000001",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000002",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000003",
+            ]
+        # the target is "standalone", all files and only required WALs should be included
+        elif target == "standalone":
+            assert entries == [
+                "barman-backups/my-server/base/fake_id/data.tar",
+                "barman-backups/my-server/base/fake_id/1234.tar",
+                "barman-backups/my-server/base/fake_id/backup.info",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000001",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000002",
+            ]
+        # the target is "data", only backup files should be included, no WALs
+        elif target == "data":
+            assert entries == [
+                "barman-backups/my-server/base/fake_id/data.tar",
+                "barman-backups/my-server/base/fake_id/1234.tar",
+                "barman-backups/my-server/base/fake_id/backup.info",
+            ]
+        # the target is "wal", only WALs should be included, no backup files
+        elif target == "wal":
+            assert entries == [
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000001",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000002",
+                "barman-backups/my-server/wals/0000000100000001/000000000000000000000003",
+            ]

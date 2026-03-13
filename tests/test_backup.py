@@ -43,19 +43,24 @@ from barman.exceptions import (
     BackupException,
     CommandFailedException,
     CompressionIncompatibility,
+    DuplicateWalFile,
+    MatchingDuplicateWalFile,
     RecoveryInvalidTargetException,
 )
 from barman.infofile import BackupInfo, load_datetime_tz
 from barman.lockfile import ServerBackupIdLock
 from barman.retention_policies import RetentionPolicyFactory
+from barman.wal_archiver import CloudWalStorageStrategy, LocalWalStorageStrategy
 
 
 # noinspection PyMethodMayBeStatic
 class TestBackup(object):
     @patch("barman.backup.datetime")
-    @patch("barman.backup.LocalBackupInfo")
+    @patch("barman.backup.BackupInfoFactory.build_backup_info")
     @patch("barman.backup.BackupManager.get_last_backup_id")
-    def test_backup_maximum_age(self, backup_id_mock, infofile_mock, datetime_mock):
+    def test_backup_maximum_age(
+        self, backup_id_mock, build_infofile_mock, datetime_mock
+    ):
         # BackupManager setup
         backup_manager = build_backup_manager()
         # setting basic configuration for this test
@@ -78,7 +83,7 @@ class TestBackup(object):
         # mocking the backup id to a custom value
         backup_id_mock.return_value = "Mock_backup"
         # simulate an existing backup using a mock obj
-        instance = infofile_mock.return_value
+        instance = build_infofile_mock.return_value
         # force the backup end date over 1 day over the limit
         instance.end_time = now - timedelta(days=8)
         # build the expected message
@@ -92,7 +97,7 @@ class TestBackup(object):
         # mocking the backup id to a custom value
         backup_id_mock.return_value = "Mock_backup"
         # simulate an existing backup using a mock obj
-        instance = infofile_mock.return_value
+        instance = build_infofile_mock.return_value
         # set the backup end date inside the limit
         instance.end_time = now - timedelta(days=2)
         # build the expected msg
@@ -102,8 +107,8 @@ class TestBackup(object):
         )
         assert (r[0], r[1]) == (True, msg)
 
-    @patch("barman.backup.LocalBackupInfo")
-    def test_keyboard_interrupt(self, mock_infofile):
+    @patch("barman.backup.BackupInfoFactory.build_backup_info")
+    def test_keyboard_interrupt(self, mock_build_infofile):
         """
         Unit test for a quick check on exception catching
         during backup operations
@@ -117,7 +122,9 @@ class TestBackup(object):
         """
         # BackupManager setup
         backup_manager = build_backup_manager()
-        instance = mock_infofile.return_value
+        instance = mock_build_infofile.return_value
+        # mocks the keep-alive query
+        backup_manager.server.postgres.send_heartbeat_query.return_value = True, None
         # Instruct the patched method to raise a general exception
         backup_manager.executor.start_backup = Mock(side_effect=Exception("abc"))
         # invoke backup method
@@ -415,6 +422,166 @@ class TestBackup(object):
         mock_put_annotation.assert_called_once_with(b_info.backup_id)
         # Ensure the annotation was deleted
         mock_delete_annotation.assert_called_once_with(b_info.backup_id)
+
+    @patch("barman.backup.os.unlink")
+    @patch("barman.backup.os.path.exists", return_value=True)
+    def test_delete_cloud_backup_data(self, _, mock_unlink):
+        """
+        Test deletion of backup data from cloud storage.
+        """
+        # GIVEN a BackupManager with a mocked backup info and cloud interface
+        backup_manager = build_backup_manager(name="my-server")
+        manifest_path = os.path.join(
+            backup_manager.server.meta_directory, "test_backup_id-backup_manifest"
+        )
+        backup_info = Mock(
+            backup_id="test_backup_id",
+            get_backup_manifest_path=lambda: manifest_path,
+            get_basebackup_directory=lambda: "my-backups/my-server/base/test_backup_id",
+        )
+        cloud_interface_mock = Mock(
+            path="my-backups",
+            list_bucket=Mock(
+                return_value=[
+                    "my-backups/my-server/base/%s/data.tar" % backup_info.backup_id,
+                    "my-backups/my-server/base/%s/tbs1.tar" % backup_info.backup_id,
+                    "my-backups/my-server/base/%s/backup.info" % backup_info.backup_id,
+                ]
+            ),
+        )
+        backup_manager.server.get_backup_cloud_interface = lambda: cloud_interface_mock
+        # WHEN _delete_cloud_backup_data is called
+        backup_manager._delete_cloud_backup_data(backup_info)
+        # THEN the listed objects from the bucket are deleted from cloud storage
+        cloud_interface_mock.list_bucket.assert_called_once_with(
+            "my-backups/my-server/base/%s/" % backup_info.backup_id
+        )
+        cloud_interface_mock.delete_objects.assert_called_once_with(
+            [
+                "my-backups/my-server/base/%s/data.tar" % backup_info.backup_id,
+                "my-backups/my-server/base/%s/tbs1.tar" % backup_info.backup_id,
+                "my-backups/my-server/base/%s/backup.info" % backup_info.backup_id,
+            ]
+        )
+        # AND the backup manifest file is deleted from the local meta directory
+        mock_unlink.assert_called_once_with(manifest_path)
+
+    @patch("barman.backup.output")
+    @patch("barman.backup.os.unlink", side_effect=OSError("Some error"))
+    @patch("barman.backup.os.path.exists", return_value=True)
+    def test_delete_cloud_backup_data_deleting_manifest_fails(
+        self, _, mock_unlink, mock_output
+    ):
+        """
+        Test that if an error occurs while deleting the backup manifest file during
+        cloud backup deletion, the error is logged.
+        """
+        # GIVEN a BackupManager with a mocked backup info and cloud interface
+        backup_manager = build_backup_manager(name="my-server")
+        manifest_path = os.path.join(
+            backup_manager.server.meta_directory, "test_backup_id-backup_manifest"
+        )
+        backup_info = Mock(
+            backup_id="test_backup_id",
+            get_backup_manifest_path=lambda: manifest_path,
+            get_basebackup_directory=lambda: "my-backups/my-server/base/test_backup_id",
+        )
+        cloud_interface_mock = Mock(path="my-backups", list_bucket=lambda x: [])
+        backup_manager.server.get_backup_cloud_interface = lambda: cloud_interface_mock
+        # WHEN _delete_cloud_backup_data is called
+        backup_manager._delete_cloud_backup_data(backup_info)
+        # THEN when deleting the manifest file an error occurs and is logged
+        mock_output.warning.assert_called_once_with(
+            "Failed to delete backup manifest file: %s. Please manually delete "
+            "this file if it still exists.",
+            manifest_path,
+        )
+
+    @pytest.mark.parametrize("use_backup_cloud_storage", [True, False])
+    @patch("barman.backup.KeepManagerMixin.keep_backup")
+    @patch("barman.backup.KeepManagerMixinCloud")
+    @patch("barman.backup.BackupManager.__init__", return_value=None)
+    def test_keep_backup(
+        self,
+        _,
+        mock_cloud_keep_mixin,
+        mock_parent_keep_backup,
+        use_backup_cloud_storage,
+    ):
+        """
+        Assert that ``keep_backup`` stores annotation locally and/or in the cloud
+        according to the server's configuration.
+        """
+        # Initialize a simpel backup manager
+        backup_manager = BackupManager(None)
+        # Simulate a server with or without cloud storage based on use_backup_cloud_storage
+        backup_cloud_interface = mock.Mock()
+        server = mock.Mock(
+            use_backup_cloud_storage=use_backup_cloud_storage,
+            get_backup_cloud_interface=lambda: backup_cloud_interface,
+        )
+        backup_manager.server = server
+        backup_manager.config = mock.Mock()
+        backup_manager.config.name = "test-server"
+
+        # WHEN keep_backup is called
+        backup_manager.keep_backup("fake_backup_id", "standalone")
+        # THEN if using a cloud storage it should first store the annotation there
+        if use_backup_cloud_storage:
+            mock_cloud_keep_mixin.assert_called_once_with(
+                cloud_interface=backup_cloud_interface,
+                server_name="test-server",
+            )
+            mock_cloud_keep_mixin.return_value.keep_backup.assert_called_once_with(
+                "fake_backup_id", "standalone"
+            )
+        else:
+            mock_cloud_keep_mixin.assert_not_called()
+        # AND always save the annotation locally
+        mock_parent_keep_backup.assert_called_once_with("fake_backup_id", "standalone")
+
+    @pytest.mark.parametrize("use_backup_cloud_storage", [True, False])
+    @patch("barman.backup.KeepManagerMixin.release_keep")
+    @patch("barman.backup.KeepManagerMixinCloud")
+    @patch("barman.backup.BackupManager.__init__", return_value=None)
+    def test_release_keep(
+        self,
+        _,
+        mock_cloud_keep_mixin,
+        mock_parent_release_keep,
+        use_backup_cloud_storage,
+    ):
+        """
+        Assert that ``release_keep`` removes the annotation locally and/or from the
+        cloud storage, if configured.
+        """
+        # Initialize a simpel backup manager
+        backup_manager = BackupManager(None)
+        # Simulate a server with or without cloud storage based on use_backup_cloud_storage
+        backup_cloud_interface = mock.Mock()
+        server = mock.Mock(
+            use_backup_cloud_storage=use_backup_cloud_storage,
+            get_backup_cloud_interface=lambda: backup_cloud_interface,
+        )
+        backup_manager.server = server
+        backup_manager.config = mock.Mock()
+        backup_manager.config.name = "test-server"
+
+        # WHEN keep_backup is called
+        backup_manager.release_keep("fake_backup_id")
+        # THEN if using a cloud storage it should first delete the annotation there
+        if use_backup_cloud_storage:
+            mock_cloud_keep_mixin.assert_called_once_with(
+                cloud_interface=backup_cloud_interface,
+                server_name="test-server",
+            )
+            mock_cloud_keep_mixin.return_value.release_keep.assert_called_once_with(
+                "fake_backup_id"
+            )
+        else:
+            mock_cloud_keep_mixin.assert_not_called()
+        # AND always delete the annotation locally
+        mock_parent_release_keep.assert_called_once_with("fake_backup_id")
 
     @patch("os.stat")
     @patch("barman.backup.fsync_file")
@@ -1071,7 +1238,7 @@ class TestBackup(object):
         assert expected_warning in caplog.text
 
     @pytest.mark.parametrize("should_fail", (True, False))
-    @patch("barman.backup.LocalBackupInfo.save")
+    @patch("barman.infofile.LocalBackupInfo.save")
     @patch("barman.backup.output")
     def test_backup_with_name(self, _mock_output, _mock_backup_info_save, should_fail):
         """Verify that backup name is written to backup info during the backup."""
@@ -1092,7 +1259,7 @@ class TestBackup(object):
         assert backup_info.backup_name == backup_name
 
     @pytest.mark.parametrize("should_fail", (True, False))
-    @patch("barman.backup.LocalBackupInfo.save")
+    @patch("barman.infofile.LocalBackupInfo.save")
     @patch("barman.backup.output")
     def test_backup_without_name(
         self, _mock_output, _mock_backup_info_save, should_fail
@@ -1113,7 +1280,7 @@ class TestBackup(object):
         # THEN backup name is None in the backup_info
         assert backup_info.backup_name is None
 
-    @patch("barman.backup.LocalBackupInfo.save")
+    @patch("barman.infofile.LocalBackupInfo.save")
     @patch("barman.backup.output")
     def test_backup_without_parent_backup_id(
         self,
@@ -1135,7 +1302,7 @@ class TestBackup(object):
         # THEN parent backup ID is None in the backup_info
         assert backup_info.parent_backup_id is None
 
-    @patch("barman.backup.LocalBackupInfo.save")
+    @patch("barman.infofile.LocalBackupInfo.save")
     @patch("barman.backup.output")
     def test_backup_with_parent_backup_id(
         self,
@@ -2568,6 +2735,8 @@ class TestVerifyBackup:
         backup_path = "/fake/path"
         pg_verify_backup_path = "/path/to/pg_verifybackup"
         backup_manager = build_backup_manager()
+        backup_manager.server.use_backup_cloud_storage = False
+        backup_manager.server.use_wal_cloud_storage = False
         mock_backup_info = Mock()
         mock_backup_info.get_data_directory.return_value = backup_path
 
@@ -2617,6 +2786,207 @@ class TestVerifyBackup:
         backup_manager.verify_backup(mock_backup_info)
 
         mock_pg_verify_backup_instance.get_output.assert_not_called()
+
+    @patch("barman.backup.output")
+    def test_verify_backup_not_supported_with_cloud(self, mock_output):
+        backup_manager = build_backup_manager()
+        mock_backup_info = Mock()
+        backup_manager.server.use_backup_cloud_storage = True
+        backup_manager.server.use_wal_cloud_storage = True
+        backup_manager.verify_backup(mock_backup_info)
+        mock_output.error.assert_called_once_with(
+            "Backup verification is not supported for servers using cloud storage"
+        )
+
+
+class TestCloudBackup(object):
+    """Test handling of cloud backups by BackupManager."""
+
+    @patch("barman.backup.CloudBackupExecutor")
+    def test_cloud_backup_method(self, mock_cloud_executor):
+        """
+        Verify that a CloudBackupExecutor is created for backup_method "cloud".
+        """
+        # GIVEN a server with backup_method = "cloud"
+        server = build_mocked_server(
+            "test_server",
+            main_conf={
+                "backup_method": "local-to-cloud",
+                "basebackups_directory": "s3://bucket/path",
+            },
+        )
+        # WHEN a BackupManager is created for that server
+        manager = BackupManager(server=server)
+        # THEN its executor is a CloudBackupExecutor
+        assert manager.executor == mock_cloud_executor.return_value
+        # AND CloudBackupExecutor was called with the backup manager
+        mock_cloud_executor.assert_called_once_with(manager)
+
+    @patch("barman.backup.WalFileInfo")
+    @patch("barman.backup.output")
+    def test_cloud_wal_archive_success(self, mock_output, mock_wal_file_info):
+        """
+        Test successful cloud_wal_archive with skip_delete=True for a server using cloud
+        storage.
+        """
+        # GIVEN a backup manager for a server using cloud storage for WALs
+        backup_manager = build_backup_manager()
+        backup_manager.server.use_wal_cloud_storage = True
+
+        mock_wal_storage = Mock(spec=CloudWalStorageStrategy)
+        backup_manager.server.wal_storage = mock_wal_storage
+
+        mock_compressor = Mock()
+        backup_manager.compression_manager.get_default_compressor = Mock(
+            return_value=mock_compressor
+        )
+
+        mock_encryption = Mock()
+        backup_manager.encryption_manager.get_encryption = Mock(
+            return_value=mock_encryption
+        )
+
+        # WHEN cloud_wal_archive is called
+        wal_path = "/pg_wal/000000010000000000000001"
+        backup_manager.cloud_wal_archive(wal_path)
+
+        # THEN WalFileInfo.from_file is called as expected
+        mock_wal_file_info.from_file.assert_called_once_with(
+            filename=wal_path,
+            compression_manager=backup_manager.compression_manager,
+            unidentified_compression=None,
+            encryption_manager=backup_manager.encryption_manager,
+            encryption=None,
+        )
+
+        # AND wal_storage.save is called with skip_delete=True
+        mock_wal_storage.save.assert_called_once_with(
+            mock_compressor,
+            mock_encryption,
+            mock_wal_file_info.from_file.return_value,
+            skip_delete=True,
+        )
+
+        # AND no error is logged
+        mock_output.error.assert_not_called()
+
+    @patch("barman.backup.WalFileInfo")
+    @patch("barman.backup.output")
+    def test_cloud_wal_archive_matching_duplicate_wal_file(
+        self, mock_output, mock_wal_file_info
+    ):
+        """
+        Test cloud_wal_archive handles MatchingDuplicateWalFile exception for a server using
+        cloud storage for WALs.
+        """
+        # GIVEN a backup manager for a server using cloud storage for WALs
+        backup_manager = build_backup_manager()
+        backup_manager.server.use_wal_cloud_storage = True
+
+        mock_wal_storage = Mock(spec=CloudWalStorageStrategy)
+        mock_wal_storage.save.side_effect = MatchingDuplicateWalFile("wal_name")
+        backup_manager.server.wal_storage = mock_wal_storage
+
+        backup_manager.compression_manager.get_default_compressor = Mock(
+            return_value=None
+        )
+        backup_manager.encryption_manager.get_encryption = Mock(return_value=None)
+
+        # WHEN cloud_wal_archive is called
+        wal_path = "/pg_wal/000000010000000000000001"
+        backup_manager.cloud_wal_archive(wal_path)
+
+        # THEN wal_storage.save is called with skip_delete=True
+        mock_wal_storage.save.assert_called_once_with(
+            None,
+            None,
+            mock_wal_file_info.from_file.return_value,
+            skip_delete=True,
+        )
+
+        # AND an info is logged about the matching duplicate WAL file
+        mock_output.info.assert_called_once_with(
+            "WAL file %s is already archived in cloud storage, skipping.",
+            mock_wal_file_info.from_file.return_value.name,
+        )
+
+    @patch("barman.backup.WalFileInfo")
+    @patch("barman.backup.output")
+    def test_cloud_wal_archive_duplicate_wal_file(
+        self, mock_output, mock_wal_file_info
+    ):
+        """
+        Test cloud_wal_archive handles DuplicateWalFile exception for a server using cloud
+        storage for WALs.
+        """
+        # GIVEN a backup manager for a server using cloud storage for WALs
+        backup_manager = build_backup_manager()
+        backup_manager.server.use_wal_cloud_storage = True
+
+        mock_wal_storage = Mock(spec=CloudWalStorageStrategy)
+        mock_wal_storage.save.side_effect = DuplicateWalFile("wal_name")
+        backup_manager.server.wal_storage = mock_wal_storage
+
+        backup_manager.compression_manager.get_default_compressor = Mock(
+            return_value=None
+        )
+        backup_manager.encryption_manager.get_encryption = Mock(return_value=None)
+
+        # WHEN cloud_wal_archive is called
+        wal_path = "/pg_wal/000000010000000000000001"
+        backup_manager.cloud_wal_archive(wal_path)
+
+        # THEN wal_storage.save is called with skip_delete=True
+        mock_wal_storage.save.assert_called_once_with(
+            None,
+            None,
+            mock_wal_file_info.from_file.return_value,
+            skip_delete=True,
+        )
+
+        # AND an error is logged about the duplicate WAL file
+        mock_output.warning.assert_called_once_with(
+            "WAL file %s is already archived in cloud storage of server %s but "
+            "with different content",
+            mock_wal_file_info.from_file.return_value.name,
+            backup_manager.config.name,
+        )
+
+    @patch("barman.backup.WalFileInfo")
+    @patch("barman.backup.output")
+    def test_cloud_wal_archive_invalid_wal_storage_strategy(
+        self, mock_output, mock_wal_file_info
+    ):
+        """
+        Test cloud_wal_archive logs an error if the server's wal_storage is not a
+        CloudWalStorageStrategy.
+        """
+        # GIVEN a backup manager for a server using cloud storage for WALs
+        backup_manager = build_backup_manager()
+        backup_manager.server.use_wal_cloud_storage = True
+
+        mock_wal_storage = Mock(spec=LocalWalStorageStrategy)
+        mock_wal_storage.save.side_effect = DuplicateWalFile("wal_name")
+        backup_manager.server.wal_storage = mock_wal_storage
+
+        backup_manager.compression_manager.get_default_compressor = Mock(
+            return_value=None
+        )
+        backup_manager.encryption_manager.get_encryption = Mock(return_value=None)
+
+        # WHEN cloud_wal_archive is called
+        wal_path = "/pg_wal/000000010000000000000001"
+        backup_manager.cloud_wal_archive(wal_path)
+
+        # THEN wal_storage.save is not called
+        mock_wal_storage.save.assert_not_called()
+
+        # AND an error is logged about the duplicate WAL file
+        mock_output.error.assert_called_once_with(
+            "The 'cloud-wal-archive' command can only be used with cloud WAL "
+            "storage strategies. Please check your server configuration and ensure "
+            "that the `wals_directory` points to a cloud object storage."
+        )
 
 
 class TestSnapshotBackup(object):

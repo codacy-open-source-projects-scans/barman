@@ -31,6 +31,7 @@ import select
 import signal
 import subprocess
 import sys
+import threading
 import time
 from distutils.version import LooseVersion as Version
 
@@ -131,6 +132,7 @@ class Command(object):
         check=False,
         allowed_retval=(0,),
         close_fds=True,
+        wait=True,
         out_handler=None,
         err_handler=None,
         retry_times=0,
@@ -159,6 +161,12 @@ class Command(object):
 
         If the `close_fds` argument is True, all file descriptors
         except 0, 1 and 2 will be closed before the child process is executed.
+
+        If `wait` is True this class only returns when the command
+        has been terminated. Otherwise, it returns immediately after spawning
+        the subprocess. When `wait` is False, the output/error/retry handlers are
+        ignored. Similarly, retries are also not managed in case of failures that
+        happen during the execution of the command.
 
         If the `check` argument is True, the exit code will be checked
         against the `allowed_retval` list, raising a CommandFailedException if
@@ -199,17 +207,26 @@ class Command(object):
         :param list[int] allowed_retval: List of exit codes considered as a
             successful termination.
         :param bool close_fds: If set, close all the extra file descriptors
+        :param bool wait: If ``True``, it returns only when the command is terminated.
+            Otherwise, it returns immediately after spawning the subprocess.
         :param callable out_handler: handler for lines sent on stdout
         :param callable err_handler: handler for lines sent on stderr
         :param int retry_times: number of allowed retry attempts
         :param int retry_sleep: wait seconds between every retry
         :param callable retry_handler: handler invoked during a command retry
+
+        .. note::
+            The methods ``get_returncode()`` and ``get_stderr()`` are meant to be used
+            when ``wait`` is set to ``False``. For ``wait`` set to ``True``, the return
+            code and the stderr are available as attributes in the object, namely
+            ``ret`` and ``err`` respectively.
         """
         self.pipe = None
         self.cmd = cmd
         self.args = args if args is not None else []
         self.shell = shell
         self.close_fds = close_fds
+        self.wait = wait
         self.check = check
         self.allowed_retval = allowed_retval
         self.retry_times = retry_times
@@ -220,6 +237,8 @@ class Command(object):
         self.ret = None
         self.out = None
         self.err = None
+        # Lock to protect access to self.pipe after subprocess creation
+        self._pipe_lock = threading.Lock()
         # If env_append has been provided use it or replace with an empty dict
         env_append = env_append or {}
         # If path has been provided, replace it in the environment
@@ -251,11 +270,6 @@ class Command(object):
             self.err_handler = err_handler
         else:
             self.err_handler = self.make_logging_handler(logging.WARNING)
-
-    @staticmethod
-    def _restore_sigpipe():
-        """restore default signal handler (http://bugs.python.org/issue1652)"""
-        signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # pragma: no cover
 
     def __call__(self, *args, **kwargs):
         """
@@ -303,6 +317,10 @@ class Command(object):
         against the `allowed_retval` list, raising a CommandFailedException if
         not in the list.
 
+        If `wait` is True this method only returns when the command
+        has been terminated. Otherwise, it returns immediately after spawning
+        the subprocess.
+
         Every keyword argument can be specified both in the class constructor
         and during the method call. If specified in both places,
         the method arguments will take the precedence over
@@ -315,7 +333,7 @@ class Command(object):
         attempt = 0
         while True:
             try:
-                return self._get_output_once(*args, **kwargs)
+                return self._get_result(*args, **kwargs)
             except CommandFailedException as exc:
                 # Try again if retry number is lower than the retry limit
                 if attempt < self.retry_times:
@@ -338,7 +356,7 @@ class Command(object):
                         # original one
                         raise CommandMaxRetryExceeded(*exc.args)
 
-    def _get_output_once(self, *args, **kwargs):
+    def _get_result(self, *args, **kwargs):
         """
         Run the command and return the output and the error as a tuple.
 
@@ -354,6 +372,10 @@ class Command(object):
         If the `check` argument is True, the exit code will be checked
         against the `allowed_retval` list, raising a CommandFailedException if
         not in the list.
+
+        If `wait` is True this method only returns when the command
+        has been terminated. Otherwise, it returns immediately after spawning
+        the subprocess, in which case (None, None) is returned.
 
         Every keyword argument can be specified both in the class constructor
         and during the method call. If specified in both places,
@@ -379,13 +401,19 @@ class Command(object):
         # If check is true, it must be handled here
         check = kwargs.pop("check", self.check)
         allowed_retval = kwargs.pop("allowed_retval", self.allowed_retval)
+        wait = kwargs.pop("wait", self.wait)
         self.execute(
             out_handler=out_handler,
             err_handler=err_handler,
             check=False,
             *args,
-            **kwargs
+            **kwargs,
         )
+
+        # If not requested to wait for the command termination, return now
+        if not wait:
+            return None, None
+
         self.out = "\n".join(out)
         self.err = "\n".join(err)
 
@@ -441,6 +469,7 @@ class Command(object):
         check = kwargs.pop("check", self.check)
         allowed_retval = kwargs.pop("allowed_retval", self.allowed_retval)
         close_fds = kwargs.pop("close_fds", self.close_fds)
+        wait = kwargs.pop("wait", self.wait)
         out_handler = kwargs.pop("out_handler", self.out_handler)
         err_handler = kwargs.pop("err_handler", self.err_handler)
         if len(kwargs):
@@ -463,6 +492,11 @@ class Command(object):
         if stdin:
             pipe.stdin.write(stdin)
         pipe.stdin.close()
+
+        # If not requested to wait for the command termination, return now
+        if not wait:
+            return
+
         # Prepare the list of processors
         processors = [
             StreamLineProcessor(pipe.stdout, out_handler),
@@ -514,7 +548,7 @@ class Command(object):
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            preexec_fn=self._restore_sigpipe,
+            restore_signals=True,
             close_fds=close_fds,
         )
 
@@ -614,6 +648,93 @@ class Command(object):
         # Set the signal handler
         signal.signal(signal_id, _handler)
 
+    @property
+    def pid(self):
+        """
+        Get the pid of the subprocess
+
+        :rtype: int|None
+        """
+        with self._pipe_lock:
+            if self.pipe:
+                return self.pipe.pid
+
+    def pause(self):
+        """
+        Pause the command execution sending a SIGSTOP to the subprocess
+        """
+        with self._pipe_lock:
+            if self.pipe:
+                self.pipe.send_signal(signal.SIGSTOP)
+
+    def resume(self):
+        """
+        Resume the command execution sending a SIGCONT to the subprocess
+        """
+        with self._pipe_lock:
+            if self.pipe:
+                self.pipe.send_signal(signal.SIGCONT)
+
+    def is_running(self):
+        """
+        Check if the command is still running
+
+        :rtype: bool
+        :return: ``True`` if the command is still running, ``False`` otherwise
+        """
+        with self._pipe_lock:
+            if self.pipe:
+                return self.pipe.poll() is None
+            return False
+
+    def wait_exit(self):
+        """
+        Wait for the command to exit.
+
+        :rtype: int|None
+        :return: the exit code of the command
+        """
+        with self._pipe_lock:
+            if self.pipe:
+                self.pipe.wait()
+                self.ret = self.pipe.returncode
+                return self.ret
+            return None
+
+    def terminate(self):
+        """
+        Terminate the command sending a SIGTERM to the subprocess
+        """
+        with self._pipe_lock:
+            if self.pipe:
+                self.pipe.terminate()
+
+    def get_returncode(self):
+        """
+        Get the return code of the command if it has terminated
+
+        :rtype: int|None
+        :return: the exit code of the command if it has terminated, ``None``
+            otherwise
+        """
+        with self._pipe_lock:
+            if self.pipe and self.pipe.poll() is not None:
+                return self.pipe.returncode
+            return None
+
+    def get_stderr(self):
+        """
+        Get the stderr of the command if it has terminated
+
+        :rtype: str|None
+        :return: the stderr of the command if it has terminated, ``None``
+            otherwise
+        """
+        with self._pipe_lock:
+            if self.pipe and self.pipe.poll() is not None and self.pipe.stderr:
+                return self.pipe.stderr.read().decode("utf-8")
+            return None
+
 
 class Rsync(Command):
     """
@@ -633,7 +754,7 @@ class Rsync(Command):
         include=None,
         network_compression=None,
         path=None,
-        **kwargs
+        **kwargs,
     ):
         """
         :param str rsync: rsync executable name
@@ -928,8 +1049,10 @@ class PgBaseBackup(PostgreSQLClient):
         check=True,
         compression=None,
         parent_backup_manifest_path=None,
+        no_sync=False,
+        warehousepg_dbid=None,
         args=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Constructor
@@ -950,6 +1073,8 @@ class PgBaseBackup(PostgreSQLClient):
         :param str parent_backup_manifest_path:
           the path to a backup_manifest file from a previous backup which can
           be used to perform an incremental backup
+        :param bool no_sync: avoid fsync calls if specified
+        :param int warehousepg_dbid: the WarehousePG database id
         :param List[str] args: additional arguments
         """
         PostgreSQLClient.__init__(
@@ -959,11 +1084,14 @@ class PgBaseBackup(PostgreSQLClient):
             version=version,
             app_name=app_name,
             check=check,
-            **kwargs
+            **kwargs,
         )
 
         # Set the backup destination
         self.args += ["-v", "--no-password", "--pgdata=%s" % destination]
+
+        if warehousepg_dbid is not None:
+            self.args.append(f"--target-gp-dbid={warehousepg_dbid}")
 
         if version and version >= Version("10"):
             # If version of the client is >= 10 it would use
@@ -988,6 +1116,10 @@ class PgBaseBackup(PostgreSQLClient):
         # If it has a manifest file path it means it is an incremental backup
         if parent_backup_manifest_path:
             self.args.append("--incremental=%s" % parent_backup_manifest_path)
+
+        # Avoid fsync calls if requested
+        if no_sync:
+            self.args.append("--no-sync")
 
         # Immediate checkpoint
         if immediate:
@@ -1067,7 +1199,7 @@ class PgReceiveXlog(PostgreSQLClient):
         check=True,
         slot_name=None,
         args=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Constructor
@@ -1092,7 +1224,7 @@ class PgReceiveXlog(PostgreSQLClient):
             version=version,
             app_name=app_name,
             check=check,
-            **kwargs
+            **kwargs,
         )
 
         self.args += [
@@ -1130,7 +1262,7 @@ class PgVerifyBackup(PostgreSQLClient):
         app_name=None,
         check=True,
         args=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Constructor
@@ -1151,7 +1283,7 @@ class PgVerifyBackup(PostgreSQLClient):
             version=version,
             app_name=app_name,
             check=check,
-            **kwargs
+            **kwargs,
         )
 
         self.args = ["-n", data_path]
@@ -1177,7 +1309,7 @@ class PgCombineBackup(PostgreSQLClient):
         app_name=None,
         check=True,
         args=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Constructor
@@ -1202,7 +1334,7 @@ class PgCombineBackup(PostgreSQLClient):
             version=version,
             app_name=app_name,
             check=check,
-            **kwargs
+            **kwargs,
         )
 
         # Set the backup destination
@@ -1285,7 +1417,7 @@ class BarmanSubProcess(object):
             preexec_fn=os.setsid,
             close_fds=True,
             stdin=devnull,
-            **additional_arguments
+            **additional_arguments,
         )
         _logger.debug("BarmanSubProcess: subprocess started. pid: %s", proc.pid)
 
@@ -1351,7 +1483,7 @@ class GPG(Command):
         recipient=None,
         input_filepath=None,
         output_filepath=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Initialize the GPG command wrapper.

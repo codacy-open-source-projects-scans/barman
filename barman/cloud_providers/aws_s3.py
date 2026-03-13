@@ -22,6 +22,7 @@ import math
 import os
 import shutil
 from datetime import datetime
+from distutils.version import LooseVersion as Version
 from io import RawIOBase
 
 import botocore
@@ -37,6 +38,7 @@ from barman.cloud import (
     SnapshotsInfo,
     VolumeMetadata,
 )
+from barman.cloud_providers import ObjectKeyAlreadyExists
 from barman.exceptions import (
     CommandException,
     SnapshotBackupException,
@@ -118,11 +120,13 @@ class S3CloudInterface(CloudInterface):
         encryption=None,
         jobs=2,
         profile_name=None,
+        region=None,
         endpoint_url=None,
         tags=None,
         delete_batch_size=None,
         read_timeout=None,
         sse_kms_key_id=None,
+        addressing_style=None,
     ):
         """
         Create a new S3 interface given the S3 destination url and the profile
@@ -135,12 +139,15 @@ class S3CloudInterface(CloudInterface):
         :param str profile_name: Amazon auth profile identifier
         :param str endpoint_url: override default endpoint detection strategy
           with this one
+        :param str|None region: the AWS region to use for the S3 resource
         :param int|None delete_batch_size: the maximum number of objects to be
           deleted in a single request
         :param int|None read_timeout: the time in seconds until a timeout is
           raised when waiting to read from a connection
         :param str|None sse_kms_key_id: the AWS KMS key ID that should be used
           for encrypting uploaded data in S3
+        :param str|None addressing_style: the addressing style to use for S3
+          requests. Valid values are 'auto', 'virtual', or 'path'
         """
         super(S3CloudInterface, self).__init__(
             url=url,
@@ -149,10 +156,12 @@ class S3CloudInterface(CloudInterface):
             delete_batch_size=delete_batch_size,
         )
         self.profile_name = profile_name
+        self.region = region
         self.encryption = encryption
         self.endpoint_url = endpoint_url
         self.read_timeout = read_timeout
         self.sse_kms_key_id = sse_kms_key_id
+        self.addressing_style = addressing_style
 
         # Extract information from the destination URL
         parsed_url = urlparse(url)
@@ -176,10 +185,14 @@ class S3CloudInterface(CloudInterface):
         config_kwargs = {}
         if self.read_timeout is not None:
             config_kwargs["read_timeout"] = self.read_timeout
+        if self.addressing_style is not None:
+            config_kwargs["s3"] = {"addressing_style": self.addressing_style}
         config = Config(**config_kwargs)
 
         session = boto3.Session(profile_name=self.profile_name)
-        self.s3 = session.resource("s3", endpoint_url=self.endpoint_url, config=config)
+        self.s3 = session.resource(
+            "s3", endpoint_url=self.endpoint_url, region_name=self.region, config=config
+        )
 
     @property
     def _extra_upload_args(self):
@@ -333,7 +346,7 @@ class S3CloudInterface(CloudInterface):
             else:
                 raise
 
-    def upload_fileobj(self, fileobj, key, override_tags=None):
+    def upload_fileobj(self, fileobj, key, override_tags=None, fail_if_exists=False):
         """
         Synchronously upload the content of a file-like object to a cloud key
 
@@ -341,7 +354,26 @@ class S3CloudInterface(CloudInterface):
         :param str key: The key to identify the uploaded object
         :param List[tuple] override_tags: List of k,v tuples which should override any
           tags already defined in the cloud interface
+        :param bool fail_if_exists: Whether to fail if the object already exists
+        :raises ObjectKeyAlreadyExists: if the object *fail_if_exists* is ``True``  and
+          the object already exists
+
+        .. note::
+            The ``upload_fileobj`` method is a high-level API call with a simpler
+            interface that automatically handles multipart uploads. It is generally
+            the preferred method for uploading files unless you need more control over
+            the upload process, in which case you should use ``put_object`` (see
+            :meth:`_put_object`).
         """
+        # When avoiding overwrites, defer it to _put_object to handle it gracefully
+        if fail_if_exists:
+            return self._put_object(
+                fileobj=fileobj,
+                key=key,
+                override_tags=override_tags,
+                fail_if_exists=True,
+            )
+
         extra_args = self._extra_upload_args.copy()
         tags = override_tags or self.tags
         if tags is not None:
@@ -353,6 +385,84 @@ class S3CloudInterface(CloudInterface):
             ExtraArgs=extra_args,
             Config=self.config,
         )
+
+    def check_object_existence(self, key):
+        """
+        Check whether an object with the specified key exists in the bucket.
+
+        :param str key: The object key
+        :return: ``True`` if the object exists, ``False`` otherwise
+        """
+        try:
+            self.s3.meta.client.head_object(Bucket=self.bucket_name, Key=key)
+            return True
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                return False
+            raise
+
+    def _put_object(self, fileobj, key, override_tags=None, fail_if_exists=False):
+        """
+        Synchronously upload the content of a file-like object to a cloud key
+
+        :param IOBase fileobj: File-like object to upload
+        :param str key: The key to identify the uploaded object
+        :param List[tuple] override_tags: List of k,v tuples which should override any
+          tags already defined in the cloud interface
+        :param bool fail_if_exists: Whether to fail if the object already exists
+        :raises ObjectKeyAlreadyExists: if *fail_if_exists* is ``True``  and
+          the object already exists
+
+        .. note::
+            The ``put_object`` method is a low-level API call. For this reason, it
+            supports many more configurable options. In contrast, it does not handle
+            multipart uploads automatically, and it also has a limit of 5GB per file.
+            Hence, it is more useful when you need more control over the upload process.
+            See :meth:`upload_fileobj` for a higher-level API that automatically handles
+            multipart uploads.
+        """
+        extra_args = self._extra_upload_args.copy()
+        tags = override_tags or self.tags
+        if tags is not None:
+            extra_args["Tagging"] = urlencode(tags)
+
+        if fail_if_exists:
+            # boto3 >= 1.35.2 accepts a IfNoneMatch argument that makes the request
+            # fail with a PreconditionFailed error if the object already exists
+            if Version(boto3.__version__) >= Version("1.35.2"):
+                extra_args["IfNoneMatch"] = "*"
+            else:
+                # when IfNoneMatch is not available, we need to manually check for
+                # object existence at the cost of an extra head-object API call
+                if self.check_object_existence(key):
+                    raise ObjectKeyAlreadyExists(
+                        "Object %s already exists in bucket %s"
+                        % (key, self.bucket_name)
+                    )
+        try:
+            self.s3.meta.client.put_object(
+                Body=fileobj,
+                Bucket=self.bucket_name,
+                Key=key,
+                **extra_args,
+            )
+        except ClientError as e:
+            if e.response["Error"]["Code"] == "PreconditionFailed":
+                raise ObjectKeyAlreadyExists(
+                    "Object %s already exists in bucket %s" % (key, self.bucket_name)
+                )
+            elif e.response["Error"]["Code"] == "ConditionalRequestConflict":
+                # If a conflicting operation occurs during the upload, S3 returns a 409
+                # ConditionalRequestConflict response. On a 409 failure, retry the upload
+                # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/put_object.html
+                self.s3.meta.client.put_object(
+                    Body=fileobj,
+                    Bucket=self.bucket_name,
+                    Key=key,
+                    **extra_args,
+                )
+            else:
+                raise
 
     def create_multipart_upload(self, key):
         """
