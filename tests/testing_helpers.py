@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2014-2025
+# © Copyright EnterpriseDB UK Limited 2014-2026
 #
 # This file is part of Barman.
 #
@@ -168,7 +168,7 @@ def mock_backup_ext_info(
     analysis_time=None,
     number_of_workers=None,
     estimated_throughput=None,
-    **kwargs
+    **kwargs,
 ):
     # make a dictionary with all the arguments
     ext_info = dict(locals())
@@ -289,6 +289,7 @@ def build_config_dictionary(config_keys=None):
         "archiver_batch_size": 0,
         "autogenerate_manifest": False,
         "aws_await_snapshots_timeout": 3600,
+        "aws_check_object_lock": False,
         "aws_encryption": None,
         "aws_read_timeout": None,
         "aws_snapshot_lock_mode": None,
@@ -298,6 +299,7 @@ def build_config_dictionary(config_keys=None):
         "aws_profile": None,
         "aws_region": None,
         "aws_sse_kms_key_id": None,
+        "aws_sse_customer_key": None,
         "azure_credential": None,
         "azure_resource_group": None,
         "azure_subscription_id": None,
@@ -325,6 +327,8 @@ def build_config_dictionary(config_keys=None):
         "cloud_staging_max_size": 30 * 1024 * 1024 * 1024,  # 30GiB
         "cloud_upload_max_archive_size": 100 * 1024 * 1024 * 1024,  # 100GiB
         "cloud_upload_min_chunk_size": None,
+        "cloud_wal_archive_parallel": 0,
+        "cloud_wal_restore_parallel": 0,
         "custom_compression_filter": None,
         "custom_decompression_filter": None,
         "custom_compression_magic": None,

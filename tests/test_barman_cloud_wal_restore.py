@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2025
+# © Copyright EnterpriseDB UK Limited 2013-2026
 #
 # Client Utilities for Barman, Backup and Recovery Manager for PostgreSQL
 #
@@ -107,7 +107,7 @@ class TestMain(object):
             )
         assert exc.value.code == 1
         assert (
-            "WAL file 000000080000ABFF000000C1 for server test-server does not exists\n"
+            "WAL file 000000080000ABFF000000C1 for server test-server does not exist\n"
             in caplog.text
         )
 
@@ -129,7 +129,7 @@ class TestMain(object):
             )
         assert exc.value.code == 1
         assert (
-            "WAL file 000000080000ABFF000000C0 for server test-server does not exists\n"
+            "WAL file 000000080000ABFF000000C0 for server test-server does not exist\n"
             in caplog.text
         )
 
@@ -159,6 +159,9 @@ class TestMain(object):
         cloud_interface_mock.download_file.side_effect = Exception(
             "something went wrong"
         )
+        # The exception is not a connectivity error, so it must be reported
+        # as a generic error (exit code 4).
+        cloud_interface_mock.is_connectivity_error.return_value = False
         with pytest.raises(SystemExit) as exc:
             cloud_walrestore.main(
                 [
@@ -172,3 +175,92 @@ class TestMain(object):
         assert (
             "Barman cloud WAL restore exception: something went wrong\n" in caplog.text
         )
+
+    @mock.patch("barman.clients.cloud_walrestore.get_cloud_interface")
+    def test_fails_on_network_error_during_download(
+        self, get_cloud_interface_mock, caplog
+    ):
+        """If a download fails and connectivity is lost we exit with status 2."""
+        cloud_interface_mock = get_cloud_interface_mock.return_value
+        cloud_interface_mock.path = "testfolder/"
+        cloud_interface_mock.list_bucket.return_value = [
+            "testfolder/test-server/wals/000000080000ABFF/000000080000ABFF000000C1"
+        ]
+        cloud_interface_mock.download_file.side_effect = Exception(
+            "connection reset by peer"
+        )
+        # The exception is a connectivity error, so the failure must be
+        # reported as a network error (exit code 2).
+        cloud_interface_mock.is_connectivity_error.return_value = True
+        with pytest.raises(SystemExit) as exc:
+            cloud_walrestore.main(
+                [
+                    "s3://test-bucket/testfolder/",
+                    "test-server",
+                    "000000080000ABFF000000C1",
+                    "/tmp/000000080000ABFF000000C1",
+                ]
+            )
+        assert exc.value.code == 2
+        assert (
+            "Barman cloud WAL restore exception: connection reset by peer\n"
+            in caplog.text
+        )
+
+
+class TestCloudWalRestoreAwsEncryptionArgs(object):
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface")
+    def test_sse_customer_key_not_set(self, cloud_interface_mock):
+        """Verify that sse_customer_key is None when --sse-customer-key is not provided."""
+        # GIVEN a cloud interface mock that simulates a WAL not being found
+        cloud_interface_mock.return_value.download_file.return_value = False
+
+        # WHEN barman-cloud-wal-restore is called without --sse-customer-key
+        with pytest.raises(SystemExit):
+            cloud_walrestore.main(
+                [
+                    "--cloud-provider",
+                    "aws-s3",
+                    "s3://test-bucket",
+                    "test-server",
+                    "000000010000000000000001",
+                    "/tmp/000000010000000000000001",
+                ]
+            )
+
+        # THEN S3CloudInterface was created with sse_customer_key=None
+        cloud_interface_mock.assert_called_once()
+        _, kwargs = cloud_interface_mock.call_args
+        assert kwargs.get("sse_customer_key") is None
+
+    @mock.patch("barman.cloud_providers.aws_s3.S3CloudInterface")
+    def test_sse_customer_key_passed_to_cloud_interface(
+        self, cloud_interface_mock, tmp_path
+    ):
+        """Verify that --sse-customer-key file:// URI is passed to the S3 cloud interface."""
+        # GIVEN a key file containing a valid base64-encoded key
+        key_file = tmp_path / "key.b64"
+        key_file.write_text("WkMb3SePiDn8cCIt/Knb0O+B0yYZavrwqsOQdjNe57g=")
+        key_uri = "file://" + str(key_file)
+        # AND a cloud interface mock that simulates a WAL not being found
+        cloud_interface_mock.return_value.download_file.return_value = False
+
+        # WHEN barman-cloud-wal-restore is called with --sse-customer-key
+        with pytest.raises(SystemExit):
+            cloud_walrestore.main(
+                [
+                    "--cloud-provider",
+                    "aws-s3",
+                    "s3://test-bucket",
+                    "test-server",
+                    "000000010000000000000001",
+                    "/tmp/000000010000000000000001",
+                    "--sse-customer-key",
+                    key_uri,
+                ]
+            )
+
+        # THEN S3CloudInterface was created with the file:// URI as sse_customer_key
+        cloud_interface_mock.assert_called_once()
+        _, kwargs = cloud_interface_mock.call_args
+        assert kwargs.get("sse_customer_key") == key_uri

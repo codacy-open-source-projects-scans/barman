@@ -38,8 +38,8 @@ the ``.conf`` suffix. You may have one or multiple files for servers. You can ov
 default location by setting the ``configuration_files_directory`` option in the global
 configuration file and placing the files in that particular location.
 
-3. **Model Configuration**: It comprises one or more files with a set of
-configurations overrides that can be applied to Barman servers within the same cluster as
+3. **Model Configuration**: It comprises one or more files with a set of configuration
+overrides that can be applied to backups of Postgres servers within the same cluster as
 the model. These overrides can be implemented using the barman ``config-switch`` command.
 Default location is ``/etc/barman.d`` and must use the ``.conf`` suffix. The same
 ``configuration_files_directory`` override option from the server configuration applies for
@@ -207,6 +207,11 @@ This is a libpq connection string. Commonly used keys include: ``host``, ``hosta
 ``port``, ``dbname``, ``user`` and ``password``. See the 
 `libpq-connstring <https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING>`_
 PostgreSQL documentation for details.
+
+.. note::
+   Multi-host connection strings (e.g. ``host=primary_db,replica_db``) and
+   ``target_session_attrs`` are not supported. Each connection string must point
+   to a single, specific host.
 
 Scope: Server / Model.
 
@@ -389,6 +394,9 @@ Scope: Server / Model.
 Connection string for Barman to connect to the primary Postgres server during a
 standby backup.
 
+.. note::
+   Multi-host connection strings are not supported. See ``conninfo`` for details.
+
 Scope: Server / Model.
 
 **primary_ssh_command**
@@ -443,6 +451,9 @@ Scope: Global / Server / Model.
 **streaming_conninfo**
 
 Connection string for streaming replication protocol. Defaults to ``conninfo``.
+
+.. note::
+   Multi-host connection strings are not supported. See ``conninfo`` for details.
 
 Scope: Server / Model.
 
@@ -605,6 +616,17 @@ Destination for base backup files. It can be a local path if storing backups loc
 or a cloud storage URL if streaming backups to the cloud as described in
 :ref:`backup-streaming-backup-cloud`. Defaults to ``<backup_directory>/base``.
 
+.. warning::
+  Changing the value of ``basebackups_directory`` on an active server is discouraged.
+  Even if done with care, by deactivating the server, moving existing data to the new
+  location, and reactivating it, there are potential risks of data loss or
+  misconfiguration.
+
+  Instead, the safe option is to create a new server configuration with the new value
+  for ``basebackups_directory``, perform a new full backup to the new server, and then
+  decommission the old server once the new one is fully operational.
+
+
 Scope: Server.
 
 **basebackup_retry_sleep**
@@ -698,6 +720,19 @@ the AWS region where the S3 bucket is located.
 
 Scope: Global / Server / Model.
 
+**aws_check_object_lock**
+
+When set to ``true``, Barman will check for S3 Object Lock before attempting to
+delete base backup files from S3 storage. If an object is locked, the deletion
+is aborted. Defaults to ``false``.
+
+.. note::
+   Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``,
+   and ``basebackups_directory`` points to S3. If enabled with a non-S3 provider,
+   a warning will be logged and no lock checks will be performed.
+
+Scope: Global / Server / Model.
+
 **aws_encryption**
 
 Specifies the server-side encryption algorithm to use when storing objects in S3.
@@ -734,6 +769,37 @@ Example::
   basebackups_directory = s3://my-bucket/barman/backups
   aws_encryption = aws:kms
   aws_sse_kms_key_id = arn:aws:kms:us-east-1:123456789012:key/abcd1234-5678-90ab-cdef-EXAMPLEKEY
+
+.. note::
+  Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
+  ``basebackups_directory`` and/or ``wals_directory`` point to S3.
+
+Scope: Global / Server / Model.
+
+**aws_sse_customer_key**
+
+Specifies a customer-provided encryption key for AWS S3 SSE-C (Server-Side
+Encryption with Customer Keys). The value must be a ``file://`` URI pointing to a file
+containing a base64-encoded 256-bit (32-byte) key.
+
+When set, Barman passes the key to boto3 for all upload and download operations,
+including base backups and WAL files. The same key must be provided for both
+backup and restore operations.
+
+Cannot be used together with ``aws_encryption`` or ``aws_sse_kms_key_id``.
+
+Example::
+
+  [myserver]
+  backup_method = local-to-cloud
+  basebackups_directory = s3://my-bucket/barman/backups
+  aws_sse_customer_key = file:///etc/barman/sse-c.b64
+
+.. important::
+  All backups and WAL files for a given server must be encrypted with the same SSE-C
+  key. Mixing SSE-C-encrypted and unencrypted objects, or using different keys across
+  backups, will cause barman commands to fail when S3 rejects requests with a
+  mismatched or missing key.
 
 .. note::
   Only supported when ``backup_method`` is ``postgres`` or ``local-to-cloud``, and
@@ -1283,6 +1349,20 @@ level is used. The default value is ``medium``.
 
 Scope: Global / Server / Model.
 
+**cloud_wal_archive_parallel**
+
+Controls the number of WAL files that ``barman cloud-wal-archive`` will upload in
+parallel. When set to ``N`` (where N > 1), up to ``N - 1`` additional WAL files that
+are ready in ``pg_wal/archive_status`` are uploaded concurrently in background
+processes after the primary WAL has been successfully archived. Defaults to ``0``
+(disabled).
+
+.. note::
+  This option only applies when using the ``local-to-cloud`` backup method with
+  ``barman cloud-wal-archive`` as the ``archive_command``.
+
+Scope: Global / Server.
+
 **incoming_wals_directory**
 
 Specifies the directory where incoming WAL files are archived. Requires ``archiver`` to
@@ -1357,6 +1437,16 @@ Scope: Server / Model.
 Destination for archived WAL files. It can be a local path if storing WAL files locally,
 or a cloud storage URL if storing WAL files in the cloud as described in
 :ref:`backup-streaming-backup-cloud`. Defaults to ``<backup_directory>/wals``.
+
+.. warning::
+  Changing the value of ``wals_directory`` on an active server is discouraged. Even if
+  done with care, by deactivating the server, moving existing data to the new location,
+  and reactivating it, there are potential risks of data loss or misconfiguration.
+
+  Instead, the safe option is to create a new server configuration with the new value
+  for ``wals_directory``, perform a new full backup to the new server, and then
+  decommission the old server once the new one is fully operational.
+
 
 Scope: Server.
 
@@ -1553,7 +1643,7 @@ the identifiers of server sections and model sections.
 
 To apply a configuration model, execute the
 ``barman config-switch SERVER_NAME MODEL_NAME``. This command facilitates the application
-of the model's overrides to the relevant Barman server associated with the specified
+of the model's overrides to the relevant Postgres server associated with the specified
 cluster name.
 
 If you wish to remove the overrides, the deletion of the model configuration file alone
@@ -1572,7 +1662,7 @@ command, as follows: ``barman config-switch SERVER_NAME --reset``.
 Benefits
 """"""""
 
-* Consistency: Ensures uniform configuration across multiple Barman servers within a
+* Consistency: Ensures uniform configuration across multiple Postgres servers within a
   cluster.
 * Efficiency: Simplifies configuration management by allowing centralized updates and
   overrides.

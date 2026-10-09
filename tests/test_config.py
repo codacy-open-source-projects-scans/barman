@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2025
+# © Copyright EnterpriseDB UK Limited 2011-2026
 #
 # This file is part of Barman.
 #
@@ -346,6 +346,7 @@ class TestConfig(object):
         expected = testing_helpers.build_config_dictionary(
             {
                 "config": main.config,
+                "aws_check_object_lock": False,
                 "worm_mode": False,
                 "autogenerate_manifest": False,
                 "backup_compression": "none",
@@ -357,6 +358,8 @@ class TestConfig(object):
                 "compression_level": "medium",
                 "cloud_staging_directory": "/tmp/barman/cloud-staging",
                 "cloud_staging_max_size": 30 * 1024 * 1024 * 1024,  # 30 GiB
+                "cloud_wal_archive_parallel": 0,
+                "cloud_wal_restore_parallel": 0,
                 "last_backup_maximum_age": timedelta(1),
                 "last_backup_minimum_size": 1048576,
                 "last_wal_maximum_age": timedelta(hours=1),
@@ -386,6 +389,7 @@ class TestConfig(object):
             {
                 "_active_model_file": "/some/barman/home/web/.active-model.auto",
                 "config": web.config,
+                "aws_check_object_lock": False,
                 "worm_mode": False,
                 "autogenerate_manifest": False,
                 "backup_directory": "/some/barman/home/web",
@@ -398,6 +402,8 @@ class TestConfig(object):
                 "cluster": "web",
                 "cloud_staging_directory": "/tmp/barman/cloud-staging",
                 "cloud_staging_max_size": 30 * 1024 * 1024 * 1024,  # 30 GiB
+                "cloud_wal_archive_parallel": 0,
+                "cloud_wal_restore_parallel": 0,
                 "compression": None,
                 "compression_level": "medium",
                 "conninfo": "host=web01 user=postgres port=5432",
@@ -435,7 +441,7 @@ class TestConfig(object):
         c = Config(fp)
         main = c.get_server("main")
         assert main.description == " Text with quotes "
-        assert main.ssh_command == 'ssh -c "arcfour" ' "-p 22 postgres@pg01.nowhere"
+        assert main.ssh_command == 'ssh -c "arcfour" -p 22 postgres@pg01.nowhere'
 
     def test_interpolation(self):
         """
@@ -987,9 +993,11 @@ class TestConfig(object):
 
         mock = mock_open(read_data="SOME_OTHER_MODEL")
 
-        with patch.object(c, "servers") as mock_servers, patch(
-            "builtins.open", mock
-        ), patch.object(c, "get_model", Mock(return_value=None)):
+        with (
+            patch.object(c, "servers") as mock_servers,
+            patch("builtins.open", mock),
+            patch.object(c, "get_model", Mock(return_value=None)),
+        ):
             mock_server = MagicMock()
             mock_servers.return_value = [mock_server]
 
@@ -1022,9 +1030,11 @@ class TestConfig(object):
 
         mock = mock_open(read_data="SOME_OTHER_MODEL")
 
-        with patch.object(c, "servers") as mock_servers, patch(
-            "builtins.open", mock
-        ), patch.object(c, "get_model", Mock(return_value=mock_model)):
+        with (
+            patch.object(c, "servers") as mock_servers,
+            patch("builtins.open", mock),
+            patch.object(c, "get_model", Mock(return_value=mock_model)),
+        ):
             mock_server = MagicMock()
             mock_servers.return_value = [mock_server]
 
@@ -1269,7 +1279,7 @@ class TestServerConfig(object):
         with patch("builtins.open", mock):
             server_config.apply_model(model_config, from_cli)
 
-        expected = "Model '%s' is already active for server '%s', " "skipping..." % (
+        expected = "Model '%s' is already active for server '%s', skipping..." % (
             "SOME_MODEL",
             server_config.name,
         )
@@ -1428,6 +1438,7 @@ class TestModelConfig:
         expected = {
             "active": None,
             "archiver": None,
+            "aws_check_object_lock": None,
             "worm_mode": None,
             "archiver_batch_size": None,
             "autogenerate_manifest": None,
@@ -1441,6 +1452,7 @@ class TestModelConfig:
             "aws_profile": None,
             "aws_region": None,
             "aws_sse_kms_key_id": None,
+            "aws_sse_customer_key": None,
             "azure_credential": None,
             "azure_resource_group": None,
             "azure_subscription_id": None,
@@ -1460,6 +1472,8 @@ class TestModelConfig:
             "cloud_staging_max_size": None,
             "cloud_upload_max_archive_size": None,
             "cloud_upload_min_chunk_size": None,
+            "cloud_wal_archive_parallel": None,
+            "cloud_wal_restore_parallel": None,
             "cluster": "SOME_CLUSTER",
             "compression": None,
             "compression_level": None,
@@ -1538,6 +1552,7 @@ class TestModelConfig:
         expected = {
             "active": {"source": "SOME_SOURCE", "value": None},
             "archiver": {"source": "SOME_SOURCE", "value": None},
+            "aws_check_object_lock": {"source": "SOME_SOURCE", "value": None},
             "worm_mode": {"source": "SOME_SOURCE", "value": None},
             "archiver_batch_size": {"source": "SOME_SOURCE", "value": None},
             "autogenerate_manifest": {"source": "SOME_SOURCE", "value": None},
@@ -1557,6 +1572,7 @@ class TestModelConfig:
             "aws_profile": {"source": "SOME_SOURCE", "value": None},
             "aws_region": {"source": "SOME_SOURCE", "value": None},
             "aws_sse_kms_key_id": {"source": "SOME_SOURCE", "value": None},
+            "aws_sse_customer_key": {"source": "SOME_SOURCE", "value": None},
             "azure_credential": {"source": "SOME_SOURCE", "value": None},
             "azure_resource_group": {"source": "SOME_SOURCE", "value": None},
             "azure_subscription_id": {"source": "SOME_SOURCE", "value": None},
@@ -1576,6 +1592,8 @@ class TestModelConfig:
             "cloud_staging_max_size": {"source": "SOME_SOURCE", "value": None},
             "cloud_upload_max_archive_size": {"source": "SOME_SOURCE", "value": None},
             "cloud_upload_min_chunk_size": {"source": "SOME_SOURCE", "value": None},
+            "cloud_wal_archive_parallel": {"source": "SOME_SOURCE", "value": None},
+            "cloud_wal_restore_parallel": {"source": "SOME_SOURCE", "value": None},
             "cluster": {"source": "SOME_SOURCE", "value": "SOME_CLUSTER"},
             "compression": {"source": "SOME_SOURCE", "value": None},
             "compression_level": {"source": "SOME_SOURCE", "value": None},
@@ -2055,9 +2073,10 @@ class TestBaseConfig:
         an instance of the class.
         """
         bc = BaseConfig()
-        with patch.dict(bc.PARSERS, {"SOME_KEY": CsvOption}), patch.object(
-            CsvOption, "parse"
-        ) as mock:
+        with (
+            patch.dict(bc.PARSERS, {"SOME_KEY": CsvOption}),
+            patch.object(CsvOption, "parse") as mock,
+        ):
             result = bc.invoke_parser(
                 "SOME_KEY", "SOME_SOURCE", "SOME_VALUE", "SOME_NEW_VALUE"
             )
@@ -2075,9 +2094,10 @@ class TestBaseConfig:
         """
         bc = BaseConfig()
 
-        with patch.dict(bc.PARSERS, {"SOME_KEY": CsvOption}), patch.object(
-            CsvOption, "parse"
-        ) as mock:
+        with (
+            patch.dict(bc.PARSERS, {"SOME_KEY": CsvOption}),
+            patch.object(CsvOption, "parse") as mock,
+        ):
             mock.side_effect = ValueError("SOME_ERROR")
 
             result = bc.invoke_parser(

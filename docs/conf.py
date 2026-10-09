@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2011-2025
+# © Copyright EnterpriseDB UK Limited 2011-2026
 #
 # This file is part of Barman.
 #
@@ -43,7 +43,7 @@ from barman.version import __version__  # noqa: E402
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 module_dir = os.path.abspath(os.path.join(project_root, "barman"))
-excludes = ["tests", "setup.py", "conf"]
+excludes = ["tests", "conf"]
 
 release_date = os.getenv("SPHINX_BUILD_DATE")
 if release_date:
@@ -97,7 +97,7 @@ master_doc = "index"
 
 # General information about the project.
 project = "Barman"
-copyright = "© Copyright EnterpriseDB UK Limited 2011-2025"
+copyright = "© Copyright EnterpriseDB UK Limited 2011-2026"
 author = "EnterpriseDB"
 
 # The version info for the project you"re documenting, acts as replacement for
@@ -321,7 +321,7 @@ man_pages = [
     ),
     (
         "user_guide/commands/barman/list_backups.inc",
-        "barman-list_backups",
+        "barman-list-backups",
         "Barman Sub-Commands",
         [author],
         1,
@@ -515,6 +515,12 @@ man_pages = [
         [author],
         1,
     ),
+    # As there would be a clash in the name of the man pages for the
+    # "barman-cloud-wal-archive" script and the "barman cloud-wal-archive" command, we
+    # decided not to have a man page for the command for now. Once we deprecate the
+    # script, we can do the other way around.
+    # TODO: have a man page for "barman cloud-wal-archive" command once the cloud script
+    # is deprecated.
     (
         "user_guide/commands/barman_cloud/wal_archive.inc",
         "barman-cloud-wal-archive",

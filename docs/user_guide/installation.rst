@@ -3,13 +3,19 @@
 Installing
 ==========
 
-Barman official packages are provided by :term:`PGDG`. These packages use the default
-version of Python 3 that comes with the operating system.
+Barman official community packages are provided by :term:`PGDG`.
 
-There are three packages that make up the suite of Barman features: ``barman``,
-``barman-cli`` and ``barman-cli-cloud``.
+.. note::
+    If you are an EnterpriseDB customer, you should use the packages provided by
+    EDB. This will ensure better compatibility with other EDB products.
+
+There are four packages that make up the suite of Barman features: ``barman``,
+``python3-barman``, ``barman-cli`` and ``barman-cli-cloud``.
 
 * ``barman`` is the main package and it must be installed.
+
+* ``python3-barman`` is a package that holds the Python libraries of Barman. It
+  is a package required by all the other Barman packages.
 
 * ``barman-cli`` is an optional package that holds the ``barman-wal-restore`` and
   ``barman-wal-archive`` utilites. This package is mandatory if you plan to use those
@@ -23,9 +29,9 @@ There are three packages that make up the suite of Barman features: ``barman``,
 
 
 .. note::
-    Barman packages can be found in several different repositories. We recommend using
-    PGDG repositories because it ensures compatibility, stability and access to
-    the latest updates.
+    Barman packages can be found in several different repositories. Unless you have an
+    EDB subscription, we recommend using PGDG repositories, because it ensures
+    compatibility, stability and access to the latest updates.
 
 .. warning::
     Do not upgrade Barman using different repositories. By doing so you risk losing your
@@ -41,12 +47,11 @@ The minimal system requirements needed to run a Barman server are the following:
 
 * Linux operating system (Debian, Ubuntu, RHEL, Rocky, Fedora, etc.) or UNIX-like
   operating system (FreeBSD, OpenBSD, etc.)
-* Python version from 3.8 to 3.14
+* Python 3.12 to 3.14
 * Python modules:
 
   * ``psycopg2`` >= 2.4.2: Required to connect to the Postgres server
   * ``python-dateutil``
-  * ``setuptools``
   * ``argcomplete`` (optional)
 * PostgreSQL client tools: Required to interact with the Postgres server
 * PostgreSQL server >= 13
@@ -59,6 +64,10 @@ The minimal system requirements needed to run a Barman server are the following:
    Support for versions 3.6 and 3.7 of Python has been deprecated. It is known that
    Barman 3.14 does not work with Python 3.6. It may work with Python 3.7, but it's not
    being tested, nor supported for versions of Python prior to 3.8.
+
+.. deprecated:: 3.20
+   Support for versions 3.8 to 3.11 of Python has been deprecated. Barman 3.20
+   requires Python 3.12 or later.
 
 .. note::
    Users of RedHat Enterprise Linux, RockyLinux and AlmaLinux are required to install
@@ -200,6 +209,51 @@ To install the ``barman-cli`` package, run as **root** in the Postgres server:
    If you want to use the barman-cloud utilities as
    :ref:`hook scripts <hook-scripts-using-barman-cloud-scripts-as-hooks-in-barman>`, you
    will need to install this package in the Barman server.
+
+.. _installation-upgrading:
+
+Upgrading
+---------
+
+Before upgrading Barman packages, review the following recommendations to ensure a
+smooth and safe upgrade:
+
+* **Review the release notes**: Check the release notes for the target version to
+  identify any breaking changes, deprecated options, or new requirements that may
+  affect your setup.
+
+* **Back up your configuration**: Make a copy of your Barman configuration files
+  (e.g. ``/etc/barman.conf`` and ``/etc/barman.d/``) before upgrading, in case the
+  package update modifies or replaces them. This is usually not necessary, but it's
+  always good practice to have a backup of your configuration.
+
+* **Ensure no operations are running**: Before upgrading, make sure no backup, WAL
+  archiving, or recovery operations are in progress on any of your configured servers.
+
+  * Disable the execution of ``barman cron`` during the upgrade to prevent any scheduled
+    tasks from running. You can do this by setting all servers to inactive, or
+    commenting out the cron job in your system's crontab.
+
+  * Comment any cron job that would execute ``barman backup`` during the upgrade.
+
+  * Stop the ``receive-wal`` process for each configured server to prevent possible issues
+    with WAL archiving during the upgrade. You can do this by running:
+
+    .. code-block:: bash
+
+       barman terminate-process SERVER_NAME receive-wal
+
+* **Use the same repository**: Upgrade Barman using the same package repository that
+  was used for the original installation. Mixing repositories can result in
+  configuration layout mismatches or broken packages.
+
+* **Verify Python compatibility**: Confirm that the Python version on your system is
+  supported by the new Barman release. Refer to :ref:`installation-system-requirements`
+  for supported versions.
+
+* **Test before upgrading production**: When possible, test the upgrade in a
+  non-production environment first to catch any issues before applying it to your
+  production Barman server.
 
 .. _extra-requirements:
 

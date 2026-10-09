@@ -3,7 +3,7 @@
 Barman for the cloud
 ====================
 
-Barman provides various ways for backing up Postgres servers to the cloud:
+Barman provides various ways for backing up Postgres clusters to the cloud:
 
 * **Using a Barman server**
 
@@ -29,6 +29,11 @@ Barman provides various ways for backing up Postgres servers to the cloud:
      the only method that allows you to have incremental backups (block-level) in the
      cloud. If you choose this approach, please consult the
      :ref:`backup-streaming-backup-cloud` section for details.
+  4. Set up Barman locally on the Postgres server, and use the ``local-to-cloud`` backup
+     method to create backups directly in the cloud, without ever storing them locally.
+     WAL files can be archived directly to the object store using 
+     ``barman cloud-wal-archive`` as the ``archive_command``. If you choose this
+     approach, please consult the :ref:`backup-local-to-cloud` section for details. 
 
 * **Using the cloud scripts, without the need of a Barman server**
 
@@ -187,6 +192,124 @@ For more information about AWS S3 Object Lock, refer to the
 See the :ref:`barman-cloud-barman-cloud-backup-delete` command reference for more
 details on how the ``--check-object-lock`` option works, including information about the
 deletion process and performance considerations.
+
+.. _barman-cloud-permissions:
+
+Cloud Provider Permissions
+--------------------------
+
+This section documents the minimum IAM/access permissions required for Barman to operate
+with each supported cloud provider. This is useful if you want to follow the principle
+of least privilege when configuring access for Barman.
+
+.. note::
+   Currently, only the required IAM permissions for AWS S3 are documented. The
+   documentation for Azure Blob Storage and Google Cloud Storage permissions is
+   not yet available.
+
+
+AWS S3 Permissions
+""""""""""""""""""
+
+When using AWS S3 for object storage (backups and WAL files), the following IAM
+permissions are required. These permissions apply to the ``barman-cloud-*`` scripts
+(``barman-cloud-backup``, ``barman-cloud-restore``, ``barman-cloud-wal-archive``, etc.)
+as well as to any Barman server that has S3 as the backup or WAL destination (i.e.
+have an S3 URL in ``basebackups_directory`` or ``wals_directory``).
+
+**Minimum Required Permissions**
+
+These permissions are required for basic backup and restore operations:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Permission
+     - Purpose
+   * - ``s3:CreateBucket``
+     - Create the bucket if it does not exist when running ``barman-check-wal-archive``
+   * - ``s3:ListBucket``
+     - List objects in the bucket, verify bucket exists (``ListObjectsV2``, ``HeadBucket``)
+   * - ``s3:GetObject``
+     - Download backups and WAL files, check if objects exist (``GetObject``, ``HeadObject``)
+   * - ``s3:PutObject``
+     - Upload backups, WAL files, and metadata (includes multipart uploads)
+   * - ``s3:AbortMultipartUpload``
+     - Abort failed or interrupted multipart uploads
+   * - ``s3:DeleteObject``
+     - Delete backups and WAL files during retention enforcement
+
+**Conditional Permissions**
+
+These permissions are only required when using specific features:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 70
+
+   * - Permission
+     - When Required
+   * - ``s3:PutObjectTagging``
+     - When using the ``--tags`` option to tag objects
+   * - ``s3:GetObjectRetention``
+     - When using ``--check-object-lock`` option before deleting backups
+   * - ``s3:GetObjectLegalHold``
+     - When using ``--check-object-lock`` option before deleting backups
+
+**KMS Permissions (Server-Side Encryption)**
+
+When using server-side encryption with AWS KMS (``--sse-kms-key-id`` option):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 75
+
+   * - Permission
+     - Purpose
+   * - ``kms:GenerateDataKey``
+     - Required for encrypting uploaded objects
+   * - ``kms:Decrypt``
+     - Required for decrypting objects during restore
+
+**Sample IAM Policy**
+
+The following IAM policy provides the minimum permissions for S3 object storage
+operations:
+
+.. code-block:: json
+
+   {
+     "Version": "2012-10-17",
+     "Statement": [
+       {
+         "Sid": "BucketLevelPermissions",
+         "Effect": "Allow",
+         "Action": [
+           "s3:CreateBucket",
+           "s3:ListBucket"
+         ],
+         "Resource": "arn:aws:s3:::your-bucket-name"
+       },
+       {
+         "Sid": "ObjectLevelPermissions",
+         "Effect": "Allow",
+         "Action": [
+           "s3:GetObject",
+           "s3:PutObject",
+           "s3:AbortMultipartUpload",
+           "s3:DeleteObject"
+         ],
+         "Resource": "arn:aws:s3:::your-bucket-name/*"
+       }
+     ]
+   }
+
+.. note::
+   For EBS snapshot backups (using ``backup_method=snapshot``), additional EC2
+   permissions are required. Refer to the
+   :ref:`cloud snapshot backups <cloud-snapshot-backups>` section for details on
+   EC2 permissions.
 
 .. _barman-cloud-commands-reference:
 

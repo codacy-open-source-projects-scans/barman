@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# © Copyright EnterpriseDB UK Limited 2013-2025
+# © Copyright EnterpriseDB UK Limited 2013-2026
 #
 # This file is part of Barman.
 #
@@ -704,7 +704,7 @@ class TestHooks(object):
             "BARMAN_TABLESPACES": '{"first": "/first/relocated", '
             '"second": "/another/location"}',
             "BARMAN_REMOTE_COMMAND": "ssh user@host",
-            "BARMAN_RECOVER_OPTIONS": '{"exclusive": true, ' '"target_name": "name"}',
+            "BARMAN_RECOVER_OPTIONS": '{"exclusive": true, "target_name": "name"}',
         }
         assert script.run() == 0
         assert command_mock.call_count == 1
